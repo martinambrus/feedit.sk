@@ -1,0 +1,164 @@
+Interface
+=========
+- add a "Back" button to code verify pages, as people in app cannot go back if they enter invalid address to enter a good one instead
+- show a different message (All Read) when no filters are used and there is 0 articles to read
+- make help images lazy-load
+- add a Mark Read button, visible even in simple mode which will - when clicked - close the article, mark it read and continue
+  with next one, expanding its description and scrolling to it in the content
+- use router to store clicks, so the back button can go back to whatever feed/page (when ordering by date) we were at before
+- allow folders structure for feeds
+- auto-upvote/downvote link that a user clicks on
+  -> this will first require training from user's side
+  -> training will be done via YES/NO dialog upon user's return to the reader
+  -> if the user wasn't gone for at least 6 seconds, no training will be conducted,
+  -> this dialog frequency can be adjusted by clicking a link with these options:
+     -> ask less frequently (show every 5 links)
+	 -> ask occasionally (show every 20 links)
+	 -> stop asking (disable this training functionality)
+  -> once the user trains the reader this way, we will be able to determine how long does it take to read an article with that category of words count
+     (and possibly from that author and category)
+  -> when we have enough training data for this, we can start auto-training links for the user and occasionally asking them to verify that rating
+     via the same dialog
+- add stats for feed modal
+
+Functionality
+=============
+- update cookies-based preferences to be DB-based (the APP don't seem to be able to save them between runs if killed, or at least is killed too soon)
+- for new feeds that are website URLs, try to discover feeds there and use the first one instead of showing the user an error message
+- create an image-proxy server which would serve HTTPS versions of images, if they are not available through HTTPS in the target feed
+  -> this is for favicons and description images
+- temporary muting of keywords (to prevent multiples of same news cropping up in Google News feed once we read them)
+- undo on training/marking read failure (re-show items, unmark trained etc.)
+- ability to hide feeds
+- check if we can add untrained authors and categories to DB and show them in training modal, as they now only appear after 1st training
+- add the ability to filter by feeds in "all feeds" item
+- put long-running jobs to bg (like/dislike whole feed) or they'll timeout on front-end while keep running in the BG
+- add priorization by currency and recognize currency in words-parsing (remove it from measurement units and make it its own thing)
+  -> recognize all forms - 1CZK, CZK 1, 1 koruna, 20 korun, 1$, $1, USD 1, 1 USD
+- consider the following variables
+  -> number of lines in article VS. average number of lines in previously upvoted articles
+     (this can be possibly broken down by category, author and/or [majority of words OR all of the upvoted n-grams for the link])
+	 (we can calculate number of lines per article artificially from words count)
+	 (this is percentage value, i.e. will help in filtering into tiers)
+  -> number of words in article
+     (count all words and upvote/downvote one of 4 categories - up to 50, 250, 1000 words and 1000+ words)
+	 (this serves as another scoring mechanism)
+  -> lines actually read by the user VS. number of lines in article
+     (will need an internal UI scanning read time of the external page, in frame?)
+	 (this is percentage value, i.e. will help in filtering into tiers)
+	 (it will possibly invalidate the auto-link-rating feature where we need to ask if the user liked the article or not)
+- shared keywords (and therefore trigrams) across multiple feeds
+  -> at some later point, as it's mighty complicated due to all dependencies of dependencies of dependencies ...
+  -> eventually, this would be much easier to implement as a "copy training from another feed" feature
+  -> a great idea is to implement linked feeds, in which training one article would trigger training of words,
+     n-grams, categories, authors and phrases relevant to that article in all of the linked feeds
+- OPML import / export
+  -> export when a user removes some feeds
+     (keep them in their account and after some time, e-mail OPML file with those deleted feeds)
+- test and allow for per-article language, as there can be feeds that are multilingual
+- EllasticSearch
+- deactivate user if they've not used the application for 4 months
+  -> warn after 3 months, then after 3,5 months
+  -> deactivate on 4th month (don't forget to decrease subscription amounts in DB for each of their feeds)
+- delete users after 12 months of inactivity
+  -> warn on 11th inactive month, then after 11,5 inactive months
+  -> delete on 12th month
+- reactivate user upon login if inactive
+  -> add and train the last 100 links from each their feed for them
+  -> warn them that their feeds will only have the latest 100 links added for them
+     and then they'll see links they'd seen the last time they were active
+- pause feeds that have only users subscribed who did not log in to the application for 6+ days
+- record number of SNS triggers into the DB and count them down with each of the worker finishing its job,
+  then set up a 1-min CRON that would check this and fire up training CRON right after we've got all of our
+  feed fetched, rather than having the training CRON on a fixed timing (fetching can be very variable)
+- assign some good processor power to feed fetching, initial feed training and feed discovery lambdas,
+  as they can do some very heavy lifting if a feed contains a lot of links
+- make browser an RSS bridge for services such as Vimeo, which won't allow datacenter IPs to load their videos via RSS
+  (load the RSS via AJAX, then send it to the server)
+- store per-feed settings (filter values) in DB (with the feed, in user's feed collection)
+- custom RSS feed from website maker
+- offline reading
+
+links
+	-> https://fetchrss.com/facebook
+	-> https://feeder.co/knowledge-base/rss-feed-creation/twitter-rss-feeds/
+	-> https://www.kdnuggets.com/2019/01/solve-90-nlp-problems-step-by-step-guide.html
+	-> https://www.howtogeek.com/444549/how-to-create-an-rss-feed-from-a-google-alert/
+	-> https://www.howtogeek.com/318401/how-to-find-or-create-an-rss-feed-for-any-website/
+	-> https://jurnsearch.wordpress.com/2019/03/11/how-to-bulk-import-your-youtube-subscriptions-into-your-rss-feedreader/
+	-> https://feeder.co/knowledge-base/rss-feed-creation/youtube-rss/
+	-> https://addons.mozilla.org/en-US/firefox/addon/want-my-rss/
+
+feeds
+- https://www.bazos.sk/rss.php?rub=au
+- https://www.root.cz/rss/clanky/
+- https://zive.aktuality.sk/rss/najnovsie/
+- https://www.zive.cz/rss/sc-47/default.aspx
+- https://www.root.cz/rss/zpravicky/
+- https://www.gameinformer.com/news.xml
+- https://www.gameinformer.com/previews.xml
+- https://www.gameinformer.com/reviews.xml
+- https://www.smashingmagazine.com/feed/
+- https://feeds.feedburner.com/codinghorror
+- https://news.ycombinator.com/rss
+- https://increment.com/feed.xml
+- https://www.boredpanda.com/feed/
+- https://www.dobrenoviny.sk/rss
+- https://www.sme.sk/rss-title
+- https://www.seznamzpravy.cz/rss
+- https://blog.seznam.cz/sluzby/feed/
+- https://refresher.sk/rss
+- https://www.goodnewsnetwork.org/feed/
+- https://www.youtube.com/feeds/videos.xml?channel_id=UCunX1VxcZGyJU4Lu7KaI4Kg
+- https://www.youtube.com/feeds/videos.xml?channel_id=UCnbvPS_rXp4PC21PG2k1UVg
+- https://www.youtube.com/feeds/videos.xml?channel_id=UCQkd05iAYed2-LOmhjzDG6g
+- https://www.youtube.com/feeds/videos.xml?channel_id=UCQkd05iAYed2-LOmhjzDG6g
+- https://www.youtube.com/feeds/videos.xml?channel_id=UCLx053rWZxCiYWsBETgdKrQ
+- http://export.arxiv.org/rss/astro-ph (100+ items a day)
+- http://www.dnjournal.com/rss.xml (NewsBlur unable to parse with 505 timeouts)
+- https://cdn.jwz.org/blog/feed/
+- https://mtgazone.com/feed/
+- https://vigyanprasar.gov.in/category/science-news/feed
+- http://afterdawn.com/news/afterdawn_rss.xml
+- http://feeds.feedburner.com/ajaxian
+- http://www.andybudd.com/index.rdf&amp;image=true
+- http://feeds.feedburner.com/AskANinja
+- http://newsrss.bbc.co.uk/rss/newsonline_world_edition/front_page/rss.xml
+- http://inessential.com/xml/rss.xml
+- http://rss.cnn.com/rss/cnn_topstories.rss
+- http://digg.com/rss/index.xml
+- http://www.flickr.com/services/feeds/photos_public.gne?format=rss2
+- http://news.google.com/?output=rss
+- http://blogs.law.harvard.edu/home/feed/rdf/
+- http://phobos.apple.com/WebObjects/MZStore.woa/wpa/MRSS/topsongs/limit=10/rss.xml&amp;orderbydate=false
+- http://www.newspond.com/rss/main.xml
+- http://feeds.feedburner.com/ok-cancel
+- http://osnews.com/files/recent.rdf
+- http://weblog.philringnalda.com/feed/
+- http://www.reddit.com/.rss
+- http://www.pariurisportive.com/blog/xmlsrv/rss2.php?blog=2
+- http://blog.ryanparman.com/feed/
+- http://technorati.com/watchlists/rss.html?wid=29290
+- http://engadget.com/rss.xml
+- http://feeds.feedburner.com/web20Show
+- http://xkcd.com/rss.xml
+- http://rss.news.yahoo.com/rss/topstories
+- http://zeldman.com/rss/
+- https://aluska.org/feed/atom/
+- https://www.milton.edu/feed/
+- https://www.bleepingcomputer.com/feed/
+- https://forum.guns.ru/
+- https://www.androidpolice.com/feed/
+- http://rss.tecmundo.com.br/feed (wrong encoding reported by feed sometimes)
+- https://news.google.com/news/rss/headlines/section/topic/SCIENCE?ned=us&hl=en&gl=US (duplicates)
+- https://news.google.com/news/rss/headlines/section/topic/TECHNOLOGY?ned=us&hl=en&gl=US (duplicates)
+
+premium features
+- RSS fetch standoff time
+- max links at once
+- insta-fetch
+- max feeds
+- tags
+- search
+- custom phrases
+- all-feeds combined left menu item

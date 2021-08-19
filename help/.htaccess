@@ -1,0 +1,3 @@
+<FilesMatch ^((?![a-zA-Z0-9\-_]\.(gif|png)).)*$>
+  Require all denied
+</FilesMatch>

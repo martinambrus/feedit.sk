@@ -1,0 +1,3 @@
+<FilesMatch ^(.gitignore|.htaccess|composer.json|composer.lock|(create_account|footer|header|left-menu|SimplePie.compiled|SimplePie.compiled-original).php|todo.txt|training.txt)$>
+  Require all denied
+</FilesMatch>

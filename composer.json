@@ -1,0 +1,8 @@
+{
+  "require": {
+    "mongodb/mongodb": "^1.6",
+    "patrickschur/language-detection": "^4.0",
+    "jdecool/jsonfeed": "^0.4.0",
+    "swiftmailer/swiftmailer": "^6.0"
+  }
+}

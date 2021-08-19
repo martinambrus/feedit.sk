@@ -1,0 +1,3 @@
+<FilesMatch ^((?!(auto-archive|auto-archive-processed|auto-remove|links-trainer|rss-fetch|tiers-training-check)\.php).)*$>
+  Require all denied
+</FilesMatch>

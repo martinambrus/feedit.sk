@@ -1,0 +1,3 @@
+<FilesMatch ^((?!(bookmark|captcha|content|feed_add|feed_edit|feed_remove|feeds|feeds_counts|feeds_discovery|help|labels_get|labels_give|labels_save|langs|languages|report_bug|training-detailed|training-mark-read|training-modal|training-simple)\.php).)*$>
+  Require all denied
+</FilesMatch>
