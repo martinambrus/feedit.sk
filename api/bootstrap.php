@@ -1,8 +1,22 @@
 <?php
+// USER CONFIGURATION
+const SMTP_HOST = 'smtp.gmail.com';
+const SMTP_PORT = 465;
+const SMTP_ENCRYPTION = 'ssl';
+const SMTP_USERNAME = 'infofeedit@gmail.com';
+const SMTP_PASSWORD = 'hello';
+const SUPPORT_EMAIL = 'infofeedit@gmail.com';
+
+
+
+
+
+// DO NOT TOUCH THE CODE BELOW THIS LINE
 session_write_close();
 
 const DEBUG = false;
 const LAST_UPDATE = 1605090146;
+
 require_once "utils.php";
 
 if (!ini_get('date.timezone')) {

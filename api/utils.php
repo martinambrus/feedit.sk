@@ -135,9 +135,9 @@ function get_mail_header() {
     'Content-Transfer-Encoding: 7bit',
     'Date: ' . date('r', $_SERVER['REQUEST_TIME']),
     'Message-ID: <' . $_SERVER['REQUEST_TIME'] . md5($_SERVER['REQUEST_TIME']) . '@' . $_SERVER['SERVER_NAME'] . '>',
-    'From: ' . 'infofeedit@gmail.com',
-    'Reply-To: ' . 'infofeedit@gmail.com',
-    'Return-Path: ' . 'infofeedit@gmail.com',
+    'From: ' . SUPPORT_EMAIL,
+    'Reply-To: ' . SUPPORT_EMAIL,
+    'Return-Path: ' . SUPPORT_EMAIL,
     'X-Mailer: PHP v' . phpversion(),
     'X-Originating-IP: ' . $_SERVER['SERVER_ADDR'],
   );
@@ -256,16 +256,16 @@ function permute($arg) {
 
 function send_mail($to, $subject, $body) {
   // Create the Transport
-  $transport = (new Swift_SmtpTransport('smtp.gmail.com', 465, 'ssl'))
-    ->setUsername('infofeedit@gmail.com')
-    ->setPassword('hello');
+  $transport = (new Swift_SmtpTransport(SMTP_HOST, SMTP_PORT, SMTP_ENCRYPTION))
+    ->setUsername(SMTP_USERNAME)
+    ->setPassword(SMTP_PASSWORD);
 
   // Create the Mailer using your created Transport
   $mailer = new Swift_Mailer($transport);
 
   // Create a message
   $message = (new Swift_Message( $subject ))
-    ->setFrom(['infofeedit@gmail.com' => 'FeedIt RSS Reader'])
+    ->setFrom([SUPPORT_EMAIL => 'FeedIt RSS Reader'])
     ->setTo($to)
     ->setBody( $body );
 

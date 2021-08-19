@@ -17,8 +17,8 @@ $user_email = decode_user_email( $mongo->bayesian->accounts->findOne( [ '_id' =>
 $headers = get_mail_header();
 
 // TODO: change verification address in e-mail body
-if ( !send_mail('infofeedit@gmail.com', ($_POST['type'] == 'bug' ? 'FeedIt Bug Report' : 'FeedIt Account Question'), 'User ' . $user_email . " send the following report:\n\n\n" . $_POST['msg'], implode("\n", $headers)) ) {
-  send_error($lang['Error Sending Report'], $lang['There was a problem while trying to send your report. Please try again or contact us directly on infofeedit@gmail.com'], 503, 'mail', ['api' => 'report_bug']);
+if ( !send_mail(SUPPORT_EMAIL, ($_POST['type'] == 'bug' ? 'FeedIt Bug Report' : 'FeedIt Account Question'), 'User ' . $user_email . " send the following report:\n\n\n" . $_POST['msg'], implode("\n", $headers)) ) {
+  send_error($lang['Error Sending Report'], $lang['There was a problem while trying to send your report. Please try again or contact us directly on ' . SUPPORT_EMAIL], 503, 'mail', ['api' => 'report_bug']);
 }
 
 // no output when all is OK
