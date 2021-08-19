@@ -1,4 +1,6 @@
 <?php
+/* RUNS EVERY MINUTE */
+
 set_time_limit( 600 );
 session_write_close();
 

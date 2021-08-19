@@ -1,4 +1,6 @@
 <?php
+/* RUNS EVERY 5 MINUTES */
+
 use JDecool\JsonFeed\Reader\ReaderBuilder;
 
 set_time_limit( 500 );

@@ -1,4 +1,6 @@
 <?php
+/* RUNS EVERY 6 HOURS */
+
 set_time_limit( 600 );
 session_write_close();
 

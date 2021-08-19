@@ -1,4 +1,6 @@
 <?php
+/* RUNS EVERY 2 HOURS */
+
 session_write_close();
 $time_start = microtime(true);
 
