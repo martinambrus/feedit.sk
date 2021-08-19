@@ -74,19 +74,19 @@ require_once "header.php";
         <ion-row>
           <ion-col>&nbsp;</ion-col>
         </ion-row>
-        <ion-row>
+        <!-- <ion-row>
           <ion-col>
             <a href='https://play.google.com/store/apps/details?id=sk.feedit&pcampaignid=pcampaignidMKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1'><img height="100" alt='<?php echo $lang['Get it on Google Play']; ?>' src='https://play.google.com/intl/en_us/badges/static/images/badges/<?php echo LANGUAGE; ?>_badge_web_generic.png'/></a>
           </ion-col>
           <ion-col>
             <a href="https://apps.apple.com/us/app/feedit-rss-reader/id1538541609?itsct=apps_box&amp;itscg=30200" style="display: inline-block; overflow: hidden; border-radius: 13px; width: 250px; height: 83px;"><img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/<?php echo $locales[ LANGUAGE ]['full_id'] ?>?size=250x83&amp;releaseDate=1605571200&h=8bc73f1e1e3a1f2b6ae23c7e7095697c" alt="Download on the App Store" style="border-radius: 13px; width: 250px; height: 83px;"></a>
           </ion-col>
-        </ion-row>
+        </ion-row> //-->
         <?php } ?>
       </ion-grid>
     </ion-content>
 
-    <script src="https://www.google.com/recaptcha/api.js?render=6Le5VLoZAAAAALoOSJNdm3DYDMkt4fwKPc24dn99"></script>
+    <script src="https://www.google.com/recaptcha/api.js?render=6LcwoBAcAAAAALFySP8EDETXmKB_PPEdanvgx2I2"></script>
     <script type="application/javascript">
       $(function() {
         // set user's timezone
@@ -129,7 +129,7 @@ require_once "header.php";
 
         grecaptcha.ready(function() {
           grecaptcha
-            .execute('6Le5VLoZAAAAALoOSJNdm3DYDMkt4fwKPc24dn99', {action: 'submit'})
+            .execute('6LcwoBAcAAAAALFySP8EDETXmKB_PPEdanvgx2I2', {action: 'submit'})
             .then(function(token) {
               // verify Re-Captcha
               $.post('api/captcha.php', {

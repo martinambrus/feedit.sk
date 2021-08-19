@@ -22,7 +22,7 @@ $headers[] = 'Expect:';
 curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
 curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
 curl_setopt($ch, CURLOPT_POSTFIELDS, [
-  'secret' => '6Le5VLoZAAAAACBRsIf8MVBehMMzCpRp-MEktPrL',
+  'secret' => '6LcwoBAcAAAAAJDSufZ8EQDzJmdTB_7SH7ULLtT6',
   'response' => $_POST['token'],
   'remoteip' => $_SERVER['REMOTE_ADDR'], // optional
 ]);
