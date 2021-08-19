@@ -3,7 +3,7 @@ require_once "api/bootstrap.php";
 
 // check that we are currently logged-in with an active session
 if (!empty($_COOKIE['feedit'])) {
-  $session = $mongo->bayesian->sessions->findOne( [ 'auth_hash' => (string) $_COOKIE['feedit'], 'expires' => [ '$gt' => time() ] ] );
+  $session = $mongo->{MONGO_DB_NAME}->sessions->findOne( [ 'auth_hash' => (string) $_COOKIE['feedit'], 'expires' => [ '$gt' => time() ] ] );
   if ( !$session ) {
     // not logged-in
     header( 'Location: logout.php' );

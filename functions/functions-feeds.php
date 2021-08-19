@@ -6,14 +6,14 @@
     $feed_objects = [];
 
     if (!$bookmarks_only) {
-      foreach ( $mongo->bayesian->{'feeds-' . $user->short_id}->find( [], [ 'projection' => [ '_id' => 1, 'lang' => 1, 'title' => 1, 'allow_duplicates' => 1, 'tiers_training_check' => 1 ] ] ) as $user_feed ) {
+      foreach ( $mongo->{MONGO_DB_NAME}->{'feeds-' . $user->short_id}->find( [], [ 'projection' => [ '_id' => 1, 'lang' => 1, 'title' => 1, 'allow_duplicates' => 1, 'tiers_training_check' => 1 ] ] ) as $user_feed ) {
         $feeds[ (string) $user_feed->_id ] = $user_feed;
         $feed_objects[] = $user_feed->_id;
       }
 
       // add feed details from the main feeds collection
       foreach (
-        $mongo->bayesian->feeds->find( [ '_id' => [ '$in' => $feed_objects ] ],
+        $mongo->{MONGO_DB_NAME}->feeds->find( [ '_id' => [ '$in' => $feed_objects ] ],
           [
             'sort'       => [ 'title' => 1, 'url' => 1 ],
             'projection' => [
@@ -33,7 +33,7 @@
         $filter        = build_filters_and_options()[0];
 
         // use a real count with the filter set above
-        $feeds[ (string) $feed_object ]->count = $mongo->bayesian->{'training-' . $user->short_id}->countDocuments( $filter );
+        $feeds[ (string) $feed_object ]->count = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->countDocuments( $filter );
         $all_count += $feeds[ (string) $feed_object ]->count;
 
         // update the ID parameter, so it's directly readable
@@ -43,7 +43,7 @@
     }
 
     // add number of bookmarks
-    $feeds['bookmarks_count'] = $mongo->bayesian->{'training-' . $user->short_id}->countDocuments( [ 'bookmarked' => 1 ] );
+    $feeds['bookmarks_count'] = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->countDocuments( [ 'bookmarked' => 1 ] );
 
     // add all feeds count
     if (isset($all_count)) {

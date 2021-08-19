@@ -10,7 +10,7 @@ require_once('functions/functions-user.php');
 
 // check the hash or email
 if (!empty($_GET['id'])) {
-  $existing = $mongo->bayesian->accounts->findOne( [ 'hash' => (string) $_GET['id'] ] );
+  $existing = $mongo->{MONGO_DB_NAME}->accounts->findOne( [ 'hash' => (string) $_GET['id'] ] );
 } else {
   $existing = get_existing_user( mb_strtolower( (string) $_POST['email'] ) );
 }
@@ -35,11 +35,11 @@ if (!$existing->active) {
 }
 
 // clean up all expired sessions
-$mongo->bayesian->sessions->deleteMany([ 'expires' => [ '$lt' => time() ] ]);
+$mongo->{MONGO_DB_NAME}->sessions->deleteMany([ 'expires' => [ '$lt' => time() ] ]);
 
 // check if we are logging-in
 if (!empty($_GET['hash'])) {
-  $session = $mongo->bayesian->sessions->findOne(
+  $session = $mongo->{MONGO_DB_NAME}->sessions->findOne(
     [
       'hash' => $existing->hash,
       'auth_hash' => (string) $_GET['hash']
@@ -49,7 +49,7 @@ if (!empty($_GET['hash'])) {
   // check session existence
   if ($session) {
     // store last login time, update session cookie
-    $mongo->bayesian->accounts->updateOne([ '_id' => $existing->_id ],
+    $mongo->{MONGO_DB_NAME}->accounts->updateOne([ '_id' => $existing->_id ],
       [
         '$set' => [
           'last_login' => time(),
@@ -72,7 +72,7 @@ if (!empty($_GET['hash'])) {
 } else {
   // create new authentication hash, if not created within the last 5 minutes
   if (
-    !$mongo->bayesian->sessions->findOne(
+    !$mongo->{MONGO_DB_NAME}->sessions->findOne(
       [
         'hash' => $existing->hash,
         'expires' => [
@@ -91,7 +91,7 @@ if (!empty($_GET['hash'])) {
     $auth_time = ( time() + ( 60 * 60 * 24 * 30 ) );
 
     // create new session
-    $mongo->bayesian->sessions->insertOne(
+    $mongo->{MONGO_DB_NAME}->sessions->insertOne(
       [
         'hash' => $existing->hash,
         'auth_hash' => $auth_hash,

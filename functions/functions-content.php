@@ -10,7 +10,7 @@
     }
 
     // cache labels for this user
-    foreach ($mongo->bayesian->{'labels-' . $user->short_id}->find() as $label_record) {
+    foreach ($mongo->{MONGO_DB_NAME}->{'labels-' . $user->short_id}->find() as $label_record) {
       // make sure we have labels as an array
       if (!empty($_POST['labels']) && !is_array($_POST['labels'])) {
         $_POST['labels'] = [ $_POST['labels'] ];
@@ -59,7 +59,7 @@
       ]
     ];
 
-    $trained = $mongo->bayesian->{'training-' . $user->short_id};
+    $trained = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id};
 
     // don't filter on read or trained if we're showing bookmarks
     if ($feed != 'bookmarks') {
@@ -421,7 +421,7 @@
 
     // retrieve actual title, URL and description data for the selected links
     // re-use this variable...
-    $processed_data = $mongo->bayesian->processed->find( [ '_id' => [ '$in' => $processed_ids ] ], [
+    $processed_data = $mongo->{MONGO_DB_NAME}->processed->find( [ '_id' => [ '$in' => $processed_ids ] ], [
       'projection' => [
         'title' => 1,
         'description' => 1,

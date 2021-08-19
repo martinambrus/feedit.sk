@@ -25,7 +25,7 @@
   }
 
   $cached_feeds = [];
-  $records = $mongo->bayesian->{'labels-' . $user->short_id}->find($filter, [ 'sort' => [ 'label' => 1 ], 'projection' => [ 'feed' => 1, 'label' => 1, ] ]);
+  $records = $mongo->{MONGO_DB_NAME}->{'labels-' . $user->short_id}->find($filter, [ 'sort' => [ 'label' => 1 ], 'projection' => [ 'feed' => 1, 'label' => 1, ] ]);
   foreach ($records as $label) {
     // if we're getting labels for a single feed, we don't need its name to complement them
     if (isset($filter['feed'])) {
@@ -36,7 +36,7 @@
     } else {
       // we're getting labels for all feeds, let's add feed name to the label
       if (!isset($cached_feeds[ (string) $label->feed ])) {
-        $cached_feeds[ (string) $label->feed ] = $mongo->bayesian->{'feeds-' . $user->short_id}->findOne([ '_id' => $label->feed ], [ 'projection' => [ 'title' => 1, ] ])->title;
+        $cached_feeds[ (string) $label->feed ] = $mongo->{MONGO_DB_NAME}->{'feeds-' . $user->short_id}->findOne([ '_id' => $label->feed ], [ 'projection' => [ 'title' => 1, ] ])->title;
       }
 
       $labels[] = [

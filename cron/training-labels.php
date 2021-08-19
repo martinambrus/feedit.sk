@@ -10,7 +10,7 @@
 
   // load all labels that this link's words are present in,
   // or those that have the same label as any of the words in this link
-  $possible_labels = $mongo->bayesian->{'labels-' . $user->short_id}->find( [
+  $possible_labels = $mongo->{MONGO_DB_NAME}->{'labels-' . $user->short_id}->find( [
     'feed' => $feed_object,
     '$or'  => [
       [ '_id' => [ '$in' => $link_label_objects ] ],

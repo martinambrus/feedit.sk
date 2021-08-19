@@ -12,7 +12,7 @@ if (empty($_POST['msg'])) {
 }
 
 // get user's e-mail
-$user_email = decode_user_email( $mongo->bayesian->accounts->findOne( [ '_id' => $user->_id ] ) );
+$user_email = decode_user_email( $mongo->{MONGO_DB_NAME}->accounts->findOne( [ '_id' => $user->_id ] ) );
 
 $headers = get_mail_header();
 

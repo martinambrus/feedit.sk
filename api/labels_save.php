@@ -30,7 +30,7 @@
     }
 
     // insert the data
-    $result = $mongo->bayesian->{'labels-' . $user->short_id}->insertMany( $_POST['additions'] );
+    $result = $mongo->{MONGO_DB_NAME}->{'labels-' . $user->short_id}->insertMany( $_POST['additions'] );
 
     if (!$result->getInsertedCount()) {
       send_error($lang['Labels Update Error'], $lang['Labels database update failed.'], 500, 'database', [ 'additions' => $_POST['additions'] ]);
@@ -47,7 +47,7 @@
       }
 
       // update name in all label predictions containing this label
-      $mongo->bayesian->{'training-' . $user->short_id}->updateMany(
+      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany(
       [
         'label_predictions' => [
           '$elemMatch' => [
@@ -63,7 +63,7 @@
       ]);
 
       // update label data
-      $mongo->bayesian->{'labels-' . $user->short_id}->updateOne([ '_id' => $label_id ], [ '$set' => [ 'label' => (string) $value['val'] ] ] );
+      $mongo->{MONGO_DB_NAME}->{'labels-' . $user->short_id}->updateOne([ '_id' => $label_id ], [ '$set' => [ 'label' => (string) $value['val'] ] ] );
     }
   }
 
@@ -78,7 +78,7 @@
         $ids[] = $label_id_object;
 
         // set label prediction for this label to 'to_be_pulled'
-        $mongo->bayesian->{'training-' . $user->short_id}->updateMany(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany(
           [
             'label_predictions' => [
               '$elemMatch' => [
@@ -95,7 +95,7 @@
     }
 
     // remove all label predictions with a "to_be_pulled" value after unsetting them above
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany( [
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [
       'label_predictions' => [
         '$elemMatch' => [
           '$in' => [ 'to_be_pulled' ],
@@ -105,10 +105,10 @@
     ], [ '$pull' => [ 'label_predictions' => 'to_be_pulled' ] ] );
 
     // remove labels from trained items
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany( [], [ '$pull' => ['labels' => [ '$in' => $ids ] ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [], [ '$pull' => ['labels' => [ '$in' => $ids ] ] ] );
 
     // remove label data
-    $result = $mongo->bayesian->{'labels-' . $user->short_id}->deleteMany( [ '_id' => [ '$in' => $ids ] ] );
+    $result = $mongo->{MONGO_DB_NAME}->{'labels-' . $user->short_id}->deleteMany( [ '_id' => [ '$in' => $ids ] ] );
 
     if (!$result->getDeletedCount()) {
       send_error($lang['Labels Update Error'], $lang['Labels database update failed.'], 500, 'database', [ 'removals' => $_POST['removals'] ]);

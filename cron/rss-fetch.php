@@ -9,7 +9,7 @@ $time_start = microtime(true);
 require_once "../api/bootstrap.php";
 
 // don't start a new job if the last one is still running and hasn't timed-out yet
-if ($mongo->bayesian->jobs->findOne([
+if ($mongo->{MONGO_DB_NAME}->jobs->findOne([
   'type' => 'rss-fetch',
   'lambdas' => [
     '$gt' => 0,
@@ -22,7 +22,7 @@ if ($mongo->bayesian->jobs->findOne([
 }
 
 // add current job into the collection of active jobs
-$job = $mongo->bayesian->jobs->insertOne([
+$job = $mongo->{MONGO_DB_NAME}->jobs->insertOne([
   'type' => 'rss-fetch',
   'lambdas' => 1,
   'start' => time(),
@@ -33,7 +33,7 @@ require_once "../SimplePie.compiled.php";
 
 // update all feeds with 10+ subsequent failures
 // where last fetch was more than 2 days ago
-$mongo->bayesian->feeds->updateMany(
+$mongo->{MONGO_DB_NAME}->feeds->updateMany(
   [
     'subsequent_errors_counter' => [
       '$gte' => 10
@@ -91,7 +91,7 @@ $find_array = [
 ];
 
 // count how many IDs do we send out per single SNS event
-$records_count = $mongo->bayesian->feeds->countDocuments($find_array);
+$records_count = $mongo->{MONGO_DB_NAME}->feeds->countDocuments($find_array);
 $per_lambda_count = ceil($records_count / 500);
 
 if ($records_count == 0) {
@@ -125,7 +125,7 @@ echo 'Would fire up ' . $lambdas . ' SNS event(s), each lambda would process ' .
 $counter = 0;
 $errors_counter = 0;
 $exceptions_counter = 0;
-foreach ($mongo->bayesian->feeds->find($find_array, [
+foreach ($mongo->{MONGO_DB_NAME}->feeds->find($find_array, [
   'projection' => [
     'title' => 1,
     'url' => 1,
@@ -147,14 +147,14 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
     $file_headers = @get_headers( 'https://' . $record->url );
     if ( $file_headers && strpos($file_headers[0], '404 Not Found') === false ) {
       echo 'changing invalid feed url' . $record->url . ' to ' . 'https://' . $record->url . "<br>\n";
-      $mongo->bayesian->feeds->updateOne( [ '_id' => $record->_id ], ['$set' => [ 'url' => 'https://' . $record->url ] ] );
+      $mongo->{MONGO_DB_NAME}->feeds->updateOne( [ '_id' => $record->_id ], ['$set' => [ 'url' => 'https://' . $record->url ] ] );
       $record->url = 'https://' . $record->url;
     } else {
       // try HTTP
       $file_headers = @get_headers( 'http://' . $record->url );
       if ( $file_headers && strpos($file_headers[0], '404 Not Found') === false ) {
         echo 'changing invalid feed url' . $record->url . ' to ' . 'http://' . $record->url . "<br>\n";
-        $mongo->bayesian->feeds->updateOne( [ '_id' => $record->_id ], ['$set' => [ 'url' => 'http://' . $record->url ] ] );
+        $mongo->{MONGO_DB_NAME}->feeds->updateOne( [ '_id' => $record->_id ], ['$set' => [ 'url' => 'http://' . $record->url ] ] );
         $record->url = 'http://' . $record->url;
       }
     }
@@ -252,7 +252,7 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
           }
 
           try {
-            $mongo->bayesian->unprocessed->insertOne( $insert_value );
+            $mongo->{MONGO_DB_NAME}->unprocessed->insertOne( $insert_value );
             $items_inserted++;
 
             // save statistical information
@@ -386,7 +386,7 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
         }
 
         try {
-          $mongo->bayesian->unprocessed->insertOne( $insert_value );
+          $mongo->{MONGO_DB_NAME}->unprocessed->insertOne( $insert_value );
           $items_inserted++;
 
           // save statistical information
@@ -421,7 +421,7 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
     // reset fetch time interval if we've had previous subsequent errors in this feed
     if ($record->subsequent_errors_counter > 0) {
       echo 'recovery from previous error state - resetting fetch interval for ' . (!empty($record->title) ? $record->title : $record->url) . ' from ' . $record->fetch_interval_minutes . ' to ' . ($record->fetch_interval_minutes - ( $record->subsequent_errors_counter * 5))."<br>\n";
-      $mongo->bayesian->feeds->updateOne( [ '_id' => $record->_id ], [
+      $mongo->{MONGO_DB_NAME}->feeds->updateOne( [ '_id' => $record->_id ], [
         '$set' => [
           'fetch_interval_minutes' => ($record->fetch_interval_minutes - ( $record->subsequent_errors_counter * 5)),
           'subsequent_errors_counter' => 0,
@@ -503,7 +503,7 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
         $data['$inc'] = $inc_array;
       }
 
-      $mongo->bayesian->feeds->updateOne([ '_id' => $record->_id ], $data);
+      $mongo->{MONGO_DB_NAME}->feeds->updateOne([ '_id' => $record->_id ], $data);
 
       echo 'Fetched "' . (!empty($record->title) ? $record->title : $record->url) . '" ('. $record->url . ') with no new records. ';
       if ($interval_increase) {
@@ -569,7 +569,7 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
         $data['$inc'] = $inc_array;
       }
 
-      $mongo->bayesian->feeds->updateOne([ '_id' => $record->_id ], $data);
+      $mongo->{MONGO_DB_NAME}->feeds->updateOne([ '_id' => $record->_id ], $data);
     }
   } catch ( MongoDB\Driver\Exception\BulkWriteException $exception ) {
     // ignore duplicate link errors - we only want a single instance of each article
@@ -585,7 +585,7 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
       // reset fetch time interval if we've had previous subsequent errors in this feed
       if ($record->subsequent_errors_counter > 0) {
         echo 'recovery from previous error state - resetting fetch interval for ' . (!empty($record->title) ? $record->title : $record->url) . ' from ' . $record->fetch_interval_minutes . ' to ' . ($record->fetch_interval_minutes - ( $record->subsequent_errors_counter * 5))."<br>\n";
-        $mongo->bayesian->feeds->updateOne( [ '_id' => $record->_id ], [
+        $mongo->{MONGO_DB_NAME}->feeds->updateOne( [ '_id' => $record->_id ], [
           '$set' => [
             'fetch_interval_minutes' => ($record->fetch_interval_minutes - ( $record->subsequent_errors_counter * 5)),
             'subsequent_errors_counter' => 0,
@@ -613,7 +613,7 @@ foreach ($mongo->bayesian->feeds->find($find_array, [
       $set_array['next_fetch_ts'] = (time() + ( $record->fetch_interval_minutes * 60));
     }
 
-    $mongo->bayesian->feeds->updateOne([ '_id' => $record->_id ], [
+    $mongo->{MONGO_DB_NAME}->feeds->updateOne([ '_id' => $record->_id ], [
       '$set' => $set_array,
       '$inc' => [
         'total_errors' => 1,
@@ -628,7 +628,7 @@ $time_end = microtime(true);
 echo '<br><br>[' . date('j.m.Y, H:i:s') . '] ' . (round($time_end - $time_start,3) * 1000) . 'ms for ' . $counter .' feeds<br><br>';
 
 // insert data into log
-$mongo->bayesian->logs->insertOne([
+$mongo->{MONGO_DB_NAME}->logs->insertOne([
   'type' => 'rss-fetch',
   'start' => $time_start,
   'end' => $time_end,
@@ -639,7 +639,7 @@ $mongo->bayesian->logs->insertOne([
 ]);
 
 // mark job as finished
-$mongo->bayesian->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
+$mongo->{MONGO_DB_NAME}->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
 
 ?>
 <script>

@@ -155,7 +155,7 @@ function sanitize_title_or_word( $text, $lang, $remove_all_dots = false ) {
   static $stopwords;
 
   if ( ! isset( $stopwords[ $lang ] ) ) {
-    $record = $mongo->bayesian->stopwords->findOne( [ 'lang' => $lang ] );
+    $record = $mongo->{MONGO_DB_NAME}->stopwords->findOne( [ 'lang' => $lang ] );
     if ( $record ) {
       $stopwords[ $lang ] = (array) $record->words;
     } else {

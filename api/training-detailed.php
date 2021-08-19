@@ -39,7 +39,7 @@
 
   // first, load data from the global processed table
   $records = [];
-  foreach ($mongo->bayesian->processed->find( ['_id' => [ '$in' => $ids ] ], [
+  foreach ($mongo->{MONGO_DB_NAME}->processed->find( ['_id' => [ '$in' => $ids ] ], [
     'projection' => [
       'description' => 1,
     ],
@@ -50,7 +50,7 @@
     $records[ (string) $record->_id ] = $record;
   }
 
-  foreach ($mongo->bayesian->{'training-' . $user->short_id}->find( ['_id' => [ '$in' => $ids ] ] ) as $record) {
+  foreach ($mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->find( ['_id' => [ '$in' => $ids ] ] ) as $record) {
     // check if we need to train this item first
     $rate = false;
     $current_link_data = false;

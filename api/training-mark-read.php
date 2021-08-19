@@ -22,7 +22,7 @@
       ] );
     }
 
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany([ 'feed' => $feed ], [ '$set' => [ 'read' => 1 ] ]);
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany([ 'feed' => $feed ], [ '$set' => [ 'read' => 1 ] ]);
     exit;
   }
 
@@ -48,12 +48,12 @@
 
   // mark articles read
   if (count($read)) {
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany([ '_id' => [ '$in' => $read ] ], [ '$set' => [ 'read' => 1 ] ]);
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany([ '_id' => [ '$in' => $read ] ], [ '$set' => [ 'read' => 1 ] ]);
   }
 
   // mark articles unread
   if (count($unread)) {
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany([ '_id' => [ '$in' => $unread ] ], [ '$set' => [ 'read' => 0 ] ]);
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany([ '_id' => [ '$in' => $unread ] ], [ '$set' => [ 'read' => 0 ] ]);
   }
 
   // no output is sent out if everything went smoothly

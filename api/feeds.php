@@ -70,9 +70,9 @@
     $warn = false;
     foreach ($data as $feed_data) {
       if (is_object($feed_data)) {
-        $all_docs = $mongo->bayesian->{'training-' . $user->short_id}->countDocuments( [ 'feed'    => new MongoDB\BSON\ObjectId( $feed_data->id ) ] );
+        $all_docs = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->countDocuments( [ 'feed'    => new MongoDB\BSON\ObjectId( $feed_data->id ) ] );
 
-        $neg_docs = $mongo->bayesian->{'training-' . $user->short_id}->countDocuments( [
+        $neg_docs = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->countDocuments( [
           'feed'    => new MongoDB\BSON\ObjectId( $feed_data->id ),
           'trained' => 1,
           'rated'   => 0,

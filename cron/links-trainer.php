@@ -7,7 +7,7 @@ $time_start = microtime(true);
 require_once "../api/bootstrap.php";
 
 // don't start a new job if the last one is still running and hasn't timed-out yet
-if ($mongo->bayesian->jobs->findOne([
+if ($mongo->{MONGO_DB_NAME}->jobs->findOne([
     'type' => 'links-trainer',
     'lambdas' => [
       '$gt' => 0,
@@ -20,7 +20,7 @@ if ($mongo->bayesian->jobs->findOne([
 }
 
 // add current job into the collection of active jobs
-$job = $mongo->bayesian->jobs->insertOne([
+$job = $mongo->{MONGO_DB_NAME}->jobs->insertOne([
   'type' => 'links-trainer',
   'lambdas' => 1,
   'start' => time(),
@@ -56,7 +56,7 @@ $archival_done_feed_ids = [];
 
 // get active users
 // TODO: this would just fire up events with up to 100 account IDs to train links for to SNS for worker lambdas to process
-foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
+foreach ($mongo->{MONGO_DB_NAME}->accounts->find([ 'active' => 1 ], [
   'limit' => 100,
   'sort' => [ 'feed' => 1 ],
   'projection' => [
@@ -88,7 +88,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
 
         // reset cache and load all scored authors for this user and this feed
         $scored_authors = [];
-        foreach ( $mongo->bayesian->{'authors-' . $user->short_id}->find( [
+        foreach ( $mongo->{MONGO_DB_NAME}->{'authors-' . $user->short_id}->find( [
           'feed' => $feed_object,
           'ignored'    => [ '$ne' => 1 ],
           'weightings' => [ '$gt' => 0 ],
@@ -98,7 +98,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
 
         // reset cache and load all scored categories for this user and this feed
         $scored_categories = [];
-        foreach ( $mongo->bayesian->{'categories-' . $user->short_id}->find( [
+        foreach ( $mongo->{MONGO_DB_NAME}->{'categories-' . $user->short_id}->find( [
           'feed' => $feed_object,
           'ignored'    => [ '$ne' => 1 ],
           'weightings' => [ '$gt' => 0 ],
@@ -112,7 +112,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
       // go through all the unprocessed links for this feed,
       // insert the link into this user's training collection,
       // train them and put them into the processed collection at the end,
-      foreach ( $mongo->bayesian->unprocessed->find( [ 'feed' => $feed_object, 'processed' => 0 ] ) as $link ) {
+      foreach ( $mongo->{MONGO_DB_NAME}->unprocessed->find( [ 'feed' => $feed_object, 'processed' => 0 ] ) as $link ) {
         try {
           // store this item's ID, so it can be marked processed at the end
           $processed_ids[ (string) $link->_id ] = $link->_id;
@@ -121,7 +121,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
           if (empty($feed_data->allow_duplicates)) {
             $true_dupe  = false;
             $dupe_type = '';
-            $dupe_check = $mongo->bayesian->{'training-' . $user->short_id}->findOne( [
+            $dupe_check = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->findOne( [
               '$or' => [
                 [ 'link' => $link->link ],
                 [ 'title' => $link->title ],
@@ -139,10 +139,10 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
                 $dupe_type = 'link';
               } else {
                 // get all items with this title to determine whether our current article is a duplicate of either of them
-                foreach ($mongo->bayesian->{'training-' . $user->short_id}->find( [ 'title' => $link->title ], [ ' projection' => [ '_id' => 1, 'feed' => 1, ] ] ) as $potential_dupe ) {
+                foreach ($mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->find( [ 'title' => $link->title ], [ ' projection' => [ '_id' => 1, 'feed' => 1, ] ] ) as $potential_dupe ) {
                   // load data from the processed collection - either directly by the ID
                   // or indirectly by querying for the same title as we have on this item
-                  $dupe_check = $mongo->bayesian->processed->findOne( [
+                  $dupe_check = $mongo->{MONGO_DB_NAME}->processed->findOne( [
                     '$or' => [
                       [ '_id' => $potential_dupe->_id ],
                       [
@@ -212,7 +212,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
             }
 
             // DB insert into user's training collection
-            $mongo->bayesian->{'training-' . $user->short_id}->insertOne( $training_array );
+            $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->insertOne( $training_array );
           } catch ( MongoDB\Driver\Exception\BulkWriteException $ex ) {
             if ( $ex->getCode() != 11000 ) {
               // TODO: something went wrong while trying to insert the data, log this properly
@@ -253,7 +253,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
 
           // if score of this item is below 2900, remove it from the DB completely
           if ( $update_array['score'] < -2900 ) {
-            $mongo->bayesian->{'training-' . $user->short_id}->deleteOne( [ '_id' => $link->_id ] );
+            $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->deleteOne( [ '_id' => $link->_id ] );
             continue;
           }
 
@@ -290,7 +290,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
             $update_array['score_conformed'] = ( $update_array['interest_average_percent_total'] * $update_array['score'] );
           }
 
-          $mongo->bayesian->{'training-' . $user->short_id}->updateOne( [ '_id' => $link->_id ], [ '$set' => $update_array ] );
+          $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateOne( [ '_id' => $link->_id ], [ '$set' => $update_array ] );
           $link_counter ++;
 
           // at last, insert the item into the processed collection
@@ -307,7 +307,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
             'feed'        => $link->feed
           ];
 
-          $mongo->bayesian->processed->insertOne( $insert_value );
+          $mongo->{MONGO_DB_NAME}->processed->insertOne( $insert_value );
         } catch ( MongoDB\Driver\Exception\BulkWriteException $ex ) {
           // duplicate error can only happen in the processed collection and that's in case when we try to insert
           // a record with link that's already been added, albeit for another user in the past
@@ -324,11 +324,11 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
 
             // load and remove trained data, as they would not have a processed collection counterpart
             // ... we will be re-adding them below, as _id field cannot be updated as such
-            $old_data = $mongo->bayesian->{'training-' . $user->short_id}->findOne( [ '_id' => $link->_id ] );
-            $mongo->bayesian->{'training-' . $user->short_id}->deleteOne( [ '_id' => $link->_id ] );
+            $old_data = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->findOne( [ '_id' => $link->_id ] );
+            $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->deleteOne( [ '_id' => $link->_id ] );
 
             // load the ID from processed collection
-            $existing_id = $mongo->bayesian->processed->findOne([ 'feed' => $link->feed, 'link' => $link->link ], [ 'projection' => [ '_id' => 1 ] ]);
+            $existing_id = $mongo->{MONGO_DB_NAME}->processed->findOne([ 'feed' => $link->feed, 'link' => $link->link ], [ 'projection' => [ '_id' => 1 ] ]);
             // something's wrong, as we did not find this link in the processed collection...
             if (!$existing_id) {
               throw new \Exception('Duplicate link  ' . $link->link . ' not found in processed collection - cannot update training data!');
@@ -337,7 +337,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
               $old_data[ '_id' ] = $existing_id->_id;
 
               // insert a new record with the proper ID
-              $mongo->bayesian->{'training-' . $user->short_id}->insertOne( $old_data );
+              $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->insertOne( $old_data );
               echo 'ID updated from ' . $link->_id .' to ' . $existing_id->_id . "<br>\n";
             }
           }
@@ -354,17 +354,17 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
 
 // mark processed links as processed
 if ( count($processed_ids) ) {
-  $mongo->bayesian->unprocessed->updateMany( [ '_id' => [ '$in' => array_values( $processed_ids ) ] ], [ '$set' => [ 'processed' => 1, 'processed_ts' => time() ] ] );
+  $mongo->{MONGO_DB_NAME}->unprocessed->updateMany( [ '_id' => [ '$in' => array_values( $processed_ids ) ] ], [ '$set' => [ 'processed' => 1, 'processed_ts' => time() ] ] );
 }
 
 // remove all processed links that's been processed for more than 11 days from the unprocessed collection
-$mongo->bayesian->unprocessed->deleteMany(['processed' => 1, 'fetched' => [ '$lt' => (time() - (60 * 60 * 24 * 11))] ]);
+$mongo->{MONGO_DB_NAME}->unprocessed->deleteMany(['processed' => 1, 'fetched' => [ '$lt' => (time() - (60 * 60 * 24 * 11))] ]);
 
 $time_end = microtime(true);
 echo '<br><br>[' . date('j.m.Y, H:i:s') . '] ' . (round($time_end - $time_start,3) * 1000) . 'ms for ' . $link_counter .' links with ' . $user_counter . ' users trained<br><br>';
 
 // insert data into log
-$mongo->bayesian->logs->insertOne([
+$mongo->{MONGO_DB_NAME}->logs->insertOne([
   'type' => 'links-trainer',
   'start' => $time_start,
   'end' => $time_end,
@@ -376,7 +376,7 @@ $mongo->bayesian->logs->insertOne([
 ]);
 
 // mark job as finished
-$mongo->bayesian->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
+$mongo->{MONGO_DB_NAME}->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
 ?>
 <script>
   // reload every minute

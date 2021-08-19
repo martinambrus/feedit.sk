@@ -33,7 +33,7 @@
   }
 
   // add feeds to the global user object
-  $user_feeds = $mongo->bayesian->accounts->findOne( [ '_id' => $user->_id ], [ 'projection' => [ 'feeds' => 1 ] ] );
+  $user_feeds = $mongo->{MONGO_DB_NAME}->accounts->findOne( [ '_id' => $user->_id ], [ 'projection' => [ 'feeds' => 1 ] ] );
   $user->feeds = (isset($user_feeds->feeds) ? $user_feeds->feeds : []);
 
   $feeds_added = [];
@@ -66,7 +66,7 @@
     }
 
     // check if we don't have this feed in the DB already, in which case increase its subscribers count
-    $feed_data = $mongo->bayesian->feeds->findOneAndUpdate( ['url' => (string) $feed['url']], [
+    $feed_data = $mongo->{MONGO_DB_NAME}->feeds->findOneAndUpdate( ['url' => (string) $feed['url']], [
       '$set' => [
         'title' => (string) $feed['title'],
         'url'   => (string) $feed['url'],
@@ -84,7 +84,7 @@
 
     // the feed did not exist in the database yet, include its base structure as well
     if ( $feed_data === null ) {
-      $feed_data = $mongo->bayesian->feeds->findOneAndUpdate( ['url' => (string) $feed['url']], [
+      $feed_data = $mongo->{MONGO_DB_NAME}->feeds->findOneAndUpdate( ['url' => (string) $feed['url']], [
         '$set' => [
           'icon' => $icon,
           'last_fetch_ts' => 0,
@@ -127,7 +127,7 @@
       $local_data['scoring_priority'] = $priorities;
     }
 
-    $existed = $mongo->bayesian->{'feeds-' . $user->short_id}->findOneAndUpdate( [ '_id' => $feed_data->_id ], [
+    $existed = $mongo->{MONGO_DB_NAME}->{'feeds-' . $user->short_id}->findOneAndUpdate( [ '_id' => $feed_data->_id ], [
       '$set' => $local_data
     ],
     [
@@ -139,7 +139,7 @@
 
     if (!$existed) {
       // increase subscribed users for this feed
-      $mongo->bayesian->feeds->updateOne( ['_id' => $feed_data->_id], [
+      $mongo->{MONGO_DB_NAME}->feeds->updateOne( ['_id' => $feed_data->_id], [
         '$inc' => [
           // TODO: when premium is ready, update this
           'premium_subscribers' => 0,
@@ -167,12 +167,12 @@
   // update this user's data with new feeds and also unmark first 100 processed articles in the unprocessed collection
   // as such, so we can immediately fetch that feed's articles for this user
   if (count($added_feeds_ids)) {
-    $mongo->bayesian->accounts->updateOne( [ '_id' => $user->_id ], [ '$set' => [ 'feeds' => $user->feeds ] ] );
+    $mongo->{MONGO_DB_NAME}->accounts->updateOne( [ '_id' => $user->_id ], [ '$set' => [ 'feeds' => $user->feeds ] ] );
     foreach ($added_feeds_ids as $added_feeds_id) {
-      $last_id = $mongo->bayesian->unprocessed->findOne([ 'feed' =>  $added_feeds_id ], [ 'sort' => [ '_id' => -1 ], 'skip' => 99, 'limit' => 1, 'projection' => [ '_id' => 1 ] ]);
+      $last_id = $mongo->{MONGO_DB_NAME}->unprocessed->findOne([ 'feed' =>  $added_feeds_id ], [ 'sort' => [ '_id' => -1 ], 'skip' => 99, 'limit' => 1, 'projection' => [ '_id' => 1 ] ]);
       if ($last_id) {
         $last_id = $last_id->_id;
-        $mongo->bayesian->unprocessed->updateMany( [ 'feed' => $added_feeds_id, '_id' => [ '$gte' => $last_id ] ], [ '$set' => [ 'processed' => 0 ] ] );
+        $mongo->{MONGO_DB_NAME}->unprocessed->updateMany( [ 'feed' => $added_feeds_id, '_id' => [ '$gte' => $last_id ] ], [ '$set' => [ 'processed' => 0 ] ] );
       }
     }
     // TODO: fire up instant fetch event once we have that in place in production

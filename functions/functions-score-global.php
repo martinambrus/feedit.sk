@@ -15,7 +15,7 @@
     $filter['archived'] = [ '$ne' => 1 ];
 
     // update total interest change percentage
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany(
       $filter,
       [
         [
@@ -60,7 +60,7 @@
   function recalculate_ngrams_total_percentage( $ngram_ids ) {
     global $mongo, $user;
     // recalculate n-grams score increment total percentage
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany( [ 'ngrams' => [ '$in' => $ngram_ids ], 'archived' => [ '$ne' => 1 ] ],
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'ngrams' => [ '$in' => $ngram_ids ], 'archived' => [ '$ne' => 1 ] ],
       [
         [
           '$set' => [
@@ -102,7 +102,7 @@ function load_feed_score_adjustments( $feed_object ) {
     'measurement_unit' => 0
   ];
 
-  $feed_data = $mongo->bayesian->{'feeds-' . $user->short_id}->findOne([ '_id' => $feed_object ]);
+  $feed_data = $mongo->{MONGO_DB_NAME}->{'feeds-' . $user->short_id}->findOne([ '_id' => $feed_object ]);
 
   if ( $feed_data && isset( $feed_data['scoring_priority'] ) ) {
     $priorities_count = count( $feed_data['scoring_priority'] );
@@ -158,7 +158,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
   // cache score for our new words
   if ( count( $words_to_get ) ) {
     foreach (
-      $mongo->bayesian->{'words-' . $user_id}->find( [
+      $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->find( [
         'feed' => $feed_object,
         'word' => [ '$in' => $words_to_get ]
       ] ) as $record
@@ -179,7 +179,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
   // cache score for our new n-grams
   if ( count( $ngrams_to_get ) ) {
     foreach (
-      $mongo->bayesian->{'ngrams-' . $user_id}->find( [
+      $mongo->{MONGO_DB_NAME}->{'ngrams-' . $user_id}->find( [
         'feed'  => $feed_object,
         'ngram' => [ '$in' => $ngrams_to_get ]
       ] ) as $record
@@ -240,13 +240,13 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
       }
 
       // update or insert a new n-gram with new value
-      $ngram_data = $mongo->bayesian->{'ngrams-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
+      $ngram_data = $mongo->{MONGO_DB_NAME}->{'ngrams-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
         'upsert'         => true,
         'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER
       ] );
 
       if ( $ngram_data === null ) {
-        $ngram_data = $mongo->bayesian->{'ngrams-' . $user_id}->findOne( $updateQuery );
+        $ngram_data = $mongo->{MONGO_DB_NAME}->{'ngrams-' . $user_id}->findOne( $updateQuery );
       }
 
       if (
@@ -255,7 +255,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
       ) {
         // increase / decrease score of all links where this n-gram is used
         // ... score must be increased / decreased for each word present in the n-gram
-        $mongo->bayesian->{'training-' . $user_id}->updateMany(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany(
           [ 'ngrams' => $ngram_data->_id, 'archived' => [ '$ne' => 1 ] ],
           [
             '$inc' => [
@@ -274,14 +274,14 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
 
       if ($rate_previous === false) {
         // add this n-gram to current link, if we're not un-training
-        $mongo->bayesian->{'training-' . $user_id}->updateOne(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
           [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
           [ '$push' => [ 'ngrams' => $ngram_data->_id ] ]
         );
       } else {
         // remove this n-gram from current link, as we're un-training
         // and keeping it here would mean duplicating n-grams during the next training
-        $mongo->bayesian->{'training-' . $user_id}->updateOne(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
           [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
           [ '$pull' => [ 'ngrams' => $ngram_data->_id ] ]
         );
@@ -392,7 +392,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
           // ... do this only if we did not priorize numbers in this feed, in which case we actually want them to count
           //     as we set them up
           if ( is_numeric( $word ) && $scoring_adjustments['number'] == 0 ) {
-            $record = $mongo->bayesian->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
+            $record = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
             if ( ! $record || ( ($record->upvoted_times / ( $record->weightings + 1 )) * 100 > 60) ) {
               $updateFields['$inc']['weight'] = $score_increment_by;
               $updateFields['$inc']['weight_raw'] ++;
@@ -420,7 +420,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
             // ... do this only if we did not priorize numbers in this feed, in which case we actually want them to count
             //     as we set them up
             if ( is_numeric( $word ) && $scoring_adjustments['number'] == 0 ) {
-              $record = $mongo->bayesian->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
+              $record = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
               if ( ($record->weightings > 0 && ( ( ($record->upvoted_times - 1) / $record->weightings) * 100 > 60)) ) {
                 $updateFields['$inc']['weight'] = $score_increment_by; // $score_increment_by is already negative at this point
                 $updateFields['$inc']['weight_raw'] --;
@@ -442,13 +442,13 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
       }
 
       // update or insert a new word with new value
-      $word_data = $mongo->bayesian->{'words-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
+      $word_data = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
         'upsert'         => true,
         'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER
       ] );
 
       if ( $word_data === null ) {
-        $word_data = $mongo->bayesian->{'words-' . $user_id}->findOne( $updateQuery );
+        $word_data = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOne( $updateQuery );
       }
 
       $recalculate_averages = false;
@@ -513,7 +513,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
                 && $word_data->weightings == 2
               )
             ) {
-              $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
+              $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
             } else if (
               (
                 $words_interest_average_percent_old <= 50 &&
@@ -537,7 +537,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
               )
             ) {
               // do the same update as above in reverse, if applicable
-              $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
+              $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
             }
           }
         }
@@ -547,7 +547,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
         $count_increment = ($rate_previous !== false ? -($word_data->weightings + 1 == 1 ? 1 : 0) : ($updateFields['$inc']['weightings'] > 0 && $word_data->weightings == 1 ? 1 : 0));
 
         if ($words_interest_average_percent_new != $words_interest_average_percent_old || $count_increment != 0) {
-          $mongo->bayesian->{'training-' . $user_id}->updateMany(
+          $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany(
             [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ],
             [
               [
@@ -653,7 +653,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
       // add this word to current link, if we're inserting this link's data into the DB
       // ... duplicate words in this array purposefully to retain words count in case of duplicates
       if ( $rate === false ) {
-        $mongo->bayesian->{'training-' . $user_id}->updateOne(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
           [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
           [ '$push' => [ 'words' => $word_data->_id ] ]
         );
@@ -742,7 +742,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
       }
 
       if ( $adjustment !== false ) {
-        $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ],
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ],
           [
             [ '$set' =>
                 [
@@ -787,7 +787,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
       }
 
       if ( count($processedUpdateQuery4Words) ) {
-        $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], $processedUpdateQuery4Words );
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], $processedUpdateQuery4Words );
         $recalculate_averages = true;
       }
 
@@ -833,7 +833,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
 
   // insert words count to the link, if we're just inserting it into the DB
   if ($update_db && $rate === false) {
-    $mongo->bayesian->{'training-' . $user_id}->updateOne(
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
       [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
       [ '$set' => [ 'words_counter' => $words_counter  ] ]
     );

@@ -1,5 +1,6 @@
 <?php
 // USER CONFIGURATION
+const MONGO_DB_NAME = 'feedit';
 const SMTP_HOST = 'smtp.gmail.com';
 const SMTP_PORT = 465;
 const SMTP_ENCRYPTION = 'ssl';

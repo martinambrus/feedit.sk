@@ -7,7 +7,7 @@ if (empty($_GET['id'])) {
 }
 
 // check the ID
-$existing = $mongo->bayesian->accounts->findOne([ 'short_id' => (string) $_GET['id'] ]);
+$existing = $mongo->{MONGO_DB_NAME}->accounts->findOne([ 'short_id' => (string) $_GET['id'] ]);
 
 if (!$existing) {
   header('Content-Type: text/html; charset=utf-8');
@@ -23,13 +23,13 @@ if ($existing->confirmed) {
 // create new set of collections for this user
 try {
   // authors
-  $new_collection = $mongo->bayesian->createCollection('authors-' . $existing->short_id);
+  $new_collection = $mongo->{MONGO_DB_NAME}->createCollection('authors-' . $existing->short_id);
 
   if (!$new_collection || !$new_collection->ok) {
     throw new \Exception('Failed to create collection authors:' . print_r($new_collection, true));
   }
 
-  $mongo->bayesian->{'authors-' . $existing->short_id}->createIndexes([
+  $mongo->{MONGO_DB_NAME}->{'authors-' . $existing->short_id}->createIndexes([
     [
       'key' => [
         'author' => 1
@@ -45,13 +45,13 @@ try {
   ]);
 
   // categories
-  $new_collection = $mongo->bayesian->createCollection('categories-' . $existing->short_id);
+  $new_collection = $mongo->{MONGO_DB_NAME}->createCollection('categories-' . $existing->short_id);
 
   if (!$new_collection || !$new_collection->ok) {
     throw new \Exception('Failed to create collection categories:' . print_r($new_collection, true));
   }
 
-  $mongo->bayesian->{'categories-' . $existing->short_id}->createIndexes([
+  $mongo->{MONGO_DB_NAME}->{'categories-' . $existing->short_id}->createIndexes([
     [
       'key' => [
         'category' => 1
@@ -67,20 +67,20 @@ try {
   ]);
 
   // feeds - no special indexes
-  $new_collection = $mongo->bayesian->createCollection('feeds-' . $existing->short_id);
+  $new_collection = $mongo->{MONGO_DB_NAME}->createCollection('feeds-' . $existing->short_id);
 
   if (!$new_collection || !$new_collection->ok) {
     throw new \Exception('Failed to create collection feeds:' . print_r($new_collection, true));
   }
 
   // labels
-  $new_collection = $mongo->bayesian->createCollection('labels-' . $existing->short_id);
+  $new_collection = $mongo->{MONGO_DB_NAME}->createCollection('labels-' . $existing->short_id);
 
   if (!$new_collection || !$new_collection->ok) {
     throw new \Exception('Failed to create collection labels:' . print_r($new_collection, true));
   }
 
-  $mongo->bayesian->{'labels-' . $existing->short_id}->createIndexes([
+  $mongo->{MONGO_DB_NAME}->{'labels-' . $existing->short_id}->createIndexes([
     [
       'key' => [
         'label' => 1
@@ -96,13 +96,13 @@ try {
   ]);
 
   // n-grams
-  $new_collection = $mongo->bayesian->createCollection('ngrams-' . $existing->short_id);
+  $new_collection = $mongo->{MONGO_DB_NAME}->createCollection('ngrams-' . $existing->short_id);
 
   if (!$new_collection || !$new_collection->ok) {
     throw new \Exception('Failed to create collection ngrams:' . print_r($new_collection, true));
   }
 
-  $mongo->bayesian->{'ngrams-' . $existing->short_id}->createIndexes([
+  $mongo->{MONGO_DB_NAME}->{'ngrams-' . $existing->short_id}->createIndexes([
     [
       'key' => [
         'feed' => 1,
@@ -119,13 +119,13 @@ try {
   ]);
 
   // training
-  $new_collection = $mongo->bayesian->createCollection('training-' . $existing->short_id);
+  $new_collection = $mongo->{MONGO_DB_NAME}->createCollection('training-' . $existing->short_id);
 
   if (!$new_collection || !$new_collection->ok) {
     throw new \Exception('Failed to create collection training:' . print_r($new_collection, true));
   }
 
-  $mongo->bayesian->{'training-' . $existing->short_id}->createIndexes([
+  $mongo->{MONGO_DB_NAME}->{'training-' . $existing->short_id}->createIndexes([
     [
       'key' => [
         'archived' => 1
@@ -357,13 +357,13 @@ try {
   ]);
 
   // words
-  $new_collection = $mongo->bayesian->createCollection('words-' . $existing->short_id);
+  $new_collection = $mongo->{MONGO_DB_NAME}->createCollection('words-' . $existing->short_id);
 
   if (!$new_collection || !$new_collection->ok) {
     throw new \Exception('Failed to create collection words:' . print_r($new_collection, true));
   }
 
-  $mongo->bayesian->{'words-' . $existing->short_id}->createIndexes([
+  $mongo->{MONGO_DB_NAME}->{'words-' . $existing->short_id}->createIndexes([
     [
       'key' => [
         'feed' => 1,
@@ -384,7 +384,7 @@ try {
 }
 
 // activate account
-$mongo->bayesian->accounts->updateOne(
+$mongo->{MONGO_DB_NAME}->accounts->updateOne(
   [ 'short_id' => $existing->short_id ],
   [
     '$set' => [
@@ -403,7 +403,7 @@ $expiry = time() + (60*60*24*30); // 30 days default expiration, as browsers now
                                   // i.e. omitting expiration in cookie will very probably keep us
                                   // logged-in for a long time
 
-$mongo->bayesian->sessions->updateOne(
+$mongo->{MONGO_DB_NAME}->sessions->updateOne(
   [ 'hash' => $existing->hash ],
   [
     '$set' => [

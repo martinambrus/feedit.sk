@@ -38,7 +38,7 @@
   } else if ( isset($feed_object) ) {
     // check that our feed hasn't been erroring out for extended time periods,
     // in which case we'll output the last error info
-    $feed_data = $mongo->bayesian->feeds->findOne([ '_id' => $feed_object ], [ 'projection' => [ 'subsequent_errors_counter' => 1, 'last_error' => 1 ] ]);
+    $feed_data = $mongo->{MONGO_DB_NAME}->feeds->findOne([ '_id' => $feed_object ], [ 'projection' => [ 'subsequent_errors_counter' => 1, 'last_error' => 1 ] ]);
 
     if ($feed_data->subsequent_errors_counter > 2 && $feed_data->last_error) {
       header('Content-Type: application/json; charset=utf-8');

@@ -25,9 +25,9 @@
   }
 
   // update bookmark
-  $mongo->bayesian->{'training-' . $user->short_id}->updateOne( [ '_id' => $link_object ], [ '$set' => [ 'bookmarked' => $_POST['action'] ] ] );
+  $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateOne( [ '_id' => $link_object ], [ '$set' => [ 'bookmarked' => $_POST['action'] ] ] );
 
   // also update the processed collection
-  $mongo->bayesian->processed->updateOne( [ '_id' => $link_object ], [ '$inc' => [ 'bookmarked_times' => ($_POST['action'] ? 1 : -1) ] ] );
+  $mongo->{MONGO_DB_NAME}->processed->updateOne( [ '_id' => $link_object ], [ '$inc' => [ 'bookmarked_times' => ($_POST['action'] ? 1 : -1) ] ] );
 
   // send out nothing if all is OK

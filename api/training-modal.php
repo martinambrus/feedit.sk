@@ -34,7 +34,7 @@
   ];
 
   // retrieve data for all items
-  $processed_data = $mongo->bayesian->{'training-' . $user->short_id}->find( $filter, [
+  $processed_data = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->find( $filter, [
     'projection' => [
       'feed' => 1,
       'interest_average_percent_total' => 1,
@@ -76,7 +76,7 @@
   $out = [];
 
   // load all scored authors for all of our feeds
-  foreach ( $mongo->bayesian->{'authors-' . $user->short_id}->find( [ 'feed' => [ '$in' => array_values($feed_objects) ] ] ) as $record ) {
+  foreach ( $mongo->{MONGO_DB_NAME}->{'authors-' . $user->short_id}->find( [ 'feed' => [ '$in' => array_values($feed_objects) ] ] ) as $record ) {
     if (!isset($scored_authors[ (string) $record->feed ])) {
       $scored_authors[ (string) $record->feed ] = [];
     }
@@ -85,7 +85,7 @@
   }
 
   // load all scored categories for all of our feeds
-  foreach ( $mongo->bayesian->{'categories-' . $user->short_id}->find( [ 'feed' => [ '$in' => array_values($feed_objects) ] ] ) as $record ) {
+  foreach ( $mongo->{MONGO_DB_NAME}->{'categories-' . $user->short_id}->find( [ 'feed' => [ '$in' => array_values($feed_objects) ] ] ) as $record ) {
     if (!isset($scored_categories[ (string) $record->feed ])) {
       $scored_categories[ (string) $record->feed ] = [];
     }

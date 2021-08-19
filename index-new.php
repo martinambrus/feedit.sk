@@ -33,13 +33,13 @@ $mongo = ( new MongoDB\Client );
 $feeds = [];
 $feed_ids = [];
 // load all feeds for this user
-foreach ( $mongo->bayesian->{'feeds-' . USER_HASH}->find() as $feed ) {
+foreach ( $mongo->{MONGO_DB_NAME}->{'feeds-' . USER_HASH}->find() as $feed ) {
   $feeds[ (string) $feed->_id ] = $feed;
   $feed_ids[] = $feed->_id;
 }
 
 // load feed data for these feeds
-foreach ( $mongo->bayesian->feeds->find(['_id' => [ '$in' => $feed_ids ] ]) as $feed ) {
+foreach ( $mongo->{MONGO_DB_NAME}->feeds->find(['_id' => [ '$in' => $feed_ids ] ]) as $feed ) {
   // combine user feed data with global feed data
   $user_feed_data = $feeds[ (string) $feed->_id ];
   $feeds[ (string) $feed->_id ] = $feed;
@@ -53,7 +53,7 @@ foreach ( $mongo->bayesian->feeds->find(['_id' => [ '$in' => $feed_ids ] ]) as $
 
 $labels = [];
 if (isset($_GET['feed'])) {
-  foreach ( $mongo->bayesian->{'labels-' . USER_HASH}->find( [ 'feed' => new MongoDB\BSON\ObjectId($_GET['feed']) ], [ 'projection' => [ '_id' => 1, 'label' => 1 ] ] ) as $label ) {
+  foreach ( $mongo->{MONGO_DB_NAME}->{'labels-' . USER_HASH}->find( [ 'feed' => new MongoDB\BSON\ObjectId($_GET['feed']) ], [ 'projection' => [ '_id' => 1, 'label' => 1 ] ] ) as $label ) {
     $labels[ (string) $label->_id ] = $label;
   }
 }
@@ -303,7 +303,7 @@ $measurement_units_array = [
 $select_time_start = microtime(true);
 if ( $feed ) {
   // load links for this feed
-  $processed_docs = $mongo->bayesian->{'training-' . USER_HASH};
+  $processed_docs = $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH};
   $filter         = [ 'feed' => $feed_object ];
   $options        = [
     'sort' => [
@@ -531,7 +531,7 @@ if ( $feed ) {
 
   // retrieve actual title, URL and description data for the selected links
   // re-use this variable...
-  $processed_data = $mongo->bayesian->processed->find( [ '_id' => [ '$in' => $processed_ids ] ] );
+  $processed_data = $mongo->{MONGO_DB_NAME}->processed->find( [ '_id' => [ '$in' => $processed_ids ] ] );
   foreach ( $processed_data as $record ) {
     // add the remainder of data to our records
     $processed[ (string) $record->_id ]->title = $record->title;
@@ -549,12 +549,12 @@ if ( $feed ) {
   }
 
   // load all scored authors for this feed
-  foreach ( $mongo->bayesian->{'authors-' . USER_HASH}->find( [ 'feed' => $feed_object ] ) as $record ) {
+  foreach ( $mongo->{MONGO_DB_NAME}->{'authors-' . USER_HASH}->find( [ 'feed' => $feed_object ] ) as $record ) {
     $scored_authors[ $record->author ] = $record;
   }
 
   // load all scored categories for this feed
-  foreach ( $mongo->bayesian->{'categories-' . USER_HASH}->find( [ 'feed' => $feed_object ] ) as $record ) {
+  foreach ( $mongo->{MONGO_DB_NAME}->{'categories-' . USER_HASH}->find( [ 'feed' => $feed_object ] ) as $record ) {
     $scored_categories[ $record->category ] = $record;
   }
 
@@ -622,7 +622,7 @@ function sanitize_title_or_word( $text, $lang, $remove_all_dots = false ) {
   static $stopwords;
 
   if ( ! isset( $stopwords[ $lang ] ) ) {
-    $record = $mongo->bayesian->stopwords->findOne( [ 'lang' => $lang ] );
+    $record = $mongo->{MONGO_DB_NAME}->stopwords->findOne( [ 'lang' => $lang ] );
     if ( $record ) {
       $stopwords[ $lang ] = (array) $record->words;
     } else {
@@ -783,7 +783,7 @@ function parse_words( $txt, $lang, $ngrams_length = 3 ) {
 function recalculate_ngrams_total_percentage( $ngram_ids, $user_id ) {
   global $mongo;
   // recalculate n-grams score increment total percentage
-  $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'ngrams' => [ '$in' => $ngram_ids ], 'archived' => [ '$ne' => 1 ] ],
+  $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'ngrams' => [ '$in' => $ngram_ids ], 'archived' => [ '$ne' => 1 ] ],
     [
       [
         '$set' => [
@@ -856,7 +856,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
 
   if ( count( $words_to_get ) ) {
     foreach (
-      $mongo->bayesian->{'words-' . $user_id}->find( [
+      $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->find( [
         'feed' => $feed_object,
         'word' => [ '$in' => $words_to_get ]
       ] ) as $record
@@ -874,7 +874,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
 
   if ( count( $ngrams_to_get ) ) {
     foreach (
-      $mongo->bayesian->{'ngrams-' . $user_id}->find( [
+      $mongo->{MONGO_DB_NAME}->{'ngrams-' . $user_id}->find( [
         'feed'  => $feed_object,
         'ngram' => [ '$in' => $ngrams_to_get ]
       ] ) as $record
@@ -935,13 +935,13 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
       }
 
       // update or insert a new ngram with new value
-      $ngram_data = $mongo->bayesian->{'ngrams-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
+      $ngram_data = $mongo->{MONGO_DB_NAME}->{'ngrams-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
         'upsert'         => true,
         'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER
       ] );
 
       if ( $ngram_data === null ) {
-        $ngram_data = $mongo->bayesian->{'ngrams-' . $user_id}->findOne( $updateQuery );
+        $ngram_data = $mongo->{MONGO_DB_NAME}->{'ngrams-' . $user_id}->findOne( $updateQuery );
       }
 
       if (
@@ -950,7 +950,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
       ) {
         // increase / decrease score of all links where this n-gram is used
         // ... score must be increased / decreased for each word present in the n-gram
-        $mongo->bayesian->{'training-' . $user_id}->updateMany(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany(
           [ 'ngrams' => $ngram_data->_id, 'archived' => [ '$ne' => 1 ] ],
           [
             '$inc' => [
@@ -969,14 +969,14 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
 
       if ($rate_previous === false) {
         // add this n-gram to current link, if we're not un-training
-        $mongo->bayesian->{'training-' . $user_id}->updateOne(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
           [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
           [ '$push' => [ 'ngrams' => $ngram_data->_id ] ]
         );
       } else {
         // remove this n-gram from current link, as we're un-training
         // and keeping it here would mean duplicating n-grams during the next training
-        $mongo->bayesian->{'training-' . $user_id}->updateOne(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
           [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
           [ '$pull' => [ 'ngrams' => $ngram_data->_id ] ]
         );
@@ -1085,7 +1085,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
           // ... do this only if we did not priorize numbers in this feed, in which case we actually want them to count
           //     as we set them up
           if ( is_numeric( $word ) && $scoring_adjustments['number'] == 0 ) {
-            $record = $mongo->bayesian->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
+            $record = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
             if ( ! $record || ( ($record->upvoted_times / ( $record->weightings + 1 )) * 100 > 60) ) {
               $updateFields['$inc']['weight'] = $score_increment_by;
               $updateFields['$inc']['weight_raw'] ++;
@@ -1113,7 +1113,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
             // ... do this only if we did not priorize numbers in this feed, in which case we actually want them to count
             //     as we set them up
             if ( is_numeric( $word ) && $scoring_adjustments['number'] == 0 ) {
-              $record = $mongo->bayesian->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
+              $record = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOne( [ 'feed' => $feed_object, 'word' => $word ] );
               if ( ($record->weightings > 0 && ( ( ($record->upvoted_times - 1) / $record->weightings) * 100 > 60)) ) {
                 $updateFields['$inc']['weight'] = $score_increment_by; // $score_increment_by is already negative at this point
                 $updateFields['$inc']['weight_raw'] --;
@@ -1135,13 +1135,13 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
       }
 
       // update or insert a new word with new value
-      $word_data = $mongo->bayesian->{'words-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
+      $word_data = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOneAndUpdate( $updateQuery, $updateFields, [
         'upsert'         => true,
         'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER
       ] );
 
       if ( $word_data === null ) {
-        $word_data = $mongo->bayesian->{'words-' . $user_id}->findOne( $updateQuery );
+        $word_data = $mongo->{MONGO_DB_NAME}->{'words-' . $user_id}->findOne( $updateQuery );
       }
 
       $recalculate_averages = false;
@@ -1206,7 +1206,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
                 && $word_data->weightings == 2
               )
             ) {
-              $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
+              $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
             } else if (
               (
                 $words_interest_average_percent_old <= 50 &&
@@ -1230,7 +1230,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
               )
             ) {
               // do the same update as above in reverse, if applicable
-              $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
+              $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
             }
           }
         }
@@ -1240,7 +1240,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
         $count_increment = ($rate_previous !== false ? -($word_data->weightings + 1 == 1 ? 1 : 0) : ($updateFields['$inc']['weightings'] > 0 && $word_data->weightings == 1 ? 1 : 0));
 
         if ($words_interest_average_percent_new != $words_interest_average_percent_old || $count_increment != 0) {
-          $mongo->bayesian->{'training-' . $user_id}->updateMany(
+          $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany(
             [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ],
             [
               [
@@ -1346,7 +1346,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
       // add this word to current link, if we're inserting this link's data into the DB
       // ... duplicate words in this array purposefully to retain words count in case of duplicates
       if ( $rate === false ) {
-        $mongo->bayesian->{'training-' . $user_id}->updateOne(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
           [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
           [ '$push' => [ 'words' => $word_data->_id ] ]
         );
@@ -1435,7 +1435,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
       }
 
       if ( $adjustment !== false ) {
-        $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ],
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ],
           [
             [ '$set' =>
                 [
@@ -1480,7 +1480,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
       }
 
       if ( count($processedUpdateQuery4Words) ) {
-        $mongo->bayesian->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], $processedUpdateQuery4Words );
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], $processedUpdateQuery4Words );
         $recalculate_averages = true;
       }
 
@@ -1525,7 +1525,7 @@ function calculate_score( $user_id, $words, $link, $rate = false, $update_db = f
 
   // insert words count to the link, if we're just inserting it into the DB
   if ($update_db && $rate === false) {
-    $mongo->bayesian->{'training-' . $user_id}->updateOne(
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateOne(
       [ '_id' => new MongoDB\BSON\ObjectId( $link ) ],
       [ '$set' => [ 'words_counter' => $words_counter  ] ]
     );
@@ -1607,7 +1607,7 @@ function update_total_interest_change_percentage($filter) {
   $filter['archived'] = [ '$ne' => 1 ];
 
   // update total interest change percentage
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
     $filter,
     [
       [
@@ -1773,7 +1773,7 @@ function recalculate_conformed_score($filter) {
   $filter['archived'] = [ '$ne' => 1 ];
 
   // update total interest change percentage
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
     $filter,
     [
       [
@@ -1926,7 +1926,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
       // add this label into our word
       if (!$label_is_present) {
         $word_data['in_labels'][] = $label_id;
-        $mongo->bayesian->{'words-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $word_data['_id'] ) ],
+        $mongo->{MONGO_DB_NAME}->{'words-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $word_data['_id'] ) ],
           [
             '$set' => [
               'in_labels' => $word_data['in_labels']
@@ -1967,7 +1967,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
     $weight_increase              = ($rate_previous === 1 ? -$author_rating_increase_value : ($rate_previous === false ? $author_rating_increase_value : 0));
 
     try {
-      $author_rating = $mongo->bayesian->{'authors-' . USER_HASH}->findOneAndUpdate( [
+      $author_rating = $mongo->{MONGO_DB_NAME}->{'authors-' . USER_HASH}->findOneAndUpdate( [
         'author'  => $processed[ $link ]['author'],
         'feed'    => $feed_object,
         'ignored' => [ '$ne' => 1 ]
@@ -1986,7 +1986,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
         // but there already is the same document with ignored set to 1 in the DB
         if ( $ex->getCode() == 11000 ) {
           // update the data to get the ignored author
-          $author_rating = $mongo->bayesian->{'authors-' . USER_HASH}->findOne( [
+          $author_rating = $mongo->{MONGO_DB_NAME}->{'authors-' . USER_HASH}->findOne( [
             'author'  => $processed[ $link ]['author'],
             'feed'    => $feed_object,
           ]);
@@ -1999,7 +1999,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
       }
 
     // adjust score of all links with this author present
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'author' => $processed[ $link ]['author'], 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $weight_increase ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'author' => $processed[ $link ]['author'], 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $weight_increase ] ] );
 
     // calculate average user interest for author in percent
     if ( $author_rating ) {
@@ -2014,7 +2014,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
       $author_interest_percentage = ( ( $weight_increase / 0.1 ) / 1 ) * 100;
     }
 
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'author' => $processed[ $link ]['author'], 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
       [
         '$set' => [
@@ -2046,7 +2046,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
 
     foreach ( $processed[ $link ]['categories'] as $category ) {
       try {
-        $mongo->bayesian->{'categories-' . USER_HASH}->updateOne(
+        $mongo->{MONGO_DB_NAME}->{'categories-' . USER_HASH}->updateOne(
           [
             'feed'     => $feed_object,
             'category' => $category,
@@ -2076,7 +2076,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
 
       // increment score of all links where our link's category exist
       if ($weight_increase != 0) {
-        $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $weight_increase ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $weight_increase ] ] );
       }
     }
 
@@ -2087,7 +2087,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
     $processed_category_names        = [];
     $categories_percentage_changed   = false;
     foreach (
-      $mongo->bayesian->{'categories-' . USER_HASH}->find( [
+      $mongo->{MONGO_DB_NAME}->{'categories-' . USER_HASH}->find( [
         'feed'       => $feed_object,
         'category'   => [ '$in' => $processed[ $link ]['categories'] ],
         'ignored'    => [ '$ne' => 1 ],
@@ -2124,7 +2124,7 @@ function train_link( $link, $rate, $rate_previous = false ) {
 
       $count_increment = ( $rate_previous !== false ? ( $category->weightings + 1 == 1 ? -1 : 0 ) : ( $category->weightings == 1 ? 1 : 0 ) );
       if ( $category_interest_percentage_change != 0 || $count_increment != 0 ) {
-        $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
           [ 'categories' => $category->category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
           [
             [
@@ -2230,10 +2230,10 @@ function train_link( $link, $rate, $rate_previous = false ) {
     $processed[ $link ]['rated']   = '';
   }
 
-  $mongo->bayesian->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$set' => $processed[ $link ] ] );
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$set' => $processed[ $link ] ] );
 
   if ( count( $unsets ) ) {
-    $mongo->bayesian->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$unset' => $unsets ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$unset' => $unsets ] );
   }
 }
 
@@ -2288,10 +2288,10 @@ if ( $links && $rate !== false ) {
           }
         }
 
-        $mongo->bayesian->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$set' => $processed[ $link ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$set' => $processed[ $link ] ] );
 
         if ( count( $unsets ) ) {
-          $mongo->bayesian->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$unset' => $unsets ] );
+          $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateOne( [ '_id' => new MongoDB\BSON\ObjectId( $link ) ], [ '$unset' => $unsets ] );
         }
       } else {
         // if this link has already been trained, we need to un-train it first
@@ -2391,7 +2391,7 @@ if ( isset( $adjustment ) ) {
     // update score of all links that this phrase is present in
     // first, select IDs of all such links from the global processed collection
     $ids = [];
-    foreach ($mongo->bayesian->processed->find([
+    foreach ($mongo->{MONGO_DB_NAME}->processed->find([
       '$and' => [
         [
           'feed' => $feed_object,
@@ -2431,7 +2431,7 @@ if ( isset( $adjustment ) ) {
 
     // now update these records
     if (count($ids)) {
-      $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ids ] ], [
+      $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ids ] ], [
         '$inc' => [
           'score' => $adjustment_amount,
           'score_increment_from_adjustments' => $adjustment_amount
@@ -2443,7 +2443,7 @@ if ( isset( $adjustment ) ) {
     }
 
     // update the actual phrase
-    $mongo->bayesian->{'feeds-' . USER_HASH}->updateOne( [ '_id' => $feed_object ], [ '$set' => [ 'adjustment_phrases' => $feeds[ $feed ]->adjustment_phrases ] ] );
+    $mongo->{MONGO_DB_NAME}->{'feeds-' . USER_HASH}->updateOne( [ '_id' => $feed_object ], [ '$set' => [ 'adjustment_phrases' => $feeds[ $feed ]->adjustment_phrases ] ] );
   }
 
   header( 'Location: ' . ( isset( $_GET['return'] ) ? $_GET['return'] : urldecode( $_POST['return'] ) ) );
@@ -2460,7 +2460,7 @@ if ( isset( $_GET['remove_phrase'] ) ) {
     if ( $update_links_by != 0 ) {
       // first, select IDs of all such links from the global processed collection
       $ids = [];
-      foreach ($mongo->bayesian->processed->find([
+      foreach ($mongo->{MONGO_DB_NAME}->processed->find([
         '$and' => [
           [
             'feed' => $feed_object,
@@ -2500,7 +2500,7 @@ if ( isset( $_GET['remove_phrase'] ) ) {
 
       // now update these records
       if (count($ids)) {
-        $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ids ] ], [
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ids ] ], [
           '$inc' => [
             'score' => - $update_links_by,
             'score_increment_from_adjustments' => - $update_links_by
@@ -2514,7 +2514,7 @@ if ( isset( $_GET['remove_phrase'] ) ) {
 
     // remove the actual phrase from the feed
     unset( $feeds[ $feed ]->adjustment_phrases[ $_GET['remove_phrase'] ] );
-    $mongo->bayesian->{'feeds-' . USER_HASH}->updateOne( [ '_id' => $feed_object ], [ '$set' => [ 'adjustment_phrases' => $feeds[ $feed ]->adjustment_phrases ] ] );
+    $mongo->{MONGO_DB_NAME}->{'feeds-' . USER_HASH}->updateOne( [ '_id' => $feed_object ], [ '$set' => [ 'adjustment_phrases' => $feeds[ $feed ]->adjustment_phrases ] ] );
   }
 
   header( 'Location: ' . $_GET['return'] );
@@ -2562,11 +2562,11 @@ if ( isset( $_GET['adjust'] ) && isset( $_GET['amount'] ) ) {
   }
 
   $word_id    = new MongoDB\BSON\ObjectId( $_GET['adjust'] );
-  $old_record = $mongo->bayesian->{'words-' . USER_HASH}->findOne( [ '_id' => $word_id ], [ 'weight' => 1 ] );
+  $old_record = $mongo->{MONGO_DB_NAME}->{'words-' . USER_HASH}->findOne( [ '_id' => $word_id ], [ 'weight' => 1 ] );
 
   // don't allow adjusting unrated words, as we cannot calculate percentage for them
   if ( $amount && $old_record->weightings ) {
-    $word_data = $mongo->bayesian->{'words-' . USER_HASH}->findOneAndUpdate( [ '_id' => $word_id ], [
+    $word_data = $mongo->{MONGO_DB_NAME}->{'words-' . USER_HASH}->findOneAndUpdate( [ '_id' => $word_id ], [
       '$inc' => [
         'weight'     => $amount,
         'weight_raw' => $amount
@@ -2575,7 +2575,7 @@ if ( isset( $_GET['adjust'] ) && isset( $_GET['amount'] ) ) {
 
     // update score for all links with this word scored in them
     // as well as percentage of score adjustments from ngrams
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ],
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ],
       [
         [
           '$set' => [
@@ -2627,14 +2627,14 @@ if ( isset( $_GET['adjust'] ) && isset( $_GET['amount'] ) ) {
     //       an abundance of false positives for various auctions, trading feeds etc.
     if (!is_numeric( $word_data->word ) || $scoring_adjustments['number']) {
       if ( $words_interest_average_percent_old >= 50 && $words_interest_average_percent_new < 50 && $word_data->weightings > 2 ) {
-        $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
       } else if ( $words_interest_average_percent_old < 50 && $words_interest_average_percent_new >= 50 && $word_data->weightings > 2 ) {
         // do the same update as above in reverse, if applicable
-        $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
       }
     }
 
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ],
       [
         [
@@ -2705,14 +2705,14 @@ if ( isset( $_GET['adjust'] ) && isset( $_GET['amount'] ) ) {
 if ( isset( $_GET['ignore'] ) ) {
   // update the word itself
   $word_id    = new MongoDB\BSON\ObjectId( $_GET['ignore'] );
-  $new_record = $mongo->bayesian->{'words-' . USER_HASH}->findOneAndUpdate( [ '_id' => $word_id ], [ '$set' => [ 'ignored' => 1 ] ] );
+  $new_record = $mongo->{MONGO_DB_NAME}->{'words-' . USER_HASH}->findOneAndUpdate( [ '_id' => $word_id ], [ '$set' => [ 'ignored' => 1 ] ] );
 
   // update all links with this word scored
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - $new_record->weight ] ] );
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - $new_record->weight ] ] );
 
   // update all ngrams with this word present
   $ngram_ids_to_update = [];
-  $ngrams_to_look_for = $mongo->bayesian->{'ngrams-' . USER_HASH}->find(
+  $ngrams_to_look_for = $mongo->{MONGO_DB_NAME}->{'ngrams-' . USER_HASH}->find(
     [
       '$and' =>
       [
@@ -2745,7 +2745,7 @@ if ( isset( $_GET['ignore'] ) ) {
     $ngram_ids_to_update[] = $ngram->_id;
     if (($ngram->weight > 25 && $ngram->weightings > 1)) {
       $ngram_words_count = count( explode(' ', $ngram->ngram) );
-      $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => - ($ngram->weight * $ngram_words_count) ] ] );
+      $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => - ($ngram->weight * $ngram_words_count) ] ] );
     }
   }
 
@@ -2755,12 +2755,12 @@ if ( isset( $_GET['ignore'] ) ) {
     recalculate_ngrams_total_percentage( $ngram_ids_to_update, USER_HASH );
 
     // set n-grams as ignored
-    $mongo->bayesian->{'ngrams-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ngram_ids_to_update ] ], [ '$set' => [ 'ignored' => 1 ] ] );
+    $mongo->{MONGO_DB_NAME}->{'ngrams-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ngram_ids_to_update ] ], [ '$set' => [ 'ignored' => 1 ] ] );
   }
 
   // update words interest percentage value for all links where this word exists
   if ($new_record->weight_raw) {
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ],
       [
         [
@@ -2837,7 +2837,7 @@ if ( isset( $_GET['ignore'] ) ) {
       $words_interest_average_percent = ( ( $new_record->weight_raw / $new_record->weightings ) * 100 );
 
       if ( $words_interest_average_percent >= 50 && $new_record->weightings > 2 && (!is_numeric( $new_record->word ) || $scoring_adjustments['number']) ) {
-        $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => - 1 ] ] );
       }
     }
   }
@@ -2850,14 +2850,14 @@ if ( isset( $_GET['ignore'] ) ) {
 if ( isset( $_GET['unignore'] ) ) {
   // update the word itself
   $word_id    = new MongoDB\BSON\ObjectId( $_GET['unignore'] );
-  $new_record = $mongo->bayesian->{'words-' . USER_HASH}->findOneAndUpdate( [ '_id' => $word_id ], [ '$unset' => [ 'ignored' => '' ] ] );
+  $new_record = $mongo->{MONGO_DB_NAME}->{'words-' . USER_HASH}->findOneAndUpdate( [ '_id' => $word_id ], [ '$unset' => [ 'ignored' => '' ] ] );
 
   // update all links with this word scored
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $new_record->weight ] ] );
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $new_record->weight ] ] );
 
   // update all ngrams with this word present
   $ngram_ids_to_update = [];
-  $ngrams_to_look_for = $mongo->bayesian->{'ngrams-' . USER_HASH}->find(
+  $ngrams_to_look_for = $mongo->{MONGO_DB_NAME}->{'ngrams-' . USER_HASH}->find(
     [
       '$and' =>
         [
@@ -2890,7 +2890,7 @@ if ( isset( $_GET['unignore'] ) ) {
     $ngram_ids_to_update[] = $ngram->_id;
     if (($ngram->weight > 25 && $ngram->weightings > 1)) {
       $ngram_words_count = count( explode(' ', $ngram->ngram) );
-      $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => ($ngram->weight * $ngram_words_count) ] ] );
+      $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => ($ngram->weight * $ngram_words_count) ] ] );
     }
   }
 
@@ -2900,12 +2900,12 @@ if ( isset( $_GET['unignore'] ) ) {
     recalculate_ngrams_total_percentage( $ngram_ids_to_update, USER_HASH );
 
     // set n-grams as ignored
-    $mongo->bayesian->{'ngrams-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ngram_ids_to_update ] ], [ '$unset' => [ 'ignored' => '' ] ] );
+    $mongo->{MONGO_DB_NAME}->{'ngrams-' . USER_HASH}->updateMany( [ '_id' => [ '$in' => $ngram_ids_to_update ] ], [ '$unset' => [ 'ignored' => '' ] ] );
   }
 
   // update words interest percentage value for all links where this word exists
   if ($new_record->weight_raw) {
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ],
       [
         [
@@ -2966,7 +2966,7 @@ if ( isset( $_GET['unignore'] ) ) {
       $words_interest_average_percent = ( ( $new_record->weight_raw / $new_record->weightings ) * 100 );
 
       if ( $words_interest_average_percent >= 50 && $new_record->weightings > 2 && (!is_numeric( $new_record->word ) || $scoring_adjustments['number']) ) {
-        $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'words' => $word_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'words_rated_above_50_percent' => 1 ] ] );
       }
     }
   }
@@ -3015,16 +3015,16 @@ if ( isset( $_GET['author'] ) && isset( $_GET['adjust'] ) ) {
       $amount = 0;
   }
 
-  $old_record = $mongo->bayesian->{'authors-' . USER_HASH}->findOne( [ 'author' => urldecode( $_GET['author'] ), 'feed' => $feed_object ], [ 'projection' => [ 'weight' => 1, 'weightings' => 1 ] ] );
+  $old_record = $mongo->{MONGO_DB_NAME}->{'authors-' . USER_HASH}->findOne( [ 'author' => urldecode( $_GET['author'] ), 'feed' => $feed_object ], [ 'projection' => [ 'weight' => 1, 'weightings' => 1 ] ] );
 
   // don't allow adjusting unrated authors, as we cannot calculate percentage for them
   if ( $amount && $old_record->weightings ) {
-    $mongo->bayesian->{'authors-' . USER_HASH}->updateOne( [ 'author' => urldecode( $_GET['author'] ), 'feed' => $feed_object ], [ '$inc' => [ 'weight' => $amount ] ] );
+    $mongo->{MONGO_DB_NAME}->{'authors-' . USER_HASH}->updateOne( [ 'author' => urldecode( $_GET['author'] ), 'feed' => $feed_object ], [ '$inc' => [ 'weight' => $amount ] ] );
 
     // update all links with this author
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $amount ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $amount ] ] );
 
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'author' => urldecode( $_GET['author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
       [
         '$set' => [ 'author_interest_average_percent' => (( (($old_record->weight + $amount) / 0.1) / $old_record->weightings ) * 100)]
@@ -3041,10 +3041,10 @@ if ( isset( $_GET['author'] ) && isset( $_GET['adjust'] ) ) {
 
 // author ignoring
 if ( isset( $_GET['ignore_author'] ) ) {
-  $new_record = $mongo->bayesian->{'authors-' . USER_HASH}->findOneAndUpdate( [ 'author' => urldecode( $_GET['ignore_author'] ), 'feed' => $feed_object ], [ '$set' => [ 'ignored' => 1 ] ], [ 'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER ] );
+  $new_record = $mongo->{MONGO_DB_NAME}->{'authors-' . USER_HASH}->findOneAndUpdate( [ 'author' => urldecode( $_GET['ignore_author'] ), 'feed' => $feed_object ], [ '$set' => [ 'ignored' => 1 ] ], [ 'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER ] );
 
   // update all links with this author
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['ignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['ignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
     [
       '$set' => [
         'author_interest_average_percent' => 0
@@ -3056,7 +3056,7 @@ if ( isset( $_GET['ignore_author'] ) ) {
   );
 
   // decrease interest average count for this author in all links where they're present
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['ignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['ignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
     [
       [
         '$set' => [
@@ -3080,10 +3080,10 @@ if ( isset( $_GET['ignore_author'] ) ) {
 
 // author unignoring
 if ( isset( $_GET['unignore_author'] ) ) {
-  $new_record = $mongo->bayesian->{'authors-' . USER_HASH}->findOneAndUpdate( [ 'author' => urldecode( $_GET['unignore_author'] ), 'feed' => $feed_object ], [ '$unset' => [ 'ignored' => '' ] ], [ 'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER ] );
+  $new_record = $mongo->{MONGO_DB_NAME}->{'authors-' . USER_HASH}->findOneAndUpdate( [ 'author' => urldecode( $_GET['unignore_author'] ), 'feed' => $feed_object ], [ '$unset' => [ 'ignored' => '' ] ], [ 'returnDocument' => MongoDB\Operation\FindOneAndUpdate::RETURN_DOCUMENT_AFTER ] );
 
   // update all links with this author
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['unignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['unignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
     [
       '$set' => [
         'author_interest_average_percent' => (( ($new_record->weight / 0.1) / $new_record->weightings ) * 100)
@@ -3095,7 +3095,7 @@ if ( isset( $_GET['unignore_author'] ) ) {
   );
 
   // increase interest average count for this author in all links where they're present
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['unignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'author' => urldecode( $_GET['unignore_author'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
     [
       [
         '$set' => [
@@ -3157,19 +3157,19 @@ if ( isset( $_GET['category'] ) && isset( $_GET['adjust'] ) ) {
       $amount = 0;
   }
 
-  $old_record = $mongo->bayesian->{'categories-' . USER_HASH}->findOne( [ 'category' => urldecode( $_GET['category'] ), 'feed' => $feed_object ], [ 'projection' => [ 'weight' => 1, 'weightings' => 1 ] ] );
+  $old_record = $mongo->{MONGO_DB_NAME}->{'categories-' . USER_HASH}->findOne( [ 'category' => urldecode( $_GET['category'] ), 'feed' => $feed_object ], [ 'projection' => [ 'weight' => 1, 'weightings' => 1 ] ] );
 
   // don't allow adjusting unrated categories, as we cannot calculate percentage for them
   if ( $amount && $old_record->weightings ) {
-    $mongo->bayesian->{'categories-' . USER_HASH}->updateOne( [ 'category' => urldecode( $_GET['category'] ), 'feed' => $feed_object ], [ '$inc' => [ 'weight' => $amount ] ] );
+    $mongo->{MONGO_DB_NAME}->{'categories-' . USER_HASH}->updateOne( [ 'category' => urldecode( $_GET['category'] ), 'feed' => $feed_object ], [ '$inc' => [ 'weight' => $amount ] ] );
 
     // update all links with this category
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'categories' => urldecode( $_GET['category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $amount ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'categories' => urldecode( $_GET['category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $amount ] ] );
 
     $category_interest_percentage_new    = ( ( ( ( ($old_record->weight + $amount) / 0.01) ) / $old_record->weightings ) * 100 );
     $category_interest_percentage_old    = ( ( ( $old_record->weight / 0.01 ) / $old_record->weightings ) * 100 );
 
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'categories' => urldecode( $_GET['category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
       [
         [
@@ -3227,14 +3227,14 @@ if ( isset( $_GET['category'] ) && isset( $_GET['adjust'] ) ) {
 
 // category ignoring
 if ( isset( $_GET['ignore_category'] ) ) {
-  $new_record = $mongo->bayesian->{'categories-' . USER_HASH}->findOneAndUpdate( [ 'category' => urldecode( $_GET['ignore_category'] ), 'feed' => $feed_object ], [ '$set' => [ 'ignored' => 1 ] ] );
+  $new_record = $mongo->{MONGO_DB_NAME}->{'categories-' . USER_HASH}->findOneAndUpdate( [ 'category' => urldecode( $_GET['ignore_category'] ), 'feed' => $feed_object ], [ '$set' => [ 'ignored' => 1 ] ] );
 
   // update all links with this category
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'categories' => urldecode( $_GET['ignore_category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - $new_record->weight ] ] );
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'categories' => urldecode( $_GET['ignore_category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - $new_record->weight ] ] );
 
   // update categories interest percentage value for all links where this category exists
   if ($new_record->weight) {
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'categories' => urldecode( $_GET['ignore_category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
       [
         [
@@ -3298,14 +3298,14 @@ if ( isset( $_GET['ignore_category'] ) ) {
 
 // category unignoring
 if ( isset( $_GET['unignore_category'] ) ) {
-  $new_record = $mongo->bayesian->{'categories-' . USER_HASH}->findOneAndUpdate( [ 'category' => urldecode( $_GET['unignore_category'] ), 'feed' => $feed_object ], [ '$unset' => [ 'ignored' => '' ] ] );
+  $new_record = $mongo->{MONGO_DB_NAME}->{'categories-' . USER_HASH}->findOneAndUpdate( [ 'category' => urldecode( $_GET['unignore_category'] ), 'feed' => $feed_object ], [ '$unset' => [ 'ignored' => '' ] ] );
 
   // update all links with this category
-  $mongo->bayesian->{'training-' . USER_HASH}->updateMany( [ 'categories' => urldecode( $_GET['unignore_category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $new_record->weight ] ] );
+  $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany( [ 'categories' => urldecode( $_GET['unignore_category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $new_record->weight ] ] );
 
   // update categories interest percentage value for all links where this category exists
   if ($new_record->weight) {
-    $mongo->bayesian->{'training-' . USER_HASH}->updateMany(
+    $mongo->{MONGO_DB_NAME}->{'training-' . USER_HASH}->updateMany(
       [ 'categories' => urldecode( $_GET['unignore_category'] ), 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
       [
         [
@@ -3596,7 +3596,7 @@ if ( count( $sorted[ 0 ] ) || count( $sorted[ 1 ] ) || (isset( $sorted[ 2 ] ) &&
 
         if ( count( $labels_to_get ) ) {
           foreach (
-            $mongo->bayesian->{'labels-' . USER_HASH}->find( [
+            $mongo->{MONGO_DB_NAME}->{'labels-' . USER_HASH}->find( [
               '_id' => [ '$in' => $labels_to_get ]
             ], [ 'projection' => [  '_id' => 1, 'label' => 1 ] ] ) as $l
           ) {

@@ -44,7 +44,7 @@ $email_hash = password_hash($_POST['email'], PASSWORD_BCRYPT, [ 'cost' => 9 ]);
 $email_encrypted = openssl_encrypt( $_POST['email'], 'AES-256-CBC', $salts[ $day_created ], false, substr($email_hash, 0, 16) );
 
 // create this account with the e-mail provided
-$mongo->bayesian->accounts->insertOne(
+$mongo->{MONGO_DB_NAME}->accounts->insertOne(
 [
     'short_id' => $acc_id,
     'hash' => md5($acc_id),

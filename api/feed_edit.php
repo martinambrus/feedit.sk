@@ -25,7 +25,7 @@
   }
 
   // update feed data
-  $mongo->bayesian->{'feeds-' . $user->short_id}->updateOne( ['_id' => $feed_object], [
+  $mongo->{MONGO_DB_NAME}->{'feeds-' . $user->short_id}->updateOne( ['_id' => $feed_object], [
     '$set' => [
       'title' => (string) $_POST['feed_title'],
       'lang'  => (string) $_POST['feed_lang'],

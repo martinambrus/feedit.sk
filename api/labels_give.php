@@ -39,18 +39,18 @@
   }
 
   // remove label predictions and labels from all these links, as we'll be assigning a set of new labels to them
-  $mongo->bayesian->{'training-' . $user->short_id}->updateMany([ '_id' => [ '$in' => $_POST['links'] ] ], [ '$unset' => [ 'label_predictions' => 1, 'labels' => 1 ] ]);
+  $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany([ '_id' => [ '$in' => $_POST['links'] ] ], [ '$unset' => [ 'label_predictions' => 1, 'labels' => 1 ] ]);
 
   // if we're not just removing everything, now add the labels we've set to add
   if ($_POST['labels'] !== 'empty') {
     // add all of the labels to these links
-    $mongo->bayesian->{'training-' . $user->short_id}->updateMany( [ '_id' => [ '$in' => $_POST['links'] ] ], [ '$set' => [ 'labels' => $_POST['labels'] ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ '_id' => [ '$in' => $_POST['links'] ] ], [ '$set' => [ 'labels' => $_POST['labels'] ] ] );
   }
 
   // train label predictions for each of these links that's trained positively (up)
   // ... first, cache all words IDs used in these links
   $words = [];
-  foreach ($mongo->bayesian->{'training-' . $user->short_id}->find(
+  foreach ($mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->find(
     [
       '_id' => [
         '$in' => $_POST['links'],
@@ -71,7 +71,7 @@
   // get and prepare data for all the cached words
   if (count($words)) {
     $words_data = [];
-    foreach ($mongo->bayesian->{'words-' . $user->short_id}->find([ '_id' => [ '$in' => $words ] ]) as $record) {
+    foreach ($mongo->{MONGO_DB_NAME}->{'words-' . $user->short_id}->find([ '_id' => [ '$in' => $words ] ]) as $record) {
       $words_data[ $record->word ] = $record;
     }
 

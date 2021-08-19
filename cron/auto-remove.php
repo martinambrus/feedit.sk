@@ -7,7 +7,7 @@ $time_start = microtime(true);
 require_once "../api/bootstrap.php";
 
 // don't start a new job if the last one is still running and hasn't timed-out yet
-if ($mongo->bayesian->jobs->findOne([
+if ($mongo->{MONGO_DB_NAME}->jobs->findOne([
     'type' => 'auto-remove',
     'lambdas' => [
       '$gt' => 0,
@@ -20,7 +20,7 @@ if ($mongo->bayesian->jobs->findOne([
 }
 
 // add current job into the collection of active jobs
-$job = $mongo->bayesian->jobs->insertOne([
+$job = $mongo->{MONGO_DB_NAME}->jobs->insertOne([
   'type' => 'auto-remove',
   'lambdas' => 1,
   'start' => time(),
@@ -33,7 +33,7 @@ $feed_fetch_times = [];
 
 // get active users
 // TODO: this would just fire up events with up to 100 account IDs to train links for to SNS for worker lambdas to process
-foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
+foreach ($mongo->{MONGO_DB_NAME}->accounts->find([ 'active' => 1 ], [
   'limit' => 100,
   'sort' => [ 'feed' => 1 ],
   'projection' => [
@@ -53,7 +53,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
   foreach ($user->feeds as $feed_object) {
     try {
       if (!isset($feed_fetch_times[ (string) $feed_object ])) {
-        $feed_fetch_times[ (string) $feed_object ] = $mongo->bayesian->feeds->findOne([ '_id' => $feed_object ], [ 'projection' => [ 'fetch_interval_minutes' => 1 ] ])->fetch_interval_minutes;
+        $feed_fetch_times[ (string) $feed_object ] = $mongo->{MONGO_DB_NAME}->feeds->findOne([ '_id' => $feed_object ], [ 'projection' => [ 'fetch_interval_minutes' => 1 ] ])->fetch_interval_minutes;
       }
 
       if ( ($feed_fetch_times[ (string) $feed_object ] * 60) > (60 * 60 * 24 * 3) ) {
@@ -62,7 +62,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
         $cleanup_time = (60 * 60 * 24 * 3); // 3 days cleanup default, in seconds
       }
 
-      $mongo->bayesian->{'training-' . $user->short_id}->deleteMany([
+      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->deleteMany([
         'feed' => $feed_object,
         'score' => [ '$lt' => -2900 ],
         'fetched' => [
@@ -82,7 +82,7 @@ $time_end = microtime(true);
 echo '<br><br>[' . date('j.m.Y, H:i:s') . '] ' . (round($time_end - $time_start,3) * 1000) . 'ms for to remove heavily downscored items for ' . $user_counter . ' user(s)<br><br>';
 
 // insert data into log
-$mongo->bayesian->logs->insertOne([
+$mongo->{MONGO_DB_NAME}->logs->insertOne([
   'type' => 'auto-remove',
   'start' => $time_start,
   'end' => $time_end,
@@ -92,7 +92,7 @@ $mongo->bayesian->logs->insertOne([
 ]);
 
 // mark job as finished
-$mongo->bayesian->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
+$mongo->{MONGO_DB_NAME}->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
 ?>
 <script>
   // reload every 6 hours

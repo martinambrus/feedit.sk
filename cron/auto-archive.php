@@ -7,7 +7,7 @@ $time_start = microtime(true);
 require_once "../api/bootstrap.php";
 
 // don't start a new job if the last one is still running and hasn't timed-out yet
-if ($mongo->bayesian->jobs->findOne([
+if ($mongo->{MONGO_DB_NAME}->jobs->findOne([
     'type' => 'auto-archive',
     'lambdas' => [
       '$gt' => 0,
@@ -20,7 +20,7 @@ if ($mongo->bayesian->jobs->findOne([
 }
 
 // add current job into the collection of active jobs
-$job = $mongo->bayesian->jobs->insertOne([
+$job = $mongo->{MONGO_DB_NAME}->jobs->insertOne([
   'type' => 'auto-archive',
   'lambdas' => 1,
   'start' => time(),
@@ -32,7 +32,7 @@ $exceptions_counter = 0;
 
 // get active users
 // TODO: this would just fire up events with up to 100 account IDs to train links for to SNS for worker lambdas to process
-foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
+foreach ($mongo->{MONGO_DB_NAME}->accounts->find([ 'active' => 1 ], [
   'limit' => 100,
   'sort' => [ 'feed' => 1 ],
   'projection' => [
@@ -59,7 +59,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
         //    or articles with a score below 0 older than 12 hours
         //    or articles older than 3 months
         //    as archived, unset their detailed scoring data and calculate their tiers
-        $mongo->bayesian->{'training-' . $user->short_id}->updateMany(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany(
         [
           '$or' => [
             [
@@ -180,7 +180,7 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
           ]
         ]);
 
-        $mongo->bayesian->{'training-' . $user->short_id}->updateMany(
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany(
           [
             'archived' => 1,
             'words' => [ '$exists' => true ],
@@ -213,15 +213,15 @@ foreach ($mongo->bayesian->accounts->find([ 'active' => 1 ], [
 
       // 2) if user has more than 1000 articles unread in this feed,
       //    make all articles beyond the first 1000 read and archived
-      if ( $mongo->bayesian->{'training-' . $user->short_id}->countDocuments([ 'feed' => $feed_object, 'read' => 0, 'bookmarked' => 0, 'archived' => [ '$ne' => 1 ] ]) > 1000 ) {
-        $last_unread_id = $mongo->bayesian->{'training-' . $user->short_id}->findOne([ 'feed' => $feed_object ], [
+      if ( $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->countDocuments([ 'feed' => $feed_object, 'read' => 0, 'bookmarked' => 0, 'archived' => [ '$ne' => 1 ] ]) > 1000 ) {
+        $last_unread_id = $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->findOne([ 'feed' => $feed_object ], [
           'sort' => [ '_id' => -1 ],
           'skip' => 1000,
           'limit' => 1,
           'projection' => [ '_id' => 1 ],
         ])->_id;
 
-        $mongo->bayesian->{'training-' . $user->short_id}->updateMany([ 'feed' => $feed_object, 'bookmarked' => 0, '_id' => [ '$lte' => $last_unread_id ] ],[
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany([ 'feed' => $feed_object, 'bookmarked' => 0, '_id' => [ '$lte' => $last_unread_id ] ],[
           '$set' => [
             'read' => 1,
             'archived' => 1,
@@ -262,7 +262,7 @@ $time_end = microtime(true);
 echo '<br><br>[' . date('j.m.Y, H:i:s') . '] ' . (round($time_end - $time_start,3) * 1000) . 'ms for ' . $user_counter . ' users\' feeds cleaned up<br><br>';
 
 // insert data into log
-$mongo->bayesian->logs->insertOne([
+$mongo->{MONGO_DB_NAME}->logs->insertOne([
   'type' => 'auto-archive',
   'start' => $time_start,
   'end' => $time_end,
@@ -272,7 +272,7 @@ $mongo->bayesian->logs->insertOne([
 ]);
 
 // mark job as finished
-$mongo->bayesian->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
+$mongo->{MONGO_DB_NAME}->jobs->updateOne([ '_id' => $job->getInsertedId() ], [ '$set' => [ 'end' => time(), 'lambdas' => 0 ] ]);
 ?>
 <script>
   // reload every 6 hours

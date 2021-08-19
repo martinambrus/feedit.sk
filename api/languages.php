@@ -4,7 +4,7 @@
 
   // load all languages data from the stopwords collection
   $langs = [];
-  foreach ($mongo->bayesian->stopwords->find([], [ 'sort' => [ 'name_en' => 1 ], 'projection' => [ 'name_en' => 1, 'name' => 1, 'lang' => 1 ] ]) as $db_lang) {
+  foreach ($mongo->{MONGO_DB_NAME}->stopwords->find([], [ 'sort' => [ 'name_en' => 1 ], 'projection' => [ 'name_en' => 1, 'name' => 1, 'lang' => 1 ] ]) as $db_lang) {
     // update identifiers to become fit for the API
     $langs[] = [
       'id' => (string) $db_lang->_id,

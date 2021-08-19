@@ -75,8 +75,8 @@
   }
 
   // TODO: fire up Lambdas to handle training in batches with IDs spread to 200 Lambdas (max)
-  foreach ($mongo->bayesian->{'training-' . $user->short_id}->find( $filter ) as $record) {
-    $records[ (string) $record->_id ] = $mongo->bayesian->processed->findOne( [ '_id' => $record->_id ] );
+  foreach ($mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->find( $filter ) as $record) {
+    $records[ (string) $record->_id ] = $mongo->{MONGO_DB_NAME}->processed->findOne( [ '_id' => $record->_id ] );
     rate_link( $record, (int) $_POST['rating'] );
   }
 

@@ -7,7 +7,7 @@ if (empty($_COOKIE['feedit'])) {
 }
 
 // delete active session
-$mongo->bayesian->sessions->deleteOne( [ 'auth_hash' => (string) $_COOKIE['feedit'] ] );
+$mongo->{MONGO_DB_NAME}->sessions->deleteOne( [ 'auth_hash' => (string) $_COOKIE['feedit'] ] );
 
 // set login cookie in the past, so it will be removed
 setcookie('feedit', '', time() - 100000);

@@ -7,7 +7,7 @@
   }
 
   // add feeds to the global user object
-  $user_feeds = $mongo->bayesian->accounts->findOne( [ '_id' => $user->_id ], [ 'projection' => [ 'feeds' => 1 ] ] );
+  $user_feeds = $mongo->{MONGO_DB_NAME}->accounts->findOne( [ '_id' => $user->_id ], [ 'projection' => [ 'feeds' => 1 ] ] );
   $user->feeds = $user_feeds->feeds;
 
   // update this user's account to exclude the given feed
@@ -35,19 +35,19 @@
   }
 
   // update the accounts collections
-  $mongo->bayesian->accounts->updateOne([ '_id' => $user->_id ], [ '$set' => [ 'feeds' => $user->feeds ] ]);
+  $mongo->{MONGO_DB_NAME}->accounts->updateOne([ '_id' => $user->_id ], [ '$set' => [ 'feeds' => $user->feeds ] ]);
 
   // update feeds and decrease subscribers count
   // TODO: decrease premium subscribers when ready (and if the user is premium)
-  $mongo->bayesian->feeds->updateOne([ '_id' => $feed_object ], [ '$inc' => [ 'normal_subscribers' => -1 ] ]);
+  $mongo->{MONGO_DB_NAME}->feeds->updateOne([ '_id' => $feed_object ], [ '$inc' => [ 'normal_subscribers' => -1 ] ]);
 
   // remove data related to this feed from all relevant collections
-  $mongo->bayesian->{'authors-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
-  $mongo->bayesian->{'categories-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
-  $mongo->bayesian->{'feeds-' . $user->short_id}->deleteMany([ '_id' => $feed_object ]);
-  $mongo->bayesian->{'labels-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
-  $mongo->bayesian->{'ngrams-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
-  $mongo->bayesian->{'training-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
-  $mongo->bayesian->{'words-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
+  $mongo->{MONGO_DB_NAME}->{'authors-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
+  $mongo->{MONGO_DB_NAME}->{'categories-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
+  $mongo->{MONGO_DB_NAME}->{'feeds-' . $user->short_id}->deleteMany([ '_id' => $feed_object ]);
+  $mongo->{MONGO_DB_NAME}->{'labels-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
+  $mongo->{MONGO_DB_NAME}->{'ngrams-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
+  $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
+  $mongo->{MONGO_DB_NAME}->{'words-' . $user->short_id}->deleteMany([ 'feed' => $feed_object ]);
 
   // no response is sent out if a deletion is successful to save bandwidth
