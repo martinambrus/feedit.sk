@@ -1,5 +1,6 @@
 Interface
 =========
+- cancel feeds removal mode (activated when clicked on the remove feed button) when adding a new feed
 - add a "Back" button to code verify pages, as people in app cannot go back if they enter invalid address to enter a good one instead
 - show a different message (All Read) when no filters are used and there is 0 articles to read
 - make help images lazy-load
@@ -147,11 +148,40 @@ feeds
 - https://aluska.org/feed/atom/
 - https://www.milton.edu/feed/
 - https://www.bleepingcomputer.com/feed/
-- https://forum.guns.ru/
+- https://forum.guns.ru/ ( https://forum.guns.ru/static/rss.xml )
 - https://www.androidpolice.com/feed/
 - http://rss.tecmundo.com.br/feed (wrong encoding reported by feed sometimes)
 - https://news.google.com/news/rss/headlines/section/topic/SCIENCE?ned=us&hl=en&gl=US (duplicates)
 - https://news.google.com/news/rss/headlines/section/topic/TECHNOLOGY?ned=us&hl=en&gl=US (duplicates)
+- https://decisions.ipc.on.ca/ipc-cipvp/phipa/en/json/rss.do (json)
+- https://vincent.micro.blog/feed.json (json)
+- https://rss.art19.com/apology-line
+- http://rss.art19.com/the-daily
+- https://feeds.fireside.fm/bibleinayear/rss
+- https://feeds.megaphone.fm/ADL9840290619
+- http://feeds.wnyc.org/experiment_podcast
+- https://feeds.megaphone.fm/WWO3519750118
+- https://rss.acast.com/unraveled
+- https://audioboom.com/channels/4997220.rss
+- https://podcastfeeds.nbcnews.com/dateline-nbc
+- https://lincolnproject.libsyn.com/rss
+- https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+- https://www.huffpost.com/section/front-page/feed?x=1
+- https://moxie.foxnews.com/google-publisher/latest.xml
+- https://rssfeeds.usatoday.com/usatodaycomnation-topstories&x=1
+- https://lifehacker.com/rss
+- https://cdn.feedcontrol.net/8/1114-wioSIX3uu8MEj.xml
+- http://www.politico.com/rss/politicopicks.xml
+- https://www.yahoo.com/news/rss
+- https://www.latimes.com/local/rss2.0.xml
+- https://www.chinadaily.com.cn/rss/china_rss.xml
+- https://www.ecns.cn/rss/rss.xml
+- https://feeds.bbci.co.uk/zhongwen/trad/rss.xml
+- https://www.percona.com/blog/feed/
+- https://blog.shiftasia.com/rss/
+- https://bitnine.net/feed/
+- https://scalegrid.io/feed/
+- https://feeds.dzone.com/home
 
 premium features
 - RSS fetch standoff time

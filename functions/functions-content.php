@@ -438,26 +438,30 @@
 
       // update all src attributes of images in description, so they are not immediately loaded
       // but rather stored in a data attribute, waiting to be revealed by JS
-      $processed[ (string) $record->_id ]->description = preg_replace('/\<img(.+)src\=(?:\"|\')(.+?)(?:\"|\')((?:.+?))\>/m', '<img$1src="img/logo114.png" data-src="$2"$3>', $processed[ (string) $record->_id ]->description);
+      if ( $processed[ (string) $record->_id ]->description ) {
+        $processed[(string)$record->_id]->description = preg_replace('/\<img(.+)src\=(?:\"|\')(.+?)(?:\"|\')((?:.+?))\>/m', '<img$1src="img/logo114.png" data-src="$2"$3>', $processed[(string)$record->_id]->description);
 
-      // if the description ends with ellipsis, remove them
-      if (substr($processed[ (string) $record->_id ]->description, -3) == '...') {
-        $processed[ (string) $record->_id ]->description = substr($processed[ (string) $record->_id ]->description,0, -3);
-      }
+        // if the description ends with ellipsis, remove them
+        if (substr($processed[(string)$record->_id]->description, -3) == '...') {
+          $processed[(string)$record->_id]->description = substr($processed[(string)$record->_id]->description, 0, -3);
+        }
 
-      // provide a tags-clear description as well
-      $description = untagize( $record->description );
+        // provide a tags-clear description as well
+        $description = untagize($record->description);
 
-      // also remove carriage returns and tabs and replace new lines by something more readable
-      $description = str_replace( [ "\r", "\t" ], '', $description );
-      $description = str_replace( "\n", ' | ', $description );
+        // also remove carriage returns and tabs and replace new lines by something more readable
+        $description = str_replace(["\r", "\t"], '', $description);
+        $description = str_replace("\n", ' | ', $description);
 
-      // replace multiple | | occurrences after converting new lines into pipes
-      $regex = '/\|[ ]+\|/m';
-      $breaker = 0;
-      while (preg_match($regex, $description) && $breaker < 100) {
-        $description = preg_replace($regex, '|', $description);
-        $breaker++;
+        // replace multiple | | occurrences after converting new lines into pipes
+        $regex = '/\|[ ]+\|/m';
+        $breaker = 0;
+        while (preg_match($regex, $description) && $breaker < 100) {
+          $description = preg_replace($regex, '|', $description);
+          $breaker++;
+        }
+      } else {
+        $description = '';
       }
 
       $processed[ (string) $record->_id ]->description_clear = $description;

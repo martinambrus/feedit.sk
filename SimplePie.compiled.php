@@ -7027,7 +7027,14 @@ class SimplePie_Enclosure
 		// If we encounter an unsupported mime-type, check the file extension and guess intelligently.
 		if (!in_array($type, array_merge($types_flash, $types_fmedia, $types_quicktime, $types_wmedia, $types_mp3)))
 		{
-			switch (strtolower($this->get_extension()))
+            $ext = $this->get_extension();
+            if ( $ext == null ) {
+              $ext = '';
+            } else {
+              $ext = strtolower( $ext );
+            }
+
+			switch ( $ext )
 			{
 				// Audio mime-types
 				case 'aac':
@@ -12126,8 +12133,12 @@ class SimplePie_Locator
 		$this->registry = $registry;
 	}
 
-	public function find($type = SIMPLEPIE_LOCATOR_ALL, &$working)
+	public function find($type, &$working)
 	{
+        if ( !$type ) {
+          $type = SIMPLEPIE_LOCATOR_ALL;
+        }
+
 		if ($this->is_feed($this->file))
 		{
 			return $this->file;
@@ -12730,6 +12741,10 @@ class SimplePie_Misc
 	 */
 	public static function change_encoding($data, $input, $output)
 	{
+        if ( !is_string( $data ) ) {
+            return false;
+        }
+
 		$input = SimplePie_Misc::encoding($input);
 		$output = SimplePie_Misc::encoding($output);
 
@@ -14469,101 +14484,107 @@ class SimplePie_Misc
 	 */
 	public static function xml_encoding($data, $registry)
 	{
-		// UTF-32 Big Endian BOM
-		if (substr($data, 0, 4) === "\x00\x00\xFE\xFF")
-		{
-			$encoding[] = 'UTF-32BE';
-		}
-		// UTF-32 Little Endian BOM
-		elseif (substr($data, 0, 4) === "\xFF\xFE\x00\x00")
-		{
-			$encoding[] = 'UTF-32LE';
-		}
-		// UTF-16 Big Endian BOM
-		elseif (substr($data, 0, 2) === "\xFE\xFF")
-		{
-			$encoding[] = 'UTF-16BE';
-		}
-		// UTF-16 Little Endian BOM
-		elseif (substr($data, 0, 2) === "\xFF\xFE")
-		{
-			$encoding[] = 'UTF-16LE';
-		}
-		// UTF-8 BOM
-		elseif (substr($data, 0, 3) === "\xEF\xBB\xBF")
-		{
-			$encoding[] = 'UTF-8';
-		}
-		// UTF-32 Big Endian Without BOM
-		elseif (substr($data, 0, 20) === "\x00\x00\x00\x3C\x00\x00\x00\x3F\x00\x00\x00\x78\x00\x00\x00\x6D\x00\x00\x00\x6C")
-		{
-			if ($pos = strpos($data, "\x00\x00\x00\x3F\x00\x00\x00\x3E"))
-			{
-				$parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 20), 'UTF-32BE', 'UTF-8')));
-				if ($parser->parse())
-				{
-					$encoding[] = $parser->encoding;
-				}
-			}
-			$encoding[] = 'UTF-32BE';
-		}
-		// UTF-32 Little Endian Without BOM
-		elseif (substr($data, 0, 20) === "\x3C\x00\x00\x00\x3F\x00\x00\x00\x78\x00\x00\x00\x6D\x00\x00\x00\x6C\x00\x00\x00")
-		{
-			if ($pos = strpos($data, "\x3F\x00\x00\x00\x3E\x00\x00\x00"))
-			{
-				$parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 20), 'UTF-32LE', 'UTF-8')));
-				if ($parser->parse())
-				{
-					$encoding[] = $parser->encoding;
-				}
-			}
-			$encoding[] = 'UTF-32LE';
-		}
-		// UTF-16 Big Endian Without BOM
-		elseif (substr($data, 0, 10) === "\x00\x3C\x00\x3F\x00\x78\x00\x6D\x00\x6C")
-		{
-			if ($pos = strpos($data, "\x00\x3F\x00\x3E"))
-			{
-				$parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 10), 'UTF-16BE', 'UTF-8')));
-				if ($parser->parse())
-				{
-					$encoding[] = $parser->encoding;
-				}
-			}
-			$encoding[] = 'UTF-16BE';
-		}
-		// UTF-16 Little Endian Without BOM
-		elseif (substr($data, 0, 10) === "\x3C\x00\x3F\x00\x78\x00\x6D\x00\x6C\x00")
-		{
-			if ($pos = strpos($data, "\x3F\x00\x3E\x00"))
-			{
-				$parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 10), 'UTF-16LE', 'UTF-8')));
-				if ($parser->parse())
-				{
-					$encoding[] = $parser->encoding;
-				}
-			}
-			$encoding[] = 'UTF-16LE';
-		}
-		// US-ASCII (or superset)
-		elseif (substr($data, 0, 5) === "\x3C\x3F\x78\x6D\x6C")
-		{
-			if ($pos = strpos($data, "\x3F\x3E"))
-			{
-				$parser = $registry->create('XML_Declaration_Parser', array(substr($data, 5, $pos - 5)));
-				if ($parser->parse())
-				{
-					$encoding[] = $parser->encoding;
-				}
-			}
-			$encoding[] = 'UTF-8';
-		}
-		// Fallback to UTF-8
-		else
-		{
-			$encoding[] = 'UTF-8';
-		}
+        if ( is_string( $data ) ) {
+            // UTF-32 Big Endian BOM
+            if (substr($data, 0, 4) === "\x00\x00\xFE\xFF")
+            {
+                $encoding[] = 'UTF-32BE';
+            }
+            // UTF-32 Little Endian BOM
+            elseif (substr($data, 0, 4) === "\xFF\xFE\x00\x00")
+            {
+                $encoding[] = 'UTF-32LE';
+            }
+            // UTF-16 Big Endian BOM
+            elseif (substr($data, 0, 2) === "\xFE\xFF")
+            {
+                $encoding[] = 'UTF-16BE';
+            }
+            // UTF-16 Little Endian BOM
+            elseif (substr($data, 0, 2) === "\xFF\xFE")
+            {
+                $encoding[] = 'UTF-16LE';
+            }
+            // UTF-8 BOM
+            elseif (substr($data, 0, 3) === "\xEF\xBB\xBF")
+            {
+                $encoding[] = 'UTF-8';
+            }
+            // UTF-32 Big Endian Without BOM
+            elseif (substr($data, 0, 20) === "\x00\x00\x00\x3C\x00\x00\x00\x3F\x00\x00\x00\x78\x00\x00\x00\x6D\x00\x00\x00\x6C")
+            {
+                if ($pos = strpos($data, "\x00\x00\x00\x3F\x00\x00\x00\x3E"))
+                {
+                    $parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 20), 'UTF-32BE', 'UTF-8')));
+                    if ($parser->parse())
+                    {
+                        $encoding[] = $parser->encoding;
+                    }
+                }
+                $encoding[] = 'UTF-32BE';
+            }
+            // UTF-32 Little Endian Without BOM
+            elseif (substr($data, 0, 20) === "\x3C\x00\x00\x00\x3F\x00\x00\x00\x78\x00\x00\x00\x6D\x00\x00\x00\x6C\x00\x00\x00")
+            {
+                if ($pos = strpos($data, "\x3F\x00\x00\x00\x3E\x00\x00\x00"))
+                {
+                    $parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 20), 'UTF-32LE', 'UTF-8')));
+                    if ($parser->parse())
+                    {
+                        $encoding[] = $parser->encoding;
+                    }
+                }
+                $encoding[] = 'UTF-32LE';
+            }
+            // UTF-16 Big Endian Without BOM
+            elseif (substr($data, 0, 10) === "\x00\x3C\x00\x3F\x00\x78\x00\x6D\x00\x6C")
+            {
+                if ($pos = strpos($data, "\x00\x3F\x00\x3E"))
+                {
+                    $parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 10), 'UTF-16BE', 'UTF-8')));
+                    if ($parser->parse())
+                    {
+                        $encoding[] = $parser->encoding;
+                    }
+                }
+                $encoding[] = 'UTF-16BE';
+            }
+            // UTF-16 Little Endian Without BOM
+            elseif (substr($data, 0, 10) === "\x3C\x00\x3F\x00\x78\x00\x6D\x00\x6C\x00")
+            {
+                if ($pos = strpos($data, "\x3F\x00\x3E\x00"))
+                {
+                    $parser = $registry->create('XML_Declaration_Parser', array(SimplePie_Misc::change_encoding(substr($data, 20, $pos - 10), 'UTF-16LE', 'UTF-8')));
+                    if ($parser->parse())
+                    {
+                        $encoding[] = $parser->encoding;
+                    }
+                }
+                $encoding[] = 'UTF-16LE';
+            }
+            // US-ASCII (or superset)
+            elseif (substr($data, 0, 5) === "\x3C\x3F\x78\x6D\x6C")
+            {
+                if ($pos = strpos($data, "\x3F\x3E"))
+                {
+                    $parser = $registry->create('XML_Declaration_Parser', array(substr($data, 5, $pos - 5)));
+                    if ($parser->parse())
+                    {
+                        $encoding[] = $parser->encoding;
+                    }
+                }
+                $encoding[] = 'UTF-8';
+            }
+            // Fallback to UTF-8
+            else
+            {
+                $encoding[] = 'UTF-8';
+            }
+        } else {
+          // Fallback to UTF-8 if we didn't get a string for input
+          // (for instance with OpenSSL errors which return array with the error message)
+          $encoding[] = 'UTF-8';
+        }
 		return $encoding;
 	}
 
@@ -15965,50 +15986,58 @@ class SimplePie_Parser
 		}
 
 		// Strip BOM:
-		// UTF-32 Big Endian BOM
-		if (substr($data, 0, 4) === "\x00\x00\xFE\xFF")
-		{
-			$data = substr($data, 4);
-		}
-		// UTF-32 Little Endian BOM
-		elseif (substr($data, 0, 4) === "\xFF\xFE\x00\x00")
-		{
-			$data = substr($data, 4);
-		}
-		// UTF-16 Big Endian BOM
-		elseif (substr($data, 0, 2) === "\xFE\xFF")
-		{
-			$data = substr($data, 2);
-		}
-		// UTF-16 Little Endian BOM
-		elseif (substr($data, 0, 2) === "\xFF\xFE")
-		{
-			$data = substr($data, 2);
-		}
-		// UTF-8 BOM
-		elseif (substr($data, 0, 3) === "\xEF\xBB\xBF")
-		{
-			$data = substr($data, 3);
-		}
+        if ( is_string( $data ) ) {
+            // UTF-32 Big Endian BOM
+            if (substr($data, 0, 4) === "\x00\x00\xFE\xFF")
+            {
+                $data = substr($data, 4);
+            }
+            // UTF-32 Little Endian BOM
+            elseif (substr($data, 0, 4) === "\xFF\xFE\x00\x00")
+            {
+                $data = substr($data, 4);
+            }
+            // UTF-16 Big Endian BOM
+            elseif (substr($data, 0, 2) === "\xFE\xFF")
+            {
+                $data = substr($data, 2);
+            }
+            // UTF-16 Little Endian BOM
+            elseif (substr($data, 0, 2) === "\xFF\xFE")
+            {
+                $data = substr($data, 2);
+            }
+            // UTF-8 BOM
+            elseif (substr($data, 0, 3) === "\xEF\xBB\xBF")
+            {
+                $data = substr($data, 3);
+            }
 
-		$data = trim($data);
+            $data = trim($data);
 
-		if (substr($data, 0, 5) === '<?xml' && strspn(substr($data, 5, 1), "\x09\x0A\x0D\x20") && ($pos = strpos($data, '?>')) !== false)
-		{
-			$declaration = $this->registry->create('XML_Declaration_Parser', array(substr($data, 5, $pos - 5)));
-			if ($declaration->parse())
-			{
-				$data = substr($data, $pos + 2);
-				$data = '<?xml version="' . $declaration->version . '" encoding="' . $encoding . '" standalone="' . (($declaration->standalone) ? 'yes' : 'no') . '"?>' ."\n". $this->declare_html_entities() . $data;
-			}
-			else
-			{
-				$this->error_string = 'SimplePie bug! Please report this!';
-				return false;
-			}
-		}
+            if (substr($data, 0, 5) === '<?xml' && strspn(substr($data, 5, 1), "\x09\x0A\x0D\x20") && ($pos = strpos($data, '?>')) !== false)
+            {
+                $declaration = $this->registry->create('XML_Declaration_Parser', array(substr($data, 5, $pos - 5)));
+                if ($declaration->parse())
+                {
+                    $data = substr($data, $pos + 2);
+                    $data = '<?xml version="' . $declaration->version . '" encoding="' . $encoding . '" standalone="' . (($declaration->standalone) ? 'yes' : 'no') . '"?>' ."\n". $this->declare_html_entities() . $data;
+                }
+                else
+                {
+                    $this->error_string = 'SimplePie bug! Please report this!';
+                    return false;
+                }
+            }
+        }
 
 		$return = true;
+
+        if ( !is_string( $data ) ) {
+          $this->error_code = -1;
+          $this->error_string = 'Input is not a string';
+          return false;
+        }
 
 		static $xml_is_sane = null;
 		if ($xml_is_sane === null)

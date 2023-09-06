@@ -31,9 +31,9 @@ require_once "api/bootstrap.php";
   <link rel="apple-touch-icon" sizes="72×72" href="img/logo72.png" />
   <link rel="apple-touch-icon" sizes="114×114" href="img/logo114.png" />
 
-  <script type="module" src="https://cdn.jsdelivr.net/npm/@ionic/core/dist/ionic/ionic.esm.js"></script>
-  <script nomodule src="https://cdn.jsdelivr.net/npm/@ionic/core/dist/ionic/ionic.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@ionic/core/css/ionic.bundle.css"/>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@ionic/core@6.7.5/dist/ionic/ionic.esm.min.js"></script>
+  <script nomodule src="https://cdn.jsdelivr.net/npm/@ionic/core@6.7.5/dist/ionic/ionic.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@ionic/core@6.7.5/css/ionic.bundle.min.css"/>
   <script src="https://cdn.jsdelivr.net/npm/jquery@3.5.1/dist/jquery.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jquery-resizable-dom@0.35.0/dist/jquery-resizable.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/js-cookie@2.2.1/src/js.cookie.min.js"></script><?php

@@ -193,7 +193,7 @@ foreach ($mongo->{MONGO_DB_NAME}->feeds->find($find_array, [
           $link_img = '';
 
           if ($item->getImage()) {
-            $link_img = getImage;
+            $link_img = $item->getImage();
           } else if ($item->getBannerImage()) {
             $link_img = $item->getBannerImage();
           } else if ($item->getContentHtml()) {
@@ -230,12 +230,12 @@ foreach ($mongo->{MONGO_DB_NAME}->feeds->find($find_array, [
           }
 
           $description = $item->getSummary();
-          $url = ($item->getUrl() ? $item->getUrl() : '#' . $item->getId());
+          // URL is optional for a JSON feed, so just use ID as a hash
+          $url = ($item->getUrl() ?? '#' . $item->getId());
 
           $insert_value = [
-            'title'       => ($item->getTitle() ? $item->getTitle() : $url),
+            'title'       => ($item->getTitle() ?? $url),
             'description' => $description,
-            // URL is optional for a JSON feed, so just use ID as a hash
             'link'        => $url,
             'img'         => $link_img,
             'date'        => (is_int($date) ? $date : strtotime( $date )),
@@ -361,20 +361,21 @@ foreach ($mongo->{MONGO_DB_NAME}->feeds->find($find_array, [
 
             if ( $author_final ) {
               $author = $author_final;
+              break;
             }
           }
         }
 
         $insert_value = [
-          'title'       => ($item->get_title() ? untagize( $item->get_title() ) : $item->get_link()),
-          'description' => $item->get_description(),
-          'link'        => $item->get_link(),
-          'img'         => $link_img,
-          'date'        => strtotime( $item->get_date() ),
-          'fetched'     => time(),
-          'feed'        => $record->_id,
-          'processed'   => 0, // will be changed to 1 upon being processed and trained for all users,
-                              // so this link can be removed from the unprocessed collection
+          'title'        => ($item->get_title() ? untagize( $item->get_title() ) : $item->get_link()),
+          'description'  => $item->get_description(),
+          'link'         => $item->get_link(),
+          'img'          => $link_img,
+          'date'         => ( $item->get_date() ? strtotime( $item->get_date() ) : time() ),
+          'fetched'      => time(),
+          'feed'         => $record->_id,
+          'processed'    => 0, // will be changed to 1 upon being processed and trained for all users,
+                               // so this link can be removed from the unprocessed collection
         ];
 
         $first_item_stamp = $insert_value['date'];
