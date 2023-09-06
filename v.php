@@ -421,7 +421,7 @@ $mongo->{MONGO_DB_NAME}->sessions->updateOne(
 // set authentication cookie
 setcookie('feedit', $auth_hash, $expiry);
 
-echo $lang['Your account was successfully activated. Redirecting you to: '] . '<a href="app.php?lang=' . LANGUAGE . '">https://feedit.sk/app.php?lang=' . LANGUAGE . '</a>';
+echo $lang['Your account was successfully activated. Redirecting you to: '] . '<a href="app.php?lang=' . LANGUAGE . '">http://' . FEEDIT_WEB_URL . '/app.php?lang=' . LANGUAGE . '</a>';
 ?>
 
 <script>

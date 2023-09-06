@@ -63,7 +63,7 @@ $mongo->{MONGO_DB_NAME}->accounts->insertOne(
 $headers = get_mail_header();
 
 // TODO: change verification address in e-mail body
-if (send_mail($_POST['email'], $lang['FeedIt e-mail confirmation'], $lang['Please follow this link to verify your e-mail and create an account: '] . 'http://feedit.sk/v.php?id=' . $acc_id . '&lang=' . LANGUAGE . "\n\n" . $lang['Your verification code'] . ': ' . $acc_id, implode("\n", $headers))) {
+if (send_mail($_POST['email'], $lang['FeedIt e-mail confirmation'], $lang['Please follow this link to verify your e-mail and create an account: '] . FEEDIT_WEB_URL . '/v.php?id=' . $acc_id . '&lang=' . LANGUAGE . "\n\n" . $lang['Your verification code'] . ': ' . $acc_id, implode("\n", $headers))) {
   send_ok($lang['Verification e-mail was sent to the provided e-mail address. Please check your inbox (and also your spam folder if you cannot find this e-mail) in order to finish creating your account.'], [ 'lang' => LANGUAGE ]);
 } else {
   send_error($lang['Verification E-Mail Sending Failed'], $lang['Our systems could not send you a verification e-mail. Please try again.'], 503, 'system');

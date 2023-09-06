@@ -13,6 +13,7 @@ const SUPPORT_EMAIL = 'infofeedit@gmail.com';
 
 
 // DO NOT TOUCH THE CODE BELOW THIS LINE
+const FEEDIT_WEB_URL = 'http://feedit.sk';
 session_write_close();
 
 const DEBUG = false;

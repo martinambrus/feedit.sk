@@ -104,7 +104,7 @@ if (!empty($_GET['hash'])) {
 
     // TODO: change authentication address in e-mail body
     header( 'Content-Type: text/html; charset=utf-8' );
-    if ( send_mail( decode_user_email( $existing ), $lang['FeedIt login confirmation'], $lang['Please follow this link to log into your account: '] . 'http://feedit.sk/login.php?id=' . $existing->hash . '&hash=' . $auth_hash . '&lang=' . LANGUAGE . "\n\n" . $lang['Your verification code'] . ': ' . $auth_hash, implode( "\n", $headers ) ) ) {
+    if ( send_mail( decode_user_email( $existing ), $lang['FeedIt login confirmation'], $lang['Please follow this link to log into your account: '] . FEEDIT_WEB_URL . '/login.php?id=' . $existing->hash . '&hash=' . $auth_hash . '&lang=' . LANGUAGE . "\n\n" . $lang['Your verification code'] . ': ' . $auth_hash, implode( "\n", $headers ) ) ) {
       if ( ! empty( $_GET['id'] ) ) {
         echo $lang['A login confirmation e-mail was sent to the e-mail address recorded for your account. Please check your mailbox.'];
       } else {
