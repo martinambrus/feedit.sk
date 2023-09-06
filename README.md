@@ -2,7 +2,7 @@
 A trainable, fast, mobile-ready RSS reader. Designed for simplicity and speed. Parses even the most impossible and non-standard RSS feeds.
 
 ### 2 minute showcase video
-https://www.youtube.com/watch?v=tZWUCaQ_nUo&t=1s
+https://www.youtube.com/watch?v=x4l0ltXHicg
 
 ### Tech used:
 * PHP (using Composer)
