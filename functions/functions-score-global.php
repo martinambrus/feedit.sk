@@ -256,7 +256,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
         // increase / decrease score of all links where this n-gram is used
         // ... score must be increased / decreased for each word present in the n-gram
         $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany(
-          [ 'ngrams' => $ngram_data->_id, 'archived' => [ '$ne' => 1 ] ],
+          [ 'ngrams' => $ngram_data->_id, 'archived' => [ '$ne' => 1 ], 'read' => 0 ],
           [
             '$inc' => [
               'score' => $updateFields['$inc']['weight'] * $ngram_words_count,
@@ -787,7 +787,7 @@ function calculate_score( $feed_object, $user_id, $words, $link, $rate = false, 
       }
 
       if ( count($processedUpdateQuery4Words) ) {
-        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ], $processedUpdateQuery4Words );
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], $processedUpdateQuery4Words );
         $recalculate_averages = true;
       }
 

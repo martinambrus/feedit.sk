@@ -132,7 +132,7 @@
       }
   
       // adjust score of all links with this author present
-      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'author' => $link_data['author'], 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $weight_increase ] ] );
+      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'author' => $link_data['author'], 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => $weight_increase ] ] );
   
       // calculate average user interest for author in percent
       if ( $author_rating ) {
@@ -209,7 +209,7 @@
   
         // increment score of all links where our link's category exist
         if ($weight_increase != 0) {
-          $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $weight_increase ] ] );
+          $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => $weight_increase ] ] );
         }
       }
   
@@ -700,7 +700,7 @@
 
       // update score for all links with this word scored in them
       // as well as percentage of score adjustments from ngrams
-      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ] ],
+      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'words' => $word_data->_id, 'archived' => [ '$ne' => 1 ], 'read' => 0 ],
         [
           [
             '$set' => [
@@ -838,7 +838,7 @@
     }
 
     // update all links with this word scored
-    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'words' => $old_record->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - $old_record->weight ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'words' => $old_record->_id, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => - $old_record->weight ] ] );
 
     // update all ngrams with this word present
     $ngram_ids_to_update = [];
@@ -875,7 +875,7 @@
       $ngram_ids_to_update[] = $ngram->_id;
       if (($ngram->weight > 25 && $ngram->weightings > 1)) {
         $ngram_words_count = count( explode(' ', $ngram->ngram) );
-        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => - ($ngram->weight * $ngram_words_count) ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => - ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => - ($ngram->weight * $ngram_words_count) ] ] );
       }
     }
 
@@ -989,7 +989,7 @@
     }
 
     // update all links with this word scored
-    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'words' => $old_record->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $old_record->weight ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'words' => $old_record->_id, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => $old_record->weight ] ] );
 
     // update all ngrams with this word present
     $ngram_ids_to_update = [];
@@ -1026,7 +1026,7 @@
       $ngram_ids_to_update[] = $ngram->_id;
       if (($ngram->weight > 25 && $ngram->weightings > 1)) {
         $ngram_words_count = count( explode(' ', $ngram->ngram) );
-        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => ($ngram->weight * $ngram_words_count) ] ] );
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'ngrams' => $ngram->_id, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => ($ngram->weight * $ngram_words_count), 'score_increment_from_ngrams' => ($ngram->weight * $ngram_words_count) ] ] );
       }
     }
 
@@ -1128,7 +1128,7 @@
       $mongo->{MONGO_DB_NAME}->{'categories-' . $user->short_id}->updateOne( [ 'category' => $category, 'feed' => $feed_object ], [ '$inc' => [ 'weight' => $amount ] ] );
 
       // update all links with this category
-      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $amount ] ] );
+      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => $amount ] ] );
 
       $category_interest_percentage_new    = ( ( ( ( ($old_record->weight + $amount) / 0.01) ) / $old_record->weightings ) * 100 );
       $category_interest_percentage_old    = ( ( ( $old_record->weight / 0.01 ) / $old_record->weightings ) * 100 );
@@ -1201,7 +1201,7 @@
     }
 
     // update all links with this category
-    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => - $old_record->weight ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => - $old_record->weight ] ] );
 
     // update categories interest percentage value for all links where this category exists
     if ($old_record->weight) {
@@ -1279,7 +1279,7 @@
     }
 
     // update all links with this category
-    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $old_record->weight ] ] );
+    $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'categories' => $category, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => $old_record->weight ] ] );
 
     // update categories interest percentage value for all links where this category exists
     if ($old_record->weight) {
@@ -1403,7 +1403,7 @@
 
       // now update these records
       if (count($ids)) {
-        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ '_id' => [ '$in' => $ids ] ], [
+        $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ '_id' => [ '$in' => $ids ], 'read' => 0 ], [
           '$inc' => [
             'score' => $amount,
             'score_increment_from_adjustments' => $amount
@@ -1486,7 +1486,7 @@
 
         // now update these records
         if (count($ids)) {
-          $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ '_id' => [ '$in' => $ids ] ], [
+          $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ '_id' => [ '$in' => $ids ], 'read' => 0 ], [
             '$inc' => [
               'score' => - $update_links_by,
               'score_increment_from_adjustments' => - $update_links_by
@@ -1523,7 +1523,7 @@
       $mongo->{MONGO_DB_NAME}->{'authors-' . $user->short_id}->updateOne( [ 'author' => $author, 'feed' => $feed_object ], [ '$inc' => [ 'weight' => $amount ] ] );
 
       // update all links with this author
-      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'author' => $author, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ], [ '$inc' => [ 'score' => $amount ] ] );
+      $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany( [ 'author' => $author, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ], 'read' => 0 ], [ '$inc' => [ 'score' => $amount ] ] );
 
       $mongo->{MONGO_DB_NAME}->{'training-' . $user->short_id}->updateMany(
         [ 'author' => $author, 'feed' => $feed_object, 'archived' => [ '$ne' => 1 ] ],
