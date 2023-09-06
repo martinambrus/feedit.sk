@@ -245,6 +245,11 @@ ion-slide .link_content img {
     --height: 95%;
 }
 
+.show-modal {
+    --width: 95%;
+    --height: 95%;
+}
+
 .word_label, .word_label.ignored ion-icon,
 .author_label, .author_label.ignored ion-icon,
 .category_label, .category_label.ignored ion-icon,
