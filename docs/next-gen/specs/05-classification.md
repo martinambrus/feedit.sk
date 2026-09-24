@@ -27,15 +27,24 @@ and `apps/worker/src/handlers/article-{enrich,match,cluster}.ts`, `card-backfill
   exporting `{ kind, version, questions }`.
 - `canonicalJson(x)`: JSON with object keys sorted recursively, no whitespace, arrays in order.
   `sha256(canonicalJson({kind, version, questions}))` is the set's `sha256`.
-- For the **match** set, the hash covers the builder *template*: the instruction wrappers and criteria
-  scaffolding with placeholders. Individual card questions are then identified by
-  `(question_set_sha, card.text_hash)`.
-- `pnpm db:seed` (and a startup check in the worker) upserts every set into `question_sets`. It
-  **fails** if a `version` already exists with a different `sha256`. Changing wording requires bumping
-  the version (`enrich-v2`).
-- `settings['question_sets.active']` names the active set per kind. Switching `enrich` to a new set is
-  an admin action that enqueues re-enrichment of articles first seen in the last 7 days (a
-  `house.reenrich` one-off job, capped by the budget).
+- **Dynamic sets** (`match-v1`, `cluster-v1`, `suggest-v1`) are hashed over their **template**: the
+  builder applied to fixed placeholder inputs. For example,
+  `definition = { kind: 'match', version: 'match-v1', card: cardQuestion(PLACEHOLDER_CARD, 'as_written'), label: labelQuestion(PLACEHOLDER_LABEL, 'as_written'), l2: l2Question(PLACEHOLDER_L1) }`
+  with `PLACEHOLDER_CARD = { interest: '{{interest}}', not_for: '{{not_for}}', examples_yes: ['{{yes}}'], examples_no: ['{{no}}'] }`.
+  Cluster options are `c1…cN` plus `none` (N ≤ 5), and the template uses N = 5.
+  - Any change to a builder changes the template and therefore the sha. A test asserts that the stored
+    sha equals the computed one.
+  - Individual card answers are identified by `(question_set_sha, card_id)`. Card ids are immutable
+    content (§5.1).
+- **Seeding:** `pnpm db:seed` (root script → `pnpm --filter @feedit/worker seed`, i.e.
+  `apps/worker/src/seed.ts`, because only apps may import every package) upserts every set into
+  `question_sets`. The worker also checks this at startup.
+  - It **fails** if a `version` already exists with a different `sha256`. Changing wording requires
+    bumping the version (`enrich-v2`).
+  - It sets `settings['question_sets.active'][kind]` **only when that kind is absent**.
+- **Switching sets:** `settings['question_sets.active']` names the active set per kind. Switching
+  `enrich` to a new set (`PATCH /admin/settings`) enqueues `house.reenrich {since: now − 7 days}`,
+  which re-enqueues `article.enrich` for those articles in batches, within the budget.
 
 ---
 
@@ -60,7 +69,8 @@ type Variant = 'native' | 'translated';
 // plus  original_title: string  and  language: "Slovak (machine-translated to English)"
 ```
 
-- The variant is chosen per article from `LANGUAGE_MODES[article.lang]` (spec 07 §2). An unknown
+- The variant is chosen per article from `settings['language_modes'][article.lang]` (env default
+  `LANGUAGE_MODES`; spec 07 §1). An unknown
   language uses `'native'`.
 - If the mode is `translate` but no usable translation exists (both tiers failed), the builder falls
   back to `'native'`.
@@ -215,26 +225,64 @@ A card's `body`:
 
 ```
 norm(s) = NFC, trim, collapse whitespace, lower-case
-text_hash = sha256(canonicalJson({ kind, interest: norm(interest), not_for: norm(not_for ?? ''),
+text_hash = sha256Hex(canonicalJson({ kind, interest: norm(interest), not_for: norm(not_for ?? ''),
+                                   title: kind === 'label' ? norm(title) : null,
                                    examples_yes: examples_yes ?? [], examples_no: examples_no ?? [],
                                    owner: visibility === 'private' ? owner_user_id : null }))
+// canonicalJson, sha256Hex and normalizeText live in packages/shared (spec 01 §2)
 ```
 
-**Lifecycle** (`packages/db` card repository, called by the API):
+**Immutability** (the rule that keeps answers valid):
+- A card row's `kind`, `interest`, `not_for`, examples and `text_hash` **never change** after insert.
+  Every change to text or examples creates, or reuses by `text_hash`, **another** card row. So
+  `card_answers` for a `card_id` always describe exactly that text.
+- The only in-place updates are:
+  - `retired_at` (a card reused while retired is un-retired)
+  - admin library fields (`title`, `topic_ids`, `i18n`, `slug`, `visibility` on promotion)
+  - the derived translations `interest_en`/`not_for_en`, which may be filled **once** when null
+    (spec 07 §5)
+- `interest_cards.title` is only a default name. Each holder's own name lives in
+  `user_cards.title_override`.
+- For **labels**, the title is part of the label's meaning: `text_hash` includes `title` for
+  `kind = 'label'`, so differently named labels are different cards.
+
+**Forks:**
+- `parent_card_id` always points to the original `shared`/`library` card: for a fork of a fork,
+  `parent = old.parent_card_id ?? old.id`.
+- `owner_user_id` is the user, and `visibility = 'private'`.
+- The fork's `text_hash` includes the owner.
+- Interest-card forks count toward `maxForks`. Label forks do not; they are bounded by `maxLabels`.
+
+**Lifecycle** (`packages/db` card repository). Each function runs in the caller's `TenantTx` and
+returns **effects** `{ refreshFeedIds: string[], backfill?: {cardIds, feedIds?}, rankFull: boolean, labelIdChange?: {from, to} }`:
+- The repository runs `refresh_feed_cards` itself, inside the transaction.
+- The API service enqueues the jobs **after commit** through `packages/shared/src/jobs.ts`. If the
+  process dies in between, `house.reconcile` and the nightly rank catch up.
 
 | Action | Effect |
 |---|---|
-| Create (text only) | Compute `text_hash`. Reuse an existing `public`/`shared` card with that hash, or insert `origin='user', visibility='shared'`. Insert `user_cards`. Refresh `feed_cards` for the user's feeds. Enqueue `card.backfill` |
-| Adopt a library card | Insert `user_cards` for the library card. Refresh + backfill as above |
-| Add an example (from "Why this?" or "make a card from this") | If the user's card is not their own private fork, create a fork: `origin='fork', visibility='private', owner_user_id=user, parent_card_id=old`, body with the new example (newest 5 per side). Re-point `user_cards` (delete old, insert new, same strength and scope). Refresh + backfill for the fork |
-| Edit text | Same as create for the new text. Re-point `user_cards`. The old card keeps its answers for other holders |
-| Change strength | Update `user_cards.strength`. Enqueue `user.rank {full: true}`. No model calls |
-| Change scope | Update `scope_feed_id`, refresh `feed_cards`, backfill if the scope widened |
-| Delete | Delete `user_cards`, refresh `feed_cards`, enqueue `user.rank {full:true}`. Cards are never deleted while answers exist; `house.retire-cards` retires cards with no holders that aren't in the library (spec 11) |
+| **Create** (text only; API `POST /cards`) | Compute `text_hash`. Reuse a `public`/`shared` card with that hash (un-retire it if retired), or insert `origin='user', visibility='shared', title`. Insert `user_cards` (strength, scope; `title_override` = the given title if it differs from the card's). Effects: refresh, backfill, rank full |
+| **Adopt** a library card | Insert `user_cards`. Same effects |
+| **Make a card from an article** (`POST /cards/from-article`) | Create or reuse the shared text-only card for `{interest, not_for}`, then **fork** it with the article title in `examples_yes`. The user holds the fork |
+| **Add or remove an example** (interest card) | Build the new body: the current examples ± this one, newest 5 per side. Create or reuse the private fork with that body (hash includes the owner). Re-point the user's `user_cards` row to it (keep strength, scope, `title_override`). The previous fork, if any, is left for `house.retire-cards` |
+| **Edit text** (`PATCH /cards/:id` with `interest`/`not_for`) | As Create for the new text (a user with examples gets a fork of the new text carrying the same examples). Re-point `user_cards`. The old card keeps its answers for other holders |
+| **Rename** (`PATCH /cards/:id {title}`) | Set `user_cards.title_override`. No card change, no model calls |
+| **Change strength** | Update `user_cards.strength`. Effect: rank full. No model calls |
+| **Change scope** | Update `scope_feed_id`. Effects: refresh, and a backfill if the scope widened, rank full |
+| **Delete** | Delete the `user_cards` row. Effects: refresh, rank full. Card rows are never deleted by the API; `house.retire-cards` retires unheld non-library cards (spec 11 §6) |
+| **Create a label** (`POST /labels`) | As Create with `kind='label'` (the hash includes the title). Insert `user_labels (card_id, name = title, color)` |
+| **Assign or unassign a label on an article** | **Does not touch cards.** It only updates `user_article.label_ids`/`label_suggestions` and records `label`/`unlabel` (spec 08 §5.3) |
+| **Add or remove a label example** (`POST /labels/:id/examples`) | Fork the label (as for interest cards). Re-point `user_labels`. In the same transaction, `UPDATE user_article SET label_ids = array_replace(label_ids, old, new), label_suggestions = array_replace(label_suggestions, old, new) WHERE user_id = me`. Effects: refresh, backfill, `labelIdChange` |
+| **Rename or redefine a label** (`PATCH /labels/:id`) | A new label card by hash, re-pointed with the same `array_replace` |
 
-`CARD_TEXT_MODE = 'english'` (a setting, decided at gate G1): on create, if the card text's detected
-language is not English, translate `interest` and `not_for` with tier-1 MT into `interest_en` and
-`not_for_en`. The builder uses the `*_en` fields when present. Users always see what they wrote.
+**`CARD_TEXT_MODE = 'english'`** (a setting, decided at gate G1). The **API service** handles
+translation, before the repository inserts a new card:
+- detect the card text's language (spec 07 §5)
+- if it is not English, call the tier-1 translator
+- store `interest_en`/`not_for_en` and `lang` in the new row
+
+The builder uses the `*_en` fields when present. Users always see what they wrote. Existing cards are
+translated by the one-off `house.translate-cards` job when the mode is switched on (spec 07 §5).
 
 ### 5.2 Question builders
 
@@ -251,8 +299,10 @@ export function cardQuestion(card: CardBody, mode: CardTextMode): NoulQuestion {
   );
 }
 
-export function labelQuestion(name: string, card: CardBody, mode: CardTextMode): NoulQuestion {
-  // same shape with question: 'Does `article` fit this label?', label: name, definition: interest, not_for
+export function labelQuestion(card: CardRow, mode: CardTextMode): NoulQuestion {
+  // same shape with question: 'Does `article` fit this label?', label: card.title (the shared card's
+  // title, which is part of the label's text_hash), definition: interest, not_for, examples as for cards.
+  // user_labels.name is display-only and never sent to the model.
 }
 ```
 
@@ -283,8 +333,8 @@ export function labelQuestion(name: string, card: CardBody, mode: CardTextMode):
    (default 7) and `pipeline_state IN ('enriched','matched')`, newest first, capped at **500** per
    request.
 3. `INSERT INTO match_queue (article_id, card_id, priority, user_id)` with priority **2** for the newest
-   50 articles and **6** for the rest, `ON CONFLICT DO NOTHING`. Skip pairs that already exist in
-   `card_answers` with the current match set sha.
+   50 articles and **6** for the rest, `ON CONFLICT DO NOTHING`. Skip pairs that already have a
+   `card_answers` row from `typesafe`/`laya` at the current match set sha.
 4. Enqueue `article.match` for each affected article (singleton per article).
 
 A new subscription runs a backfill of all the user's cards for that feed.
@@ -293,8 +343,9 @@ A new subscription runs a backfill of all the user's cards for that feed.
 
 1. Claim the rows:
    `SELECT card_id, priority, user_id FROM match_queue WHERE article_id = $1 ORDER BY priority, enqueued_at FOR UPDATE SKIP LOCKED LIMIT 400`.
-2. Drop retired cards, and cards that already have an answer with the current match set sha (delete
-   those queue rows).
+2. Drop retired cards, and cards that already have an answer **from `typesafe` or `laya`** at the
+   current match set sha (delete those queue rows). Answers from `llm` or `prefilter` are re-asked
+   whenever the pair is queued again, and are replaced by the new answer.
 3. **Prefilter.** Only when the article has more than `PREFILTER_MIN_CARDS` (default 60) queued cards
    **and** has facets:
    - keep a card if `topic_ids` is empty, or if any of its L1s has `t1.<l1> ≥ 0.05`, or if it is a
@@ -307,14 +358,29 @@ A new subscription runs a backfill of all the user's cards for that feed.
    - `priority: 'interactive'` if any row in the pack has priority ≤ 3, else `'bulk'`
    - `userId`: the single user if every row came from one user's backfill
 6. **On ok:**
-   - upsert `card_answers` (`p`, engine, model, sha, variant) and `article_topics_l2`
-   - recompute `article_facets.features`
+   - upsert `card_answers` (`p`, engine, model, sha, variant, `answered_at = now()`) and
+     `article_topics_l2`
+   - recompute `article_facets.features` and bump `article_facets.updated_at`
    - delete the answered queue rows
    - set `pipeline_state = 'matched'`
-7. **On not ok:** `attempts += 1` on the rows. Rows with `attempts ≥ 5` are dropped with a warning,
-   and the ranker treats a missing answer as unknown.
-8. Enqueue `user.rank {userId, reason: 'match'}` for every user subscribed to any of the article's
-   feeds (spec 06 §7 decides what is dirty).
+7. **On not ok:** `attempts += 1` on the rows. Rows with `attempts ≥ 5` are deleted with a warning. If
+   any of those cards then has no answer for this article, set `pipeline_state = 'degraded'` so the
+   ranker uses the BM25 fallback and `house.rescore-degraded` retries later.
+8. **More rows left?** If `match_queue` still holds rows for this article (more than the 400 claimed,
+   or rows added meanwhile), the handler enqueues `article.match` for the same article again before
+   finishing.
+9. Enqueue `user.rank {userId, reason: 'match'}` (incremental, debounced) for every user subscribed to
+   any of the article's feeds. Spec 06 §7 decides what is dirty.
+
+### 5.6 `resetArticleAnswers(articleId)`
+
+Used when the article's text changes: a title change at ingest (spec 03 §7), or a tier-2
+re-translation (spec 07 §3). In one transaction:
+1. `DELETE FROM card_answers WHERE article_id = $1`, and the same for `article_topics_l2`.
+2. `INSERT INTO match_queue (article_id, card_id, priority) SELECT $1, card_id, 5 FROM feed_cards WHERE feed_id IN (the article's feeds) ON CONFLICT DO NOTHING`.
+3. Set `pipeline_state = 'ingested'` (title change) or `'translated'` (re-translation).
+
+The caller then enqueues extract or enrich. Match follows automatically.
 
 ---
 
@@ -323,16 +389,24 @@ A new subscription runs a backfill of all the user's cards for that feed.
 1. **Candidates** (SQL):
 
    ```sql
-   SELECT a.id, a.title, a.excerpt, a.first_seen_at, f.title AS feed
-   FROM articles a JOIN feed_items fi ON fi.article_id = a.id JOIN feeds f ON f.id = fi.feed_id
-   WHERE a.id <> $1
-     AND a.first_seen_at BETWEEN $2 - interval '72 hours' AND $2 + interval '1 hour'
-     AND similarity(a.title_norm, $3) >= 0.35
-   ORDER BY similarity(a.title_norm, $3) DESC
-   LIMIT 5;
+   SET LOCAL pg_trgm.similarity_threshold = 0.35;           -- makes `%` use the GIN trigram index
+   SELECT * FROM (
+     SELECT DISTINCT ON (a.id) a.id, a.title, a.excerpt, a.first_seen_at, f.id AS feed_id, f.title AS feed,
+            similarity(a.title_norm, $3) AS sim
+     FROM articles a
+     JOIN feed_items fi ON fi.article_id = a.id
+     JOIN feeds f ON f.id = fi.feed_id
+     WHERE a.id <> $1
+       AND a.title_norm % $3
+       AND a.first_seen_at BETWEEN $2 - interval '72 hours' AND $2 + interval '1 hour'
+     ORDER BY a.id, fi.first_seen_at
+   ) c
+   ORDER BY sim DESC
+   LIMIT 20;
    ```
 
-   Prefer candidates from other feeds: when there are more than 5, keep at most 2 from the same feed.
+   Then, in code: walk the 20 by similarity, skip a candidate once 2 from the same `feed_id` have been
+   kept, and stop at 5.
 2. No candidates → done (the article is a singleton, `story_cluster_id` stays null).
 3. **State:**
    `{ new: {title, excerpt≤300, feed, published}, candidates: [{id: 'c1'…'c5', title, excerpt≤300, feed, published}] }`.
@@ -343,7 +417,7 @@ A new subscription runs a backfill of all the user's cards for that feed.
    ```ts
    same_story: choice({ question: 'Which item in `candidates` reports the same specific event as `new`?',
                         focus: 'Same topic is not enough; it must be the same event.' },
-                      { c1: null, c2: null, …, none: 'No candidate reports the same specific event' }),
+                      { c1: null, …, cN: null, none: 'No candidate reports the same specific event' }),   // N = number of candidates (1–5)
    is_followup: noul('Is `new` a follow-up with substantial new developments rather than a re-report of an event already covered in `candidates`?'),
    ```
 
@@ -380,8 +454,17 @@ A new subscription runs a backfill of all the user's cards for that feed.
 
 - One file per L1. Each entry:
   `{ slug, title, title_sk, interest, interest_sk?, not_for?, topic_ids: string[], examples_yes?: string[≤3], examples_no?: string[≤2] }`.
-- `pnpm db:seed` upserts by `slug` into `interest_cards` (`origin='library', visibility='public'`,
-  `i18n.sk` from the `*_sk` fields).
+- **`pnpm db:seed`** (`apps/worker/src/seed.ts`, running as `feedit_worker`) upserts by `slug` into
+  `interest_cards` (`origin='library', visibility='public'`, `i18n.sk` from the `*_sk` fields):
+  - **Unchanged text** (same `text_hash`): update `title`, `topic_ids`, `i18n` in place.
+  - **Changed text:**
+    - insert a new card with the new hash
+    - move the `slug` to it (set the old row's `slug = NULL` first)
+    - retire the old row
+    - re-point holders with `UPDATE user_cards SET card_id = new WHERE card_id = old` (skip users who
+      already hold the new card; delete their old row instead)
+    - call `refresh_feed_cards` for the affected feeds
+    - enqueue `card.backfill` for each affected user
 - **Size:** ≥ 150 cards in total and ≥ 5 per L1 (except `other`), including ≥ 15 cards specific to
   Slovakia/Czechia (e.g. Slovak domestic politics, Czech tech scene, Tatras hiking, Slovak football
   league).
@@ -443,7 +526,7 @@ Every stored answer carries:
 
 Every call has an `engine_calls` row. Raw answers are never overwritten by a *different* engine
 without a new row (`card_answers` is upserted, but only with the same or a better engine: `typesafe`
-replaces `llm`/`prefilter`, never the reverse). The eval replay (spec 10 §7) depends on this.
+replaces `llm`/`prefilter`, never the reverse). The eval replay (spec 10 §6) depends on this.
 
 ---
 

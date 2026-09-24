@@ -15,7 +15,7 @@ Code lives in `packages/feeds` (pure logic and the safe HTTP client) and in `app
 feed.schedule (cron, every minute)
    └─► feed.fetch {feedId}                       fetch + parse + ingest in one handler
           └─► article.extract {articleId}        for each NEW article that is not stale
-                 └─► article.translate {id}      only if LANGUAGE_MODES[lang] = 'translate' (spec 07)
+                 └─► article.translate {id}      only if language_modes[lang] = 'translate' (spec 07 §1)
                         └─► article.enrich {id}  Call A (spec 05)
                                ├─► article.cluster {id}   story clustering (spec 05 §6)
                                └─► article.match {id}     Call B for pending match_queue rows (spec 05 §5)
@@ -31,31 +31,43 @@ calling `pipeline.after(<stage>, articleId, outcome)`.
 |---|---|
 | extract | no body (`article_bodies.status = failed/skipped`); enrich uses title + excerpt |
 | translate (both tiers) | native text (`state_variant = 'native'`) |
-| enrich (engine unavailable) | `pipeline_state = 'degraded'`; no match; `user.rank` ranks with the BM25 fallback; `house.rescore-degraded` retries later (spec 04 §5) |
+| enrich: engine unavailable (`budget`, `circuit_open`, `error`, `no_key`) | `pipeline_state = 'degraded'`; no match; `pipeline.after` enqueues `user.rank` for **all subscribers** of the article's feeds, which rank it with the BM25 fallback; `house.rescore-degraded` retries later (spec 04 §5) |
+| enrich: `invalid_request` (a bug in a question set) | `pipeline_state = 'failed'`; ranked like degraded; an error log with the question-set sha; never retried automatically |
 | cluster | article stays unclustered |
-| match | the rows stay in `match_queue` with `attempts + 1`; ranking uses whatever answers exist |
+| match | the rows stay in `match_queue` with `attempts + 1`; ranking uses whatever answers exist; rows dropped after 5 attempts rank like degraded (spec 05 §5.5) |
 
 ---
 
-## 2. Queues (pg-boss)
+## 2. Queues (pg-boss 10)
 
-| Queue | Payload (zod) | Producer | Concurrency / process | Retry | Singleton key | Notes |
-|---|---|---|---|---|---|---|
-| `feed.schedule` | `{}` | cron `* * * * *` | 1 | none | — | enqueues due feeds (§3) |
-| `feed.fetch` | `{feedId: string}` | schedule, subscribe API | 16 | 0 (failures are accounted for in the feed row) | `feed:<id>` | `expireInSeconds: 120` |
-| `article.extract` | `{articleId: string}` | fetch | 8 | 2, backoff 30 s | `extract:<id>` | per-host politeness (§8.2) |
-| `article.translate` | `{articleId: string, forceTier2?: boolean}` | extract, ranker (spec 07 §5) | 4 | 1 | `translate:<id>` | |
-| `article.enrich` | `{articleId: string, priority?: 'interactive'\|'bulk'}` | extract/translate, rescore | 8 (shares the engine semaphore) | 1 | `enrich:<id>` | |
-| `article.cluster` | `{articleId: string}` | enrich | 4 | 1 | `cluster:<id>` | |
-| `article.match` | `{articleId: string}` | enrich, card.backfill | 8 | 1 | `match:<id>` | drains all queued cards for the article |
-| `card.backfill` | `{userId: string, cardIds: string[], feedIds?: string[]}` | API (card or subscription change) | 2 | 2 | — | spec 05 §5.4 |
-| `user.rank` | `{userId: string, reason: string, full?: boolean}` | match, API, learn | 4 | 2 | `rank:<userId>` with `singletonSeconds: 3` | debounced; the handler finds dirty articles itself (spec 06 §7) |
-| `user.learn` | `{userId: string}` | API (ratings), cron | 2 | 1 | `learn:<userId>` with `singletonSeconds: 60` | spec 06 §8 |
-| `user.suggest` | `{userId: string}` | learn, nightly cron | 1 | 1 | `suggest:<userId>` | spec 05 §7 |
-| `house.*` | `{}` | cron | 1 | 1 | — | spec 11 §6 |
+**Single source:** `packages/shared/src/jobs.ts` exports, for every queue, its name, zod payload
+schema, `createQueue` options and typed enqueue helpers (`enqueueFetch`, `enqueueRank`,
+`enqueueLearn`, `enqueueBackfill`, …) over a small `JobSender` interface.
+- The migrate job creates every queue (spec 02 §1.2).
+- The API and the worker both import these helpers, so payloads and keys never diverge.
 
-Payload IDs are strings (bigint-safe). Handlers validate payloads with zod and drop invalid jobs with an
-error log. Invalid payloads are never retried.
+| Queue | Payload (zod) | Producer | Concurrency / process | Retry | Queue options and send semantics |
+|---|---|---|---|---|---|
+| `feed.schedule` | `{}` | cron `* * * * *` | 1 | none | `policy: 'standard'` |
+| `feed.fetch` | `{feedId}` | schedule, subscribe API | 16 | 0 (failures are accounted for in the feed row) | `policy: 'stately'`, `singletonKey: feed:<id>` (at most one queued plus one running per feed), `expireInSeconds: 120` |
+| `article.extract` | `{articleId}` | fetch | 8 | 2, backoff 30 s | `stately`, key `extract:<id>` |
+| `article.translate` | `{articleId, forceTier2?: boolean}` | extract, `user.rank` (spec 07 §3) | 4 | 1 | `stately`, key `translate:<id>` |
+| `article.enrich` | `{articleId, priority?: 'interactive'\|'bulk'}` | extract/translate, rescore, reenrich | 8 (shares the engine semaphore) | 1 | `stately`, key `enrich:<id>` |
+| `article.cluster` | `{articleId}` | enrich | 4 | 1 | `stately`, key `cluster:<id>` |
+| `article.match` | `{articleId}` | enrich, `card.backfill`, itself (when rows remain) | 8 | 1 | `stately`, key `match:<id>`; drains all queued cards for the article |
+| `card.backfill` | `{userId, cardIds: string[], feedIds?: string[]}` | API (card or subscription change) | 2 | 2 | `standard` |
+| `user.rank` | `{userId, reason, full?: boolean}` | match, enrich (degraded), API, learn | 4 | 2 | incremental: `sendDebounced(…, 3 s, key rank:<userId>)`; full: a `stately` send with key `rank-full:<userId>`. A full request is never swallowed by a pending incremental one (spec 06 §7) |
+| `user.learn` | `{userId}` | API (ratings), `house.nightly-learn` | 2 | 1 | `sendDebounced(…, 60 s, key learn:<userId>)` |
+| `user.suggest` | `{userId}` | learn, `house.nightly-learn` | 1 | 1 | `sendThrottled(…, 86,400 s, key suggest:<userId>)`: at most daily |
+| `house.rescore-degraded`, `house.expire-rules`, `house.purge-auth`, `house.reconcile`, `house.archive`, `house.purge-articles`, `house.purge-bodies`, `house.purge-engine-calls`, `house.retire-cards`, `house.purge-users`, `house.nightly-learn`, `house.metrics`, `house.alerts` | `{}` | cron (spec 11 §6) | 1 | 1 | `policy: 'singleton'` (never two runs at once) |
+| `house.reenrich`, `house.translate-cards` | `{since?: iso}` | admin action (spec 05 §2, spec 07 §5) | 1 | 1 | `singleton` |
+
+**Rules:**
+- Payload IDs are strings (bigint-safe).
+- Handlers validate payloads with zod and drop invalid jobs with an error log. Invalid payloads are
+  never retried.
+- If the pinned pg-boss version names a policy or helper differently, keep the semantics in the last
+  column and log the mapping (spec 01 §9).
 
 ---
 
@@ -86,9 +98,21 @@ All outbound HTTP for feeds, pages, discovery and robots.txt goes through `safeF
 
 1. **Schemes:** only `http:` and `https:`. **Ports:** only 80, 443, 8080, 8443 (others fail with
    `FEED_BLOCKED_ADDRESS`).
-2. **DNS pinning:** an undici `Agent` with `connect.lookup = safeLookup`. `safeLookup` resolves with
-   `dns.lookup(host, {all: true})`. If **any** resolved address is in a blocked range it rejects;
-   otherwise it returns the first allowed address to the connector, which prevents DNS rebinding.
+2. **Address checks** happen on **every hop**, in two places, because Node never calls `lookup` for
+   IP-literal hosts:
+   - **(a) IP-literal hosts.** Before connecting, if the URL host is an IP literal, validate it directly
+     against the blocked ranges. Cover bracketed IPv6, IPv4-mapped IPv6, and the decimal, octal and hex
+     IPv4 forms that WHATWG `URL` normalizes (e.g. `http://2130706433/` becomes `127.0.0.1`).
+   - **(b) Hostnames.** Use an undici `Agent` with `connect.lookup = safeLookup`.
+     - `safeLookup(hostname, options, cb)` resolves through an **injectable resolver** (default
+       `dns.lookup(host, {all: true})`).
+     - It rejects if **any** resolved address is blocked.
+     - It honours `options.all`: with `all: true` (Node 22's `autoSelectFamily` asks for that), return
+       the full array of allowed addresses; otherwise return the first.
+     - The connection uses exactly the validated addresses, which prevents DNS rebinding.
+   - `safeFetch(url, { resolver })` accepts the resolver for tests, so SSRF tests can map
+     `evil.example` to `127.0.0.1` without touching real DNS.
+
    Blocked ranges (use `ipaddr.js` `range()` plus explicit CIDRs):
    - **IPv4:**
      - `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`
@@ -97,9 +121,10 @@ All outbound HTTP for feeds, pages, discovery and robots.txt goes through `safeF
    - **IPv6:**
      - `::/128`, `::1/128`, `fc00::/7`, `fe80::/10`, `ff00::/8`, `64:ff9b::/96`, `2001:db8::/32`
      - `::ffff:0:0/96`: check the embedded IPv4 address against the IPv4 list
-3. **Redirects:** `maxRedirections: 0`. The client follows redirects itself, up to **5 hops**,
-   re-validating scheme, port and address on every hop. It records the final URL and whether any hop
-   was a `301`/`308` (permanent).
+3. **Redirects:** no automatic redirect following. undici's `request` does not follow redirects by
+   default, and no redirect interceptor is installed. The client follows `Location` itself, up to
+   **5 hops**, re-validating scheme, port and address (2a/2b) on every hop. It records the final URL and
+   whether any hop was a `301`/`308` (permanent).
 4. **Limits:**
    - headers timeout 10 s; total timeout `FETCH_TIMEOUT_MS` (20 s)
    - body capped at `FETCH_MAX_BYTES` (5 MB), counted on the **decompressed** stream; abort with
@@ -115,8 +140,11 @@ All outbound HTTP for feeds, pages, discovery and robots.txt goes through `safeF
    It never throws for network or HTTP errors.
 8. **Error codes:** `FEED_BLOCKED_ADDRESS`, `FEED_DNS_ERROR`, `FEED_TIMEOUT`, `FEED_TLS_ERROR`,
    `FEED_CONNECTION_ERROR`, `FEED_TOO_LARGE`, `FEED_HTTP_<status>`, `FEED_TOO_MANY_REDIRECTS`.
-9. **Testing escape hatch:** `FETCH_ALLOW_PRIVATE=true` disables the address check so local fixture
-   servers work. Config validation **rejects** this flag when `NODE_ENV=production`.
+9. **Testing escape hatch:** `FETCH_ALLOW_PRIVATE=true` disables **both** the address checks and the
+   port allow-list, so local fixture servers on random ports work (M1-T9, E2E). Config validation
+   **rejects** this flag when `NODE_ENV=production`. SSRF tests always run with the hatch **off**, using
+   the injected resolver and IP-literal URLs: `127.0.0.1`, `[::1]`, `[::ffff:127.0.0.1]`, `2130706433`,
+   `0x7f.1`.
 
 **Charset decoding** (`decodeBody(bytes, contentType)`):
 1. Use the charset from the `Content-Type` header.
@@ -148,7 +176,8 @@ Decode with `iconv-lite`.
 6. Collapse repeated slashes in the path. Do **not** change trailing slashes or case in the path.
 7. `canonical_url` = the result. `url_key` = `canonical_url` without `scheme:`, e.g.
    `//example.com/a?b=1`.
-8. **Linkless items** (no link, or no URL-like guid): `url_key = 'urn:feedit:' + feedId + ':' + sha1(guid ?? title + published)`.
+8. **Linkless items** (no link, or no URL-like guid):
+   `url_key = 'urn:feedit:' + feedId + ':' + sha1Hex(guid ?? (title + '|' + (published_at?.toISOString() ?? '')))`.
 
 Unit tests cover at least 40 cases, including IDN hosts, repeated params, AMP URLs (left unchanged,
 because only `rel=canonical` fixes AMP), Google News wrappers and hash-bang URLs.
@@ -215,9 +244,13 @@ For one fetch, in **one transaction per item**, so one bad item doesn't roll bac
 2. **Exact match:** look up `articles.url_key = url_key` or `article_aliases.url_key = url_key`.
    - **Found:**
      - Upsert `feed_items (feed_id, article_id, guid)`.
-     - If `content_hash` differs and `title_norm` changed: update title/excerpt/hash, set
-       `pipeline_state = 'ingested'` and enqueue extract again. This counts as a new article for the
-       pipeline, so it is re-enriched and re-matched.
+     - If `content_hash` differs and `title_norm` changed:
+       - update title/excerpt/hash
+       - run `resetArticleAnswers(articleId)` (spec 05 §5.6): delete its `card_answers` and
+         `article_topics_l2`, and re-insert `match_queue` rows from `feed_cards`
+       - set `pipeline_state = 'ingested'` and enqueue extract again
+
+       This counts as a new article for the pipeline, so it is re-enriched and re-matched.
      - If only the excerpt changed: update the excerpt fields and nothing else.
      - Not new.
 3. **Guid match within the same feed** (`feed_items.guid`): treat it like found (the URL changed).
@@ -289,17 +322,21 @@ fetching non-HTML media.
 - A 429 or 503 with `Retry-After` blocks the origin for that long (up to 1 h) and re-queues the job
   with `startAfter`.
 
-### 8.3 Language detection (`detectLanguage`, pure)
+### 8.3 Language detection (`detectLanguage`, pure, in `packages/shared`)
+
+It lives in `packages/shared`, because `translate`, `feeds` and the API (card text) all use it.
+Signature: `detectLanguage(text, { hint?, minLength? = 40 })`.
 
 **Input:** `title + ' ' + excerpt + ' ' + body_lead.slice(0, 1000)`.
 
-1. If the text is shorter than 40 chars: `lang = feed.lang_hint ?? 'und'`, confidence 0.
-2. Otherwise run `francAll(text, { only: [eng, slk, ces, deu, pol, hun, fra, spa, ita, por, nld, ukr, rus], minLength: 20 })`.
+1. If the text is shorter than `minLength` chars: `lang = hint ?? 'und'`, confidence 0. For articles, the
+   hint is `feed.lang_hint`; for card texts, it is the user's locale, with `minLength: 10` (spec 07 §5).
+2. Otherwise run `francAll(text, { only: [eng, slk, ces, deu, pol, hun, fra, spa, ita, por, nld, ukr, rus], minLength: Math.min(20, minLength) })`.
 3. `top` is the first result. `conf = top.score - second.score`. franc scores run 0..1, with the best
    at 1.
-4. If `conf < 0.05` and `feed.lang_hint` is set, use `lang_hint`.
-5. **Slovak/Czech tie-break:** if the top two are {slk, ces} and `conf < 0.15`, use `feed.lang_hint`
-   when it is `sk` or `cs`. Otherwise keep `top`.
+4. If `conf < 0.05` and a hint is set, use the hint.
+5. **Slovak/Czech tie-break:** if the top two are {slk, ces} and `conf < 0.15`, use the hint when it is
+   `sk` or `cs`. Otherwise keep `top`.
 6. Map ISO 639-3 to 639-1 (eng→en, slk→sk, ces→cs, …). If nothing matches, `lang = 'und'`.
 
 `feeds.lang_hint`:
@@ -358,8 +395,12 @@ always: total_fetches += 1; last_fetch_at = now; store the new etag/last_modifie
 
 **Permanent redirect of the feed URL** (301/308 on the feed fetch):
 - If no other feed has the new canonical URL, update `feeds.url`.
-- If another feed has it, **merge**: move the subscriptions (skip duplicates), then call
-  `refresh_feed_subscribers` and `refresh_feed_cards` for both feeds, and mark the old feed `dead`.
+- If another feed has it, **merge** into the surviving feed in one transaction (as `feedit_worker`):
+  - move `subscriptions` (skip duplicates) and `feed_items` (skip conflicts)
+  - re-point `user_cards.scope_feed_id` and the `block_feed`/`boost_feed` rule values
+  - call `refresh_feed_subscribers` and `refresh_feed_cards` for both feeds
+  - mark the old feed `dead`
+  - enqueue `user.rank {full: true}` for every moved subscriber
 
 `dead` feeds are shown to subscribers with a banner (spec 09). An admin can reset them.
 
@@ -396,7 +437,8 @@ site, a daily blog, a weekly podcast, and a feed that breaks and recovers.
 - Cap at the plan limit (spec 08 §6). Skip duplicates.
 - Create or reuse the `feeds` rows (**no fetch**, `next_fetch_at = now()`) and the subscriptions.
 - Call `refresh_feed_subscribers`/`refresh_feed_cards` once for all of them.
-- Return a report `{added, existing, invalid: [{line, url, reason}]}`.
+- Return a report `{added, existing, invalid: [{index, url, reason}]}`, where `index` is the outline's
+  position in document order. XML parsers don't expose line numbers.
 - Feeds that fail their first fetch show their error status in the feed list.
 
 **Export:** OPML 2.0 with one `outline` per folder and `text`, `title`, `type="rss"`, `xmlUrl`,

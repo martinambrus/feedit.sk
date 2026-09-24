@@ -34,13 +34,19 @@ Every per-user query runs under row-level security, and every limit that bounds 
 
 - **Pagination:** cursor-based. `?cursor=<opaque>&limit=<1..100>` (default 30). The response has
   `nextCursor: string | null`. The cursor is base64url JSON of the sort-key tuple.
-- **Tenancy:** the `tenant` plugin opens a transaction per authenticated request with
-  `set_config('app.user_id', …, true)` and exposes `req.tx` (a `TenantTx`). Route handlers must use
-  `req.tx` for per-user tables.
+- **Tenancy:**
+  - The `tenant` plugin exposes `req.withTx(fn)`. It opens a transaction **lazily**, on first use, runs
+    `set_config('app.user_id', …, true)`, and hands `fn` a `TenantTx`. Route handlers must use it for
+    per-user tables.
+  - Slow outbound work (feed discovery, OPML validation, translation of card text) runs **before** the
+    transaction is opened, so no pooled connection is held during network I/O.
+  - Jobs are enqueued after commit through `packages/shared/src/jobs.ts`.
 - **CSRF:**
   - Every non-GET request must carry the header `X-FeedIt-Client: web`. Browsers cannot send a custom
     header cross-site without a CORS preflight, and preflights are refused.
   - If an `Origin` header is present, it must equal `PUBLIC_BASE_URL`.
+  - **Exempt:** requests authenticated with the `METRICS_TOKEN` bearer (`POST /admin/ops-event`,
+    `GET /metrics`). These come from host scripts, not browsers, and carry no cookie.
 - **CORS:** disabled. The web app is same-origin through Caddy.
 
 ---
@@ -61,7 +67,8 @@ Every per-user query runs under row-level security, and every limit that bounds 
 
 | Situation | Email sent |
 |---|---|
-| user exists (not deleted, or deleted < 7 days ago) | login code |
+| a `users` row exists (active, or soft-deleted and not yet purged) | login code (verifying restores a soft-deleted account) |
+| unknown email listed in `ADMIN_EMAILS`, mode ≠ `closed` | signup code (**admin bootstrap**: the first admin needs no invite) |
 | unknown email, `SIGNUP_MODE=open` | signup code |
 | unknown email, `SIGNUP_MODE=invite`, valid invite (unused, unexpired, email-bound invites must match) | signup code (invite remembered on the code row) |
 | unknown email, `SIGNUP_MODE=invite`, no or invalid invite | "FeedIt is invite-only" email with a waitlist link |
@@ -70,16 +77,29 @@ Every per-user query runs under row-level security, and every limit that bounds 
 **Codes:**
 - 6 digits from a CSPRNG, stored as `sha256(code + SESSION_PEPPER)`, TTL **10 minutes**, at most
   **5** verify attempts per code.
+- The requested `locale` and the `inviteCode` are stored on the `login_codes` row.
 - A new request invalidates older unconsumed codes for the email.
 - Emails come from localized templates (en/sk) in `apps/api/src/emails/`, with a plain-text and an
   HTML part.
 
+**The signup mode** is `settings['signup_mode']` if set, otherwise `SIGNUP_MODE` (spec 02 §2).
+
 **On signup:**
-- insert `users` (UUID v7, locale from the request or `Accept-Language`, role `admin` if the email is
-  in `ADMIN_EMAILS`, `invites_left` from the plan)
+- insert `users`:
+  - UUID v7
+  - locale from `login_codes.locale`, else `Accept-Language`
+  - `invites_left` from the plan
 - mark the invite used
 - if the email is on the waitlist, set `waitlist.invited_at`
-- a login within 7 days of `DELETE /me` clears `deleted_at` (restores the account)
+
+**On every successful verify:**
+- set `role = 'admin'` if the email is in `ADMIN_EMAILS`, so the list can be extended later
+- clear `deleted_at` (restoring a soft-deleted account), then call `refresh_feed_subscribers` and
+  `refresh_feed_cards` for the user's feeds and enqueue `user.rank {full: true}`
+- update `last_active_at`
+
+A soft-deleted account keeps its `users` row until `house.purge-users` removes it after 7 days, so an
+email never hits the unique constraint through the signup path.
 
 **Session cookie:** `fi_sid` = 32 random bytes, base64url, stored hashed.
 - Attributes: `HttpOnly`, `Secure` (production), `SameSite=Lax`, `Path=/`, `Max-Age = SESSION_TTL_DAYS`.
@@ -118,6 +138,9 @@ Every per-user query runs under row-level security, and every limit that bounds 
   demote: { clickbait: Tri, promotional: Tri, shallow: Tri, stale: Tri },  // Tri = 'auto'|'on'|'off', default 'auto'
   implicitNegative: boolean,                    // default false
   swipe: { left: 'dislike' | 'read' | 'none', right: 'like' | 'bookmark' | 'none' },   // default dislike / like
+  theme: 'system' | 'light' | 'dark',          // default 'system'
+  folderOrder: string[],                        // default []: folder names in sidebar order
+  onboardingCompletedAt: string | null,         // ISO; default null → the web app shows onboarding
 }
 ```
 
@@ -134,6 +157,7 @@ Every per-user query runs under row-level security, and every limit that bounds 
 | `POST /subscriptions/:feedId/mark-read` | `{olderThan?}` | Mark all unread items of the feed read |
 | `POST /subscriptions/import-opml` | multipart `file` (≤ 1 MB) | spec 03 §11. `200 {added, existing, invalid: [...]}`. Quota `opmlMaxFeeds` and `maxFeeds` |
 | `GET /subscriptions/export-opml` | — | `text/x-opml` attachment |
+| `POST /subscriptions/folders/rename` | `{from, to}` | Rename a folder across the user's subscriptions and in `preferences.folderOrder` → `200 {count}` |
 
 `FeedInfo = {id, url, siteUrl, title, iconUrl, status, lastSuccessAt, lastErrorCode, lastErrorAt}`.
 
@@ -146,21 +170,35 @@ Every per-user query runs under row-level security, and every limit that bounds 
 **Query:**
 - `lane` ∈ `for_you | maybe | everything | new | all | bookmarks` (default `for_you`)
 - `feedId?`, `folder?`, `labelId?`
-- `status` ∈ `unread | all` (default `unread`)
+- `status` ∈ `unread | all` (default `unread`; default `all` when `lane = bookmarks`)
 - `minTier?` (1–5, default `prefs.defaultTier`; applies to `for_you` and `maybe`)
 - `sort` ∈ `score | date` (default: `score` for `for_you`; uncertainty order for `maybe`, spec 06 §10;
   `date` otherwise)
 - `cursor`, `limit`
 
-**Semantics:**
-- The candidate set is articles carried by the user's subscriptions (excluding `hidden` feeds unless
-  `feedId` is given) with `first_seen_at ≥ now − 14 days`. The window does not apply to `bookmarks`.
-- The lane is `coalesce(ua.lane, 'new')`. `hidden` is never listed.
-- `unread`: `ua.read_at IS NULL AND ua.archived_at IS NULL`.
-- **Cluster folding:** for subscriptions with `allow_duplicates = false`, keep one row per
-  `coalesce(story_cluster_id, -id)`: the member with the highest `p_like`, then the earliest. The row
-  reports `cluster.size` and the other members' feed titles. Implemented with
-  `row_number() OVER (PARTITION BY … ORDER BY …) = 1`.
+**Semantics, in this order:**
+1. **Candidate set:** articles carried by the user's subscriptions (excluding `hidden` feeds unless
+   `feedId` is given) with `first_seen_at ≥ now − 14 days`. For `lane = bookmarks`: every article with
+   `bookmarked_at` set, with no window and no subscription requirement.
+2. **Cluster folding**, applied to the **whole candidate set before any lane or status filter**:
+   - An article is foldable if **any** subscription carrying it has `allow_duplicates = false`.
+   - Foldable articles sharing a `story_cluster_id` collapse into one row: the member with the highest
+     `p_like`, then the earliest `first_seen_at`, computed with
+     `row_number() OVER (PARTITION BY story_cluster_id ORDER BY …) = 1`.
+   - That row reports `cluster.size` and the other members' feed titles.
+   - Non-foldable and unclustered articles are their own rows.
+3. **Filters:**
+   - lane = `coalesce(ua.lane, 'new')`, where `all` means every lane except `hidden`; `hidden` is never
+     listed
+   - `status = unread` means `ua.read_at IS NULL AND ua.archived_at IS NULL`
+   - `minTier`, `feedId`, `folder`, `labelId`
+4. Sort, then paginate.
+
+`GET /articles/counts` applies steps 1–3 without the lane filter and groups by lane, so the counts
+always equal the list totals.
+
+**Outdated scores:** if the user's newest `score_version` is older than the current one (spec 06 §7),
+the request enqueues a full rank. The list is served immediately from the existing scores.
 - **Sort keys:**
   - score: `(p_like DESC NULLS LAST, first_seen_at DESC, id DESC)`
   - maybe: `(abs(p_like − 0.5) ASC, first_seen_at DESC, id DESC)`
@@ -170,15 +208,26 @@ Every per-user query runs under row-level security, and every limit that bounds 
 
 ```ts
 ArticleListItem = { id, title, url, feed: {id, title, iconUrl}, author, publishedAt, firstSeenAt,
-  excerpt /* ≤ 300 chars */, imageUrl, lang, lane, tier, pLike, topReason: string | null,
+  excerpt /* ≤ 300 chars */, imageUrl, lang, lane, tier, pLike, topReason: TopReason | null,
   labelIds, labelSuggestions, rating, reason, readAt, bookmarkedAt,
   cluster: { id, size, otherFeeds: string[] } | null }
+
+TopReason =                                        // structured; the web client localizes it
+  | { kind: 'card'; cardId: string; title: string; p: number }
+  | { kind: 'rule'; code: string; ruleId?: string }
+  | { kind: 'model'; feature: string; label: string }
+  | { kind: 'keyword' }                            // degraded (BM25)
 ```
 
-`topReason` is derived from `explain`: the best card title with its p, or the first fired rule.
+`topReason` is derived from `explain`:
+- a fired floor or cap rule → `rule`
+- otherwise, source `cards` → the deciding card
+- otherwise, source `model` → its top contribution
+- otherwise, source `degraded` → `keyword`
 
-`GET /articles/counts` → `{forYou, maybe, everything, new, bookmarks}` of unread items (same filters
-except lane). Computed with a single `GROUP BY lane` query.
+`GET /articles/counts` → `{forYou, maybe, everything, new, bookmarks, scored, total}` of unread items.
+`scored` counts items with a lane other than `new`, and `total` counts all unread candidates, so
+onboarding can show "Reading your feeds… 38/120".
 
 `GET /articles/calibration` → `{ items: ArticleListItem[] }`: up to 10 unrated articles for the
 calibration round (selection rules in spec 06 §10). Used by onboarding and the weekly "Tune your feed"
@@ -193,25 +242,25 @@ Returns `ArticleListItem` plus:
 - `translation: {title, excerpt, engine, quality} | null`
 - `clusterMembers: [{id, title, feedTitle, url}]`
 
-`404` if the article is not in any of the user's subscriptions (also for bookmarks of unsubscribed
-feeds: bookmarked articles stay readable).
+`404` unless the article is carried by one of the user's subscriptions **or** the user has bookmarked
+it. Bookmarks of unsubscribed feeds stay readable.
 
 ### 5.3 Actions (all `POST`, all return `200 {item: ArticleListItem}` unless noted)
 
 | Endpoint | Body | Effect |
 |---|---|---|
 | `/articles/:id/read` | `{}` | Set `read_at` (expand in the list, when `markReadOnExpand`) |
-| `/articles/:id/unread` | `{}` | Clear `read_at` |
+| `/articles/:id/unread` | `{}` | Clear `read_at`, record `unread` |
 | `/articles/:id/open` | `{}` | Set `opened_at` and `read_at`, and record a `feedback_events` `open` (the user opened the original URL) |
-| `/articles/:id/dwell` | `{ms}` | Set `dwell_ms = max(existing, ms)` and record `dwell`. The response includes `{prompt: boolean}` from the spec 06 §10 rule |
-| `/articles/:id/rating` | `{rating: 1 \| -1 \| null, reason?, hide?: boolean}` | Upsert `rating`/`reason`/`rated_at` (null = un-rate); set `read_at` if `markReadOnRate`; `hide` sets `archived_at` (FeedIt's SHIFT+rate). Records `rate`/`unrate`. Every 10th explicit label since the last training enqueues `user.learn` |
-| `/articles/:id/prompt-answer` | `{liked: boolean}` | Store as a rating from the prompt (y with weight 1.0) and `feedback_prompted_at` |
+| `/articles/:id/dwell` | `{ms}` | Set `dwell_ms = max(existing, ms)` and record `dwell`. The response includes `{prompt: boolean}` from the spec 06 §10 rule. When `prompt` is true, also set `feedback_prompted_at` |
+| `/articles/:id/rating` | `{rating: 1 \| -1 \| null, reason?, hide?: boolean}` | Upsert `rating`/`reason`/`rated_at` (null = un-rate); set `read_at` if `markReadOnRate`; `hide` sets `archived_at` (FeedIt's SHIFT+rate). Records `rate`/`unrate`. Applies the learn trigger of spec 06 §8.4 |
+| `/articles/:id/prompt-answer` | `{liked: boolean}` | Store as a rating (`rating = liked ? 1 : -1`, `rated_at = now`), record `prompt_answer`, and apply the learn trigger |
 | `/articles/:id/bookmark` / `DELETE` of the same path | `{}` | Set or clear `bookmarked_at`, and record the event |
-| `/articles/:id/labels` | `{labelId}` | Add to `label_ids`, remove from `label_suggestions`, add the title as a label example (spec 05 §5.1, which forks the label card), record `label` |
+| `/articles/:id/labels` | `{labelId}` | Add to `label_ids`, remove from `label_suggestions`, record `label`. **Cards are not changed** (spec 05 §5.1). Label examples are explicit (§7) |
 | `DELETE /articles/:id/labels/:labelId` | — | Remove it, record `unlabel` |
 | `/articles/:id/mute-story` | `{days: 1\|3\|7\|30}` | Create a cluster for the article if it has none, create a `mute_story` rule with `expires_at`, enqueue `user.rank {full}` → `201 {rule}` |
 | `/articles/mark-read` | `{articleIds?: string[≤500], lane?, feedId?, olderThan?}` | Bulk mark read (cap 5,000) → `200 {count}` |
-| `/articles/rate-bulk` | `{articleIds: string[≤200], rating: 1 \| -1}` | FeedIt's "train the whole feed", as one transaction → `200 {count}` |
+| `/articles/rate-bulk` | `{articleIds: string[≤200], rating: 1 \| -1 \| null}` | FeedIt's "train the whole feed", as one transaction. `null` un-rates, which is what undo uses → `200 {count}` |
 
 **Row creation:** `user_article` rows are created on first action (upsert). All feedback writes also
 append `feedback_events`.
@@ -242,25 +291,35 @@ append `feedback_events`.
 
 ## 7. Cards, library, suggestions, labels
 
-`Card = {id, kind, title, interest, notFor, strength, scopeFeedId, origin, isPrivateFork, examplesYes, examplesNo, topicIds, createdAt}`.
-Library cards are localized to the user's locale from `i18n`.
+```ts
+Card = { id, kind: 'interest', title /* title_override ?? card.title */, interest, notFor, strength,
+         scopeFeedId, origin, isPrivateFork, examplesYes, examplesNo, topicIds, lang, createdAt }
+Label = { id /* card id */, name, color, definition, notFor, examplesYes, examplesNo, count /* articles labelled */ }
+```
+
+Library cards are localized to the user's locale from `i18n`. Cards are **immutable** (spec 05 §5.1),
+so every endpoint that changes text or examples returns the card with its possibly **new id**. The web
+client must replace its cached id.
 
 | Endpoint | Body | Behaviour (spec 05 §5.1) |
 |---|---|---|
 | `GET /cards` | — | The user's interest cards |
-| `POST /cards` | `{title?, interest, notFor?, strength, scopeFeedId?}` | Create → `201 {card}`. Quota `maxCards` |
-| `PATCH /cards/:id` | `{title?, interest?, notFor?, strength?, scopeFeedId? \| null}` | Update. **The id may change** when text changes; the response returns the new card |
+| `POST /cards` | `{title?, interest, notFor?, strength, scopeFeedId?}` | Create or reuse → `201 {card}`. Quota `maxCards` |
+| `PATCH /cards/:id` | `{title?, interest?, notFor?, strength?, scopeFeedId? \| null}` | `title` only sets the user's override. `interest`/`notFor` re-point to another card (new id) |
 | `DELETE /cards/:id` | — | Remove from the user |
-| `POST /cards/:id/examples` | `{articleId, side: 'yes' \| 'no'}` | Add the article title as an example (forks) → `{card}`. Quota `maxForks` |
-| `DELETE /cards/:id/examples` | `{side, text}` | Remove an example (stays a fork) → `{card}` |
-| `POST /cards/from-article` | `{articleId, interest, title?, strength}` | Create a card with the article title as the first `examples_yes` (fork) |
-| `GET /library` | `?topic=&q=` | Public cards, localized, grouped by L1 topic |
+| `POST /cards/:id/examples` | `{articleId, side: 'yes' \| 'no'}` | Add the article title as an example (private fork, new id) → `{card}`. Quota `maxForks` |
+| `POST /cards/:id/examples/remove` | `{side, text}` | Remove an example (new fork id) → `{card}` |
+| `POST /cards/from-article` | `{articleId, interest, notFor?, title?, strength}` | Shared text card plus a private fork with the article title as `examples_yes` → `201 {card}`. Quotas `maxCards`, `maxForks` |
+| `GET /library` | `?topic=&q=` | Public cards (`visibility = 'public'`), localized, grouped by L1 topic |
 | `POST /library/:id/adopt` | `{strength}` | Hold a library card |
 | `GET /cards/suggestions` | — | `[{card, score}]` (not dismissed) |
 | `POST /cards/suggestions/:cardId/dismiss` | — | `204` |
-| `GET /labels` | — | `[{id (card id), name, color, definition, notFor}]` |
-| `POST /labels` | `{name, definition, notFor?, color?}` | Create a label card (kind `label`) plus `user_labels`. Quota `maxLabels` |
-| `PATCH /labels/:id` / `DELETE /labels/:id` | … | Update or delete |
+| `GET /labels` | — | `Label[]` |
+| `POST /labels` | `{name, definition, notFor?, color?}` | Create or reuse a label card (kind `label`; the hash includes the name) plus `user_labels` → `201 {label}`. Quota `maxLabels` |
+| `PATCH /labels/:id` | `{name?, definition?, notFor?, color?}` | `color` changes in place. Name or definition re-points to a new card id, and `label_ids`/`label_suggestions` are migrated with `array_replace` |
+| `POST /labels/:id/examples` | `{articleId, side: 'yes' \| 'no'}` | Add a label example (private label fork, new id, ids migrated). Not counted in `maxForks` |
+| `POST /labels/:id/examples/remove` | `{side, text}` | Remove one (new id, migrated) |
+| `DELETE /labels/:id` | — | Remove the label, and remove its id from the user's `label_ids`/`label_suggestions` |
 
 `GET /topics` → the taxonomy (id, parent, names, level) for the web client.
 
@@ -281,15 +340,15 @@ Library cards are localized to the user's locale from `i18n`.
 | Endpoint | Purpose |
 |---|---|
 | `GET /admin/overview` | users (total, active 7 d), feeds by status, articles ingested today, pipeline backlog per queue, engine status (breakers, spend today vs budget, LLM calls today), translation stats |
-| `GET /admin/usage?days=30` | platform $/day by engine and kind, the top 20 users by attributed cost (spec 04 §7) |
-| `GET /admin/settings` / `PATCH /admin/settings` | Allow-listed keys only: `engine.daily_budget_usd`, `engine.llm_daily_cap`, `language_modes`, `card_text_mode`, `ranker.thresholds`, `translate.tier2_daily_cap`, `question_sets.active`, `signup_mode`. Each key has a zod schema. Changes that affect ranking bump a `settings_version`, which forces `user.rank {full}` for active users lazily on their next request |
-| `POST /admin/engine/reset-breaker` | `{engine}`: closes a breaker (including auth mode) |
+| `GET /admin/usage?days=30` | platform $/day by engine and kind (from `usage_daily`), and the top 20 users by attributed cost via `admin_usage_attribution(days)` (spec 02 §6, spec 04 §7) |
+| `GET /admin/settings` / `PATCH /admin/settings` | Allow-listed keys only (spec 02 §2 registry): `engine.daily_budget_usd`, `engine.llm_daily_cap`, `language_modes`, `card_text_mode`, `ranker.thresholds`, `translate.tier2_daily_cap`, `question_sets.active`, `signup_mode`. Each key is validated by its zod schema. **Side effects:** `ranker.thresholds` bumps `ranker.settings_version` and enqueues `user.rank {full}` for users active in the last 7 days; `question_sets.active.enrich` enqueues `house.reenrich`; `card_text_mode = 'english'` enqueues `house.translate-cards`; `language_modes` applies to new articles only |
+| `POST /admin/engine/reset-breaker` | `{engine}`: writes `engine.circuit.resetRequested[engine] = now`. Worker routers close that breaker (including auth mode) within 10 s (spec 04 §5) |
 | `GET /admin/feeds?status=&q=` / `PATCH /admin/feeds/:id` / `POST /admin/feeds/:id/reset` | Feed health; edit `fetch_options`; clear quarantine/dead |
-| `GET /admin/library` / `POST /admin/library` / `PATCH /admin/library/:id` / `POST /admin/library/promote` | Manage library cards. `promote {cardId, title, titleSk, topicIds}` copies a `shared` card with ≥ 3 holders into a new `public` card and re-points the holders |
+| `GET /admin/library` / `POST /admin/library` / `PATCH /admin/library/:id` / `POST /admin/library/promote` | Manage library cards (`PATCH` edits only `title`, `topic_ids`, `i18n`; texts are immutable). `promote {cardId, title, titleSk, topicIds}` requires a `shared` card with ≥ 3 holders (`admin_card_holders`) and **updates it in place** to `visibility = 'public'` with that title, i18n and topics. The text and id don't change, so holders and answers stay valid |
 | `GET /admin/users?q=` / `PATCH /admin/users/:id` | Role, plan, `invites_left` |
-| `POST /admin/invites` | `{count ≤ 50, email?, note?, expiresDays ≤ 90}` → codes |
+| `GET /admin/invites?status=unused\|used\|expired` / `POST /admin/invites` | List all invites; create `{count ≤ 50, email?, note?, expiresDays ≤ 90}` → codes |
 | `GET /admin/waitlist` / `POST /admin/waitlist/:id/invite` | Create an invite and email it |
-| `POST /admin/ops-event` | `{kind: 'backup_ok' \| 'backup_failed' \| 'restore_ok' \| 'restore_failed', detail?}`. Authenticated with the `METRICS_TOKEN` bearer (used by the host scripts in spec 11 §4) |
+| `POST /admin/ops-event` | `{kind: 'backup_ok' \| 'backup_failed' \| 'restore_ok' \| 'restore_failed', detail?}`. Authenticated with the `METRICS_TOKEN` bearer and exempt from the CSRF header (§1); used by the host scripts in spec 11 §4. It appends to `settings['ops.events']` (the last 50 kept), which `house.alerts` reads |
 
 ---
 
@@ -316,7 +375,10 @@ Library cards are localized to the user's locale from `i18n`.
 | authenticated mutations, per user | 120 / min |
 | `POST /subscriptions` | 30 / hour per user |
 | `POST /subscriptions/import-opml` | 5 / day per user |
-| `POST /cards`, `PATCH /cards/*` | 60 / hour per user (each may trigger backfills) |
+| `POST /cards`, `PATCH /cards/*`, `POST /cards/*/examples*`, `POST /labels*` | 60 / hour per user (each may trigger backfills) |
+
+All limits are enforced unless `RATE_LIMITS_ENABLED=false` (spec 01 §3). Only E2E and load-test
+environments with `NODE_ENV=test` set it to false. Config validation rejects `false` in production.
 
 ---
 
@@ -332,3 +394,10 @@ Library cards are localized to the user's locale from `i18n`.
 - **CSRF:** a mutation without `X-FeedIt-Client` returns `403`.
 - **Snapshots:** the OpenAPI document (a breaking change fails CI unless the snapshot is updated in
   the same commit).
+- **Operation list:** `apps/api/test/expected-operations.txt` lists every `METHOD /path` of this spec
+  (one per line, written by hand from §2–§10). A test asserts that the OpenAPI document contains exactly
+  these operations, plus nothing undocumented.
+- **Write-path grants:** every mutation endpoint succeeds against a database where the API connects as
+  `feedit_app`. This catches missing grants (spec 02 §1.2).
+- **Enqueue:** an integration test proves the API role can `send()` to pg-boss, and that the admin
+  bootstrap row of the §2.1 decision table works with an empty `invites` table.

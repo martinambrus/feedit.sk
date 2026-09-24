@@ -8,6 +8,8 @@ same data.
 
 No FeedIt.sk data is used (locked decision). The golden set is built from scratch.
 
+Notation: `eval <command>` below is short for the root script `pnpm evaluate <command>` (spec 01 §2).
+
 ---
 
 ## 1. Outputs of gate G1
@@ -19,14 +21,25 @@ No FeedIt.sk data is used (locked decision). The golden set is built from scratc
    ```json
    { "language_modes": { "en": "native", "sk": "…", "cs": "…" },
      "card_text_mode": "as_written" | "english",
-     "ranker_thresholds": { …RankerConfig overrides… },
+     "ranker_thresholds": { …deep partial of RankerConfig… },
      "recommended_daily_budget_usd": 2.0,
+     "translate_tier2_daily_cap": 300 | 1000,
      "laya_track_recommended": false,
+     "runs": { "B0": 11, "B1": 12, "E1": 13, … },      // eval.runs ids used for the decisions (M7-T7 reads them)
      "notes": "…" }
    ```
 
-3. `pnpm --filter eval cli apply-g1 config/g1.json` writes these into `settings` (dev DB). In
-   production, an admin pastes them in through `PATCH /admin/settings`.
+3. `pnpm evaluate apply-g1 config/g1.json` writes the settings below (dev DB). In production,
+   an admin applies the same values through `PATCH /admin/settings`.
+
+   | `g1.json` field | `settings` key |
+   |---|---|
+   | `language_modes` | `language_modes` |
+   | `card_text_mode` | `card_text_mode` |
+   | `ranker_thresholds` | `ranker.thresholds` (and bump `ranker.settings_version`) |
+   | `recommended_daily_budget_usd` | `engine.daily_budget_usd` |
+   | `translate_tier2_daily_cap` | `translate.tier2_daily_cap` |
+   | `laya_track_recommended`, `runs`, `notes` | not settings; kept in the report and in git |
 
 ---
 
@@ -37,27 +50,39 @@ No FeedIt.sk data is used (locked decision). The golden set is built from scratc
 - **Feed list:** `apps/eval/data/feeds-golden.txt`, about 60 feeds: about 20 English, 20 Slovak and
   20 Czech. It mixes news, tech, science, sport, lifestyle, local and classifieds, and includes at least
   one Google News feed and one feed with poor excerpts.
-- **`eval ingest-sample --feeds data/feeds-golden.txt --days 14`:**
-  - subscribes an internal `eval` system user to the feeds
-  - runs the real ingestion pipeline (M1) with enrich and match **disabled**
-    (`EVAL_INGEST_ONLY=true` in the worker), so there are no Jev costs yet
-  - waits until 14 days of items exist, using feed history where available and continued fetching
-    otherwise
-- **Sample:** 1,500 non-stale articles, stratified 500/500/500 by detected language (fewer if a
-  language runs short), recorded in `eval.assignments` per rater (§2.2).
+- **`eval ingest-sample --feeds data/feeds-golden.txt`:**
+  - creates or reuses the internal system user `eval@feedit.local` (role `user`, never logs in) and
+    subscribes it to the feeds
+  - **requires a running worker** with `EVAL_INGEST_ONLY=true` (the command checks the worker's
+    heartbeat and exits with instructions if it is missing), so enrich and match never run and there are
+    no Jev costs
+  - fetches each feed once immediately, waits until the `article.extract` queue for these articles has
+    drained, and prints per-language article counts
+  - **`--watch`** keeps the eval user subscribed and prints counts every 10 minutes, until stopped
+  - between the first run and rating, the normal schedule keeps fetching, because the eval user is a
+    subscriber
+- **Sample (`eval sample`):** up to 1,500 non-stale articles, 500/500/500 by detected language (fewer
+  if a language runs short), preferring the most recent. Stored in `eval.sample`.
+- **Status (`eval status`):** per-language sample counts, then per rater: cards written, feeds picked,
+  assigned, rated, skipped. Also facet-label counts per language.
 
 ### 2.2 Raters (3–5 people: the owner plus testers with different tastes)
 
 - **`eval rater add --name <n> --langs sk,en`** creates `eval.raters` and prints a private URL with a
-  token: `http://<eval-host>:5180/r?t=<token>`.
+  token: `${EVAL_PUBLIC_URL}/r?t=<token>`. `EVAL_PUBLIC_URL` defaults to `http://localhost:5180`.
 - **Step 1 in the rating app: write interests first.** Before seeing any article, each rater writes
   **5–10 interest cards** (and optionally 1–3 "never" cards) in their own words, in their preferred
   language. Stored as real `interest_cards` (visibility `shared`) and `eval.rater_cards`. The spec 05
   authoring rules are shown as hints.
 - **Step 2: pick feeds.** The rater ticks the golden feeds they would actually subscribe to (at least
   10) → `eval.rater_feeds`.
-- **Step 3: rate.** The rater gets **300 articles** from their feeds, shuffled, with language shares
-  following their `langs`.
+- **Step 3: rate.** On first entry, the app builds the rater's `eval.assignments`:
+  - up to **300** articles from `eval.sample` carried by the rater's picked feeds
+  - split **equally across the rater's `langs`**; a language short of its share is topped up from the
+    others
+  - if the sample has fewer than 300 for these feeds, all of them are assigned, topped up from
+    non-sampled recent articles of the rater's feeds (which are then added to `eval.sample`)
+  - shuffled deterministically (seeded by the rater id)
   - **Blind:** no model output is shown.
   - The page shows the feed, title, excerpt (≤ 600 chars) and "open original".
   - Buttons: 👍 "I'd want to read this" / 👎 "Not for me", plus an optional reason (the spec 09 reason set).
@@ -80,7 +105,9 @@ No FeedIt.sk data is used (locked decision). The golden set is built from scratc
 - Mobile-friendly and keyboard-driven.
 - Token auth through the query string, which sets a cookie.
 - Uses `DATABASE_URL_WORKER`.
-- Not deployed to production. It runs on the dev box or a temporary VPS during M3a/M3b.
+- Not deployed to production. It runs **on the dev box** (the same DB as M3b), exposed to raters
+  through a tunnel (e.g. `cloudflared tunnel --url http://localhost:5180`). `golden-v1` therefore lives
+  in the dev database that M3b and M7-T7 use. Back it up with `pg_dump -n eval` after collection.
 
 ---
 
@@ -88,9 +115,15 @@ No FeedIt.sk data is used (locked decision). The golden set is built from scratc
 
 Each run:
 - writes `eval.runs` (config, git sha) and `eval.run_answers`
-- caches every engine call in `apps/eval/.cache/<sha256(model + state + questions)>.json`, so re-runs
-  and report tweaks cost nothing
+- caches every engine call in `${EVAL_CACHE_DIR}/<sha256(model + state + questions)>.json`
+  (default `~/.cache/feedit-eval`, outside the repository and shared by worktrees), so re-runs and
+  report tweaks cost nothing
 - uses the production packages: `questions`, `engine`, `translate`, `ranker`
+- builds its own `EngineRouter` with `kind: 'eval'` on every call, `budgetOverrideUsd = --max-usd`
+  (default 10) and `ignoreDailyCaps: true`. Eval spend therefore never touches the production daily
+  budget or the tier-2 cap (spec 04 §6).
+- prints the cost estimate first. Above $1 it asks for confirmation unless `--yes` is given. Unattended
+  goals always pass `--yes --max-usd <n>`.
 
 | Id | State variant | Card text | Purpose |
 |---|---|---|---|
@@ -101,19 +134,28 @@ Each run:
 | **E3** LT | translated with LibreTranslate | as written | free translation |
 | **E3b** LT + EN cards | translated with LibreTranslate | English | both |
 | **E4** GLM | translated with Ollama `glm-5.3-flash` | the better of as-written/English from E2 vs E1 | quality ceiling of the fallback translation (SK/CZ only) |
-| **E5** Laya zero-shot (optional) | native | as written | expected near random; recorded only as the M10 baseline. Skip if `laya` is not installed |
+| **E5** Laya zero-shot (optional) | native | as written | expected near random; recorded only as the M9 baseline. Skip if `laya` is not installed |
 
 **Per article and rater:**
 - Call A (`enrich-v1`) once per article and variant.
 - Call B with the **rater's cards** (all raters' cards can share one call per article: namespaced
   keys, exactly like production).
-- The score is computed with `packages/ranker` card scoring (spec 06 §4). No demotions and no model:
-  the eval measures the zero-training case.
+- The score is computed with `packages/ranker` card scoring (spec 06 §4.1). No demotions and no model:
+  the eval measures the zero-training case. A rater's never-card with `p ≥ 0.7` sets the score to 0 (the
+  item would be hidden). Soft never-matches are ignored.
 
 **Estimated G1 cost:**
 1,500 articles × ≈ 5.5k tokens × 6 variants ≈ 50M tokens ≈ **$2.1**, plus GLM translation of about
-1,000 SK/CZ articles ≈ **$0.15**. The eval CLI prints the estimate and asks for confirmation before
-spending more than $1.
+1,000 SK/CZ articles ≈ **$0.15**.
+
+**Other commands:**
+- **`eval dry-run`:** runs the whole pipeline on synthetic data (M3a-T8) in a **separate database**
+  `feedit_eval_dryrun` (created from the template, spec 02 §1.1). It writes
+  `reports/DRYRUN-<date>.md` and `reports/DRYRUN-<date>.g1.json`, both git-ignored, and never touches
+  the real `eval` tables.
+- **`eval replay`:** §6. Implemented in M3a-T6, first used after G1.
+- **`eval learning-curve`:** M7-T7. Reads `eval.run_answers` of the runs listed in `config/g1.json`
+  `runs`.
 
 ---
 
@@ -143,7 +185,8 @@ The report renders these as tables, plus one reliability plot (SVG) per language
 
 ## 5. Decision rules for G1 (apply mechanically; the report shows each rule's inputs)
 
-1. **Core bet.** Let E* be the best experiment by macro AUC. **Pass** requires:
+1. **Core bet.** Let E* be the best of {E1, E2, E3, E3b} by macro AUC over all raters and all
+   languages. E4 and E5 cover only part of the data and are not eligible. **Pass** requires:
    - E* macro AUC ≥ B1 macro AUC + **0.05**
    - E* macro AUC ≥ **0.70**
    - E* wins against B1 for **every** rater (the point estimate is enough)
@@ -155,18 +198,26 @@ The report renders these as tables, plus one reliability plot (SVG) per language
    - if E1 AUC(lang) ≥ E1 AUC(en) − **0.05** → `native`
    - otherwise, if E3 AUC(lang) ≥ E1 AUC(lang) + **0.02** → `translate`
    - otherwise keep `native` and set `laya_track_recommended = true`
-   - if E4 AUC(lang) ≥ E3 AUC(lang) + **0.05**, note it in the report and set
-     `settings['translate.tier2_daily_cap']` higher (e.g. 1,000). Tier 2 stays a fallback (locked
-     decision).
+   - `translate_tier2_daily_cap` = **1000** if E4 AUC(lang) ≥ E3 AUC(lang) + **0.05** for sk or cs;
+     otherwise **300**. Tier 2 stays a fallback (locked decision).
 3. **Card text mode:** `english` if (E2 − E1) or (E3b − E3) ≥ **0.02** macro AUC measured on
    non-English cards; otherwise `as_written`.
-4. **Thresholds** (computed on pooled rater data of the chosen variant):
+4. **Thresholds.** Pool the rater data per language, using the experiment rules 2–3 chose for that
+   language:
+   - `native` + `as_written` → E1
+   - `native` + `english` → E2
+   - `translate` + `as_written` → E3
+   - `translate` + `english` → E3b
+
+   Then, over the pooled items:
    - `lanes.forYou` = the smallest t ∈ [0.50, 0.85] (step 0.05) where the like-rate among items with
      P ≥ t is **≥ 0.70**; if none, 0.85
    - `lanes.maybe` = the largest t ∈ [0.20, 0.50] where the like-rate among items with P < t is
      **≤ 0.15**; if none, 0.35
    - `tiers`: keep the defaults if ECE ≤ 0.10. Otherwise fit isotonic regression of like-rate on P and
-     set the tier cut points at the P values where the fitted like-rate crosses 0.2 / 0.4 / 0.6 / 0.8.
+     set each tier cut point at the smallest P where the fitted like-rate reaches 0.2 / 0.4 / 0.6 / 0.8.
+     A level the fit never reaches keeps its default. The four cut points must end up strictly
+     increasing; otherwise all four keep their defaults.
 5. **Budget:** `recommended_daily_budget_usd` = the measured $/1,000 articles × the expected daily
    articles for the invite-only beta (spec 05 §9) × 2, rounded up to $0.50, with a minimum of $1.
 
@@ -202,3 +253,14 @@ The report ends with a filled-in decision table and a list of anomalies (e.g. a 
 - **Engine:** p50/p95 latency, error rate, degraded share, $/day.
 
 Stored in `settings['metrics.daily.<date>']` (small JSON). No separate metrics DB.
+
+---
+
+## 8. Growing the golden set after launch (M9, optional)
+
+- A user setting "Help improve FeedIt: share my ratings anonymously for evaluation" (off by default)
+  lets the nightly job copy that user's explicit ratings of the last 30 days into a new golden version
+  (`golden-v2`, with a new `eval.raters` row per consenting user and no email or name).
+- The user's cards are copied as `eval.rater_cards` references (text only, no user id).
+- Replays (§6) then run on both `golden-v1` and `golden-v2`.
+- This needs a privacy-policy update before it is enabled.

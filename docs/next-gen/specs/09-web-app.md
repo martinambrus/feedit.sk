@@ -9,7 +9,10 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 ## 1. Technical frame
 
 - React 19, Vite, TanStack Router (file routes), TanStack Query (all server state), Tailwind CSS 4,
-  `@use-gesture/react` for swipes, i18next (`en`, `sk`; key files in `src/i18n/`).
+  `@use-gesture/react` for swipes, i18next (`en`, `sk`).
+- **i18n files** are **per feature**, as i18next namespaces: `src/features/<feature>/i18n/en.json` and
+  `sk.json`, plus `src/i18n/common.{en,sk}.json`. Parallel work on different features never edits the
+  same file. A test asserts key parity between `en` and `sk` for every namespace.
 - The API client is generated from the zod DTOs in `packages/shared` (a thin typed `fetch` wrapper).
   It always sends `X-FeedIt-Client: web`.
 - Optimistic updates for every reader action (read, rate, bookmark, label), rolled back on error with
@@ -34,10 +37,10 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 
 | Route | Screen |
 |---|---|
-| `/login` | email → code (two steps). `?code=` prefill for invite links (`/join?code=` redirects here with the invite) |
-| `/join` | invite landing: explains invite-only, email field (+ the invite code) |
+| `/login` | existing users: email → code (two steps) |
+| `/join?code=…` | invite landing: explains invite-only, shows the prefilled invite code, asks for the email, then continues with the same code step as `/login` (sending `inviteCode`) |
 | `/waitlist` | public waitlist form |
-| `/onboarding` | the first-run wizard (§4); shown until it is completed or skipped |
+| `/onboarding` | the first-run wizard (§4); shown while `preferences.onboardingCompletedAt` is null. Finishing or skipping sets it |
 | `/` → `/read/for_you` | the reader (§3) |
 | `/read/:lane` | lanes: `for_you`, `maybe`, `everything`, `new`, `bookmarks` |
 | `/read/feed/:feedId`, `/read/folder/:name`, `/read/label/:labelId` | filtered reader |
@@ -71,7 +74,8 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 
 - **Content:** title, feed icon and title, relative time, excerpt (2 lines; hidden in Simple mode),
   thumbnail (lazy).
-- **`topReason` chip:** e.g. "EV battery tech · 0.91", or "Muted-soft", or "Keyword match (degraded)".
+- **`topReason` chip**, rendered from the structured `TopReason` (spec 08 §5.1) with localized
+  strings: e.g. "EV battery tech · 0.91", "Boosted source", or "Keyword match (model unavailable)".
 - **Label suggestion chips:** dashed outline; tap to assign.
 - **Cluster badge:** "+3 sources", which expands to the other members.
 - **Rating state:** 👍/👎 highlighted.
@@ -95,7 +99,8 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 - **Rating an already-rated item** in the same direction un-rates it (FeedIt behaviour).
 - **"Train the whole feed"** (feed view menu): like or dislike all visible unread items, with
   confirmation. Uses `POST /articles/rate-bulk`.
-- **Undo toast** after every rating or bulk action (5 s).
+- **Undo toast** after every rating or bulk action (5 s). Undo re-sends the previous state:
+  `rating: null` (single or bulk) or `/unread`.
 
 ### 3.4 Keyboard shortcuts (desktop; `?` shows the overlay)
 
@@ -123,7 +128,7 @@ Rendered from `explain` (spec 06 §6.2):
 1. **Verdict line:** "For you · 91 % · tier 5", with the source (cards / your personal model /
    keyword fallback).
 2. **Your interests:** the cards with probability bars, sorted by p. Each row has:
-   - **Not really about this** → `POST /cards/:id/examples {side:'no'}`, which forks the card and shows
+   - **Not really about this** → `POST /cards/:id/examples {articleId, side:'no'}`, which forks the card (new id: the client updates its cache) and shows
      "Learned: this isn't *EV battery tech*"
    - **Yes, exactly this** → examples yes
    - **Edit card**
@@ -152,7 +157,7 @@ When the page becomes visible again after `/open`:
 2. **Add feeds:**
    - paste a URL (discovery with candidate selection)
    - import OPML
-   - pick from starter bundles: a static list in `apps/web/src/onboarding/bundles.ts` with ~10 bundles
+   - pick from starter bundles: a static list in `apps/web/src/features/onboarding/bundles.ts` with ~10 bundles
      (Slovak news, Czech news, Tech, Science, …), each with 3–8 feed URLs, curated before launch
    - at least 1 feed is required to continue
 3. **Interests:**
@@ -171,13 +176,13 @@ When the page becomes visible again after `/open`:
 
 ## 5. Feeds manager
 
-- **List:** folders (drag to reorder, rename), feeds with their health status, last success, error
+- **List:** folders (drag to reorder → `preferences.folderOrder`; rename → `POST /subscriptions/folders/rename`), feeds with their health status, last success, error
   text, and a per-feed settings drawer (title override, folder, allow duplicates, hide from sidebar,
   unsubscribe).
 - **Add feed:** URL input with discovery (candidate chooser).
 - **OPML:** import (with the result report) and export.
-- A **dead** feed shows "This feed stopped working on <date>: <reason>" with Unsubscribe / Keep trying
-  (admins can reset).
+- A **dead** feed shows "This feed stopped working on <date>: <reason>" with **Unsubscribe** or
+  **Dismiss**. Dismiss only hides the banner, client-side in `localStorage`. Admins can reset the feed.
 
 ---
 
@@ -201,7 +206,7 @@ When the page becomes visible again after `/open`:
 
 ## 7. Settings
 
-Profile (name, language, timezone, theme) · Reading preferences (all fields of spec 08 §3.1 with
+Profile (name, language, timezone, theme → `preferences.theme`) · Reading preferences (all fields of spec 08 §3.1 with
 explanations) · Sessions (devices, revoke) · Invites (left, create, list, copy link) · Export data ·
 Delete account (typed confirmation).
 
@@ -222,6 +227,19 @@ Plain tables and forms, no polish needed:
 
 ## 9. E2E smoke tests (Playwright)
 
+**Environment** (`apps/web/playwright.config.ts`, the `webServer` array starts everything):
+- `packages/testing` **fixture feed server** on a random port, with 3 feeds and article pages
+- the **fake TypeSafe server** (spec 04 §10) with `latencyMs: 50`
+- `apps/api` and `apps/worker` with:
+  - `NODE_ENV=test`, `SIGNUP_MODE=open`, `RATE_LIMITS_ENABLED=false`, `FETCH_ALLOW_PRIVATE=true`
+  - `MAIL_TRANSPORT=log`, `TYPESAFE_API_KEY=test`, `TYPESAFE_BASE_URL=<fake>`
+  - `DATABASE_URL*` pointing at a fresh per-run test database (spec 02 §1.1)
+- `vite preview` of the built web app, proxied to the API
+
+Test files are named `*.pw.ts` so Vitest never picks them up (spec 01 §6).
+
+**Scenarios:**
+
 1. **Login:** request a code → read it from the dev mail log endpoint (`GET /api/v1/dev/last-email`,
    available only when `NODE_ENV=test`) → verify → onboarding.
 2. **Add a feed** (a local fixture feed server) → the items appear in New.
@@ -230,3 +248,9 @@ Plain tables and forms, no polish needed:
 4. **Dislike with a reason** → the item leaves the list → undo restores it.
 5. **Keyboard:** `j`, `k`, `+`, `-`, `b` work on the list.
 6. **Mobile viewport:** a swipe right likes the item.
+
+**PWA check** (M6-T8, a separate `pwa.pw.ts`; Lighthouse ≥ 12 no longer has a PWA category):
+- `navigator.serviceWorker.ready` resolves
+- the manifest link is present and valid
+- the Chrome DevTools Protocol call `Page.getInstallabilityErrors` returns `[]`
+- offline: after one online visit, `context.setOffline(true)` and a reload still render the cached list

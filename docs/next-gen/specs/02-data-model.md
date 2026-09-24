@@ -10,41 +10,112 @@ constraints, not Postgres enums, so they are easy to migrate. Every foreign key 
 behaviour.
 
 The Drizzle schema in `packages/db/src/schema/*.ts` must produce exactly this DDL. RLS policies,
-roles, functions and trigram indexes are hand-written SQL migrations.
+grants, functions and trigram indexes are hand-written SQL migrations. The database, roles and
+extensions come from `infra/postgres/init.sh` (§1.1).
+
+**Schema parity test.** `packages/db/test/schema-parity.int.test.ts` reads the migrated catalog and
+compares it with the checked-in `packages/db/test/expected-schema.json`:
+- tables, columns, types, nullability, defaults
+- check constraints, indexes, foreign keys with their `ON DELETE`
+- RLS policies, grants, functions
+
+The JSON is written once, by hand, from this spec. Any later schema change updates it in the same
+commit.
 
 ---
 
-## 1. Roles and extensions (`infra/postgres/init.sql` + first migration)
+## 1. Bootstrap, roles and privileges
 
-```sql
+### 1.1 Cluster bootstrap (`infra/postgres/init.sh`)
+
+The official `postgres:16` image runs `*.sh` files from `/docker-entrypoint-initdb.d/` as the `postgres`
+superuser on first start. (A plain `.sql` file cannot receive psql variables.) The script takes the
+role passwords from the env vars `FEEDIT_OWNER_PASSWORD`, `FEEDIT_APP_PASSWORD` and
+`FEEDIT_WORKER_PASSWORD` and runs:
+
+```bash
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" \
+     -v owner_pw="$FEEDIT_OWNER_PASSWORD" -v app_pw="$FEEDIT_APP_PASSWORD" -v worker_pw="$FEEDIT_WORKER_PASSWORD" <<'SQL'
+CREATE ROLE feedit_owner  LOGIN PASSWORD :'owner_pw'  BYPASSRLS;  -- runs migrations; owns every object and the SECURITY DEFINER functions (§6)
+CREATE ROLE feedit_app    LOGIN PASSWORD :'app_pw';               -- API; RLS enforced
+CREATE ROLE feedit_worker LOGIN PASSWORD :'worker_pw' BYPASSRLS;  -- worker, eval CLI, housekeeping
+CREATE DATABASE feedit OWNER feedit_owner;
+\connect feedit
 CREATE EXTENSION IF NOT EXISTS citext;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-CREATE ROLE feedit_owner  LOGIN PASSWORD :'owner_pw';           -- owns schema, runs migrations
-CREATE ROLE feedit_app    LOGIN PASSWORD :'app_pw';             -- API; RLS enforced
-CREATE ROLE feedit_worker LOGIN PASSWORD :'worker_pw' BYPASSRLS; -- worker; shared stages need cross-user reads
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+ALTER SCHEMA public OWNER TO feedit_owner;
+GRANT CONNECT ON DATABASE feedit TO feedit_app, feedit_worker;
+SQL
 ```
 
-Grants (in the migration, after the tables exist):
+`feedit_owner` must have `BYPASSRLS`. The SECURITY DEFINER functions in §6 run as the owner and must
+see every tenant's rows. `FORCE ROW LEVEL SECURITY` would otherwise apply to the owner too.
 
-- `feedit_app`:
-  - `SELECT` on all tables.
-  - `INSERT, UPDATE, DELETE` on the per-user tables (§4) and on `sessions`, `login_codes`, `invites`, `waitlist`.
-  - `INSERT` on `feeds`, `interest_cards`, `match_queue`, `feedback_events`.
-  - `UPDATE (subscriber_count)` on `feeds`.
-  - `EXECUTE` on the functions in §6.
-  - `USAGE` on all sequences.
-- `feedit_worker`: `SELECT, INSERT, UPDATE, DELETE` on all tables; `USAGE` on all sequences.
-- pg-boss creates its own `pgboss` schema, owned by `feedit_worker`.
+**Test databases** (`infra/compose.test.yml` runs the same `init.sh`):
+- The test helper in `packages/testing` connects with `TEST_ADMIN_DATABASE_URL` (the superuser).
+- It creates a migrated template database `feedit_template` once.
+- Per worktree and package it creates
+  `feedit_test_<worktree-hash>_<package>` with `CREATE DATABASE … TEMPLATE feedit_template OWNER feedit_owner`.
+- Parallel sessions and packages therefore never share a test database (spec 01 §6).
 
----
+### 1.2 Privileges (first migration, run as `feedit_owner`)
+
+**Defaults**, which cover every later migration automatically:
+
+```sql
+GRANT USAGE ON SCHEMA public TO feedit_app, feedit_worker;
+ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner IN SCHEMA public GRANT SELECT ON TABLES TO feedit_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO feedit_worker;
+ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO feedit_app, feedit_worker;
+ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+```
+
+**Explicit write privileges for `feedit_app`.** Every migration that adds a table appends its row here
+(and to the migration):
+
+| Table | `feedit_app` may | Needed for |
+|---|---|---|
+| `users` | `INSERT, UPDATE` | signup, `PATCH /me`, soft delete, `invites_left`, `last_active_at`, admin edits |
+| `settings` | `INSERT, UPDATE` | admin settings, breaker reset request, alert state |
+| `login_codes`, `sessions`, `invites`, `waitlist` | `INSERT, UPDATE, DELETE` | auth, invites |
+| `feeds` | `INSERT`; `UPDATE (min_interval_s, fetch_options, status, consecutive_errors, first_error_at, quarantined_until, quarantine_count, next_fetch_at, subscriber_count, updated_at)` | subscribe, admin reset |
+| `story_clusters` | `INSERT, UPDATE` | mute-story creates a cluster |
+| `articles` | `UPDATE (story_cluster_id)` | mute-story |
+| `interest_cards` | `INSERT`; `UPDATE (retired_at, title, topic_ids, i18n, slug, visibility)` | card create/reuse (un-retire), admin library and promotion (`shared` → `public`). **Never** the text or examples: cards are immutable (spec 05 §5.1) |
+| `feedback_events` | `INSERT` | reader actions |
+| every per-user table (§4) | `INSERT, UPDATE, DELETE` | RLS applies |
+| `drizzle.__drizzle_migrations` | `SELECT` (with `USAGE ON SCHEMA drizzle`) | `/readyz` |
+
+**pg-boss** (pg-boss 10; the schema is created by a migration and never by a running process):
+
+```sql
+-- migration: execute the SQL returned by PgBoss.getConstructionPlans('pgboss'), then:
+GRANT USAGE ON SCHEMA pgboss TO feedit_app, feedit_worker;
+GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA pgboss TO feedit_app;                 -- send() and backlog stats
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA pgboss TO feedit_worker;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA pgboss TO feedit_app, feedit_worker;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA pgboss TO feedit_app, feedit_worker;
+ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner IN SCHEMA pgboss GRANT SELECT, INSERT ON TABLES TO feedit_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner IN SCHEMA pgboss GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO feedit_worker;
+```
+
+**Queues:**
+- Created by the migrate job (as the owner) with `createQueue(name, options)` for every entry of
+  `packages/shared/src/jobs.ts` (spec 03 §2), so per-queue partitions are owned by `feedit_owner` and
+  covered by the default privileges.
+- Every process starts pg-boss with `migrate: false`. The API also uses
+  `supervise: false, schedule: false` (send only). The worker supervises and runs the cron schedules.
+- If the pinned pg-boss version differs in these mechanics, keep the requirement: the owner creates the
+  schema and queues, the API can only send and read counts, and the worker does everything else. Log
+  the adaptation (spec 01 §9).
 
 ## 2. Settings and accounts
 
 ```sql
 CREATE TABLE settings (
-  key         text PRIMARY KEY,               -- e.g. 'engine.daily_budget_usd', 'language_modes', 'ranker.thresholds'
+  key         text PRIMARY KEY,               -- see the key registry below
   value       jsonb NOT NULL,
   updated_at  timestamptz NOT NULL DEFAULT now(),
   updated_by  uuid NULL
@@ -59,7 +130,7 @@ CREATE TABLE users (
   role            text NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin')),
   plan            text NOT NULL DEFAULT 'beta',   -- key into the plan table in spec 08 §6
   invites_left    int  NOT NULL DEFAULT 3,
-  preferences     jsonb NOT NULL DEFAULT '{}',    -- schema: spec 08 §5.2
+  preferences     jsonb NOT NULL DEFAULT '{}',    -- schema: spec 08 §3.1
   created_at      timestamptz NOT NULL DEFAULT now(),
   last_active_at  timestamptz NULL,
   deleted_at      timestamptz NULL                -- soft delete for 7 days, then hard delete (spec 11)
@@ -70,6 +141,7 @@ CREATE TABLE login_codes (
   email         citext NOT NULL,
   code_hash     text NOT NULL,                    -- sha256(code + pepper)
   invite_code   text NULL,
+  locale        text NULL,                        -- locale requested at signup
   expires_at    timestamptz NOT NULL,
   attempts      int NOT NULL DEFAULT 0,
   consumed_at   timestamptz NULL,
@@ -112,6 +184,33 @@ CREATE TABLE waitlist (
   invite_code  text NULL REFERENCES invites(code) ON DELETE SET NULL
 );
 ```
+
+
+**Settings key registry.** Every key has a zod schema in `packages/shared/src/settings.ts`. Readers
+fall back to the listed default when the row is missing. Only the keys marked *admin* can be written
+through `PATCH /admin/settings`.
+
+| Key | Value | Default when missing | Written by |
+|---|---|---|---|
+| `engine.daily_budget_usd` | number | env `DAILY_BUDGET_USD` | admin, `eval apply-g1` |
+| `engine.llm_daily_cap` | int | 200 | admin |
+| `engine.circuit` | `{typesafe: Breaker, llm: Breaker, resetRequested: {typesafe?: iso, llm?: iso}}` with `Breaker = {state: 'closed'\|'open'\|'half_open'\|'auth', openedAt?, openUntil?, reopenCount}` | all closed | worker routers (state); admin (reset request only) |
+| `engine.budget_alerts` | `{day: 'YYYY-MM-DD', p80At?: iso, p100At?: iso}` | — | worker router (records crossings only; spec 04 §6) |
+| `engine.laya` | `{enrich?: string[]}` (language codes) | `{}` | admin (M9) |
+| `language_modes` | `{[lang]: 'native'\|'translate'}` | env `LANGUAGE_MODES` | admin, `apply-g1` |
+| `card_text_mode` | `'as_written'\|'english'` | `'as_written'` | admin, `apply-g1` |
+| `translate.tier2_daily_cap` | int | 300 | admin, `apply-g1` |
+| `ranker.thresholds` | deep partial of `RankerConfig` (spec 06 §11) | `{}` | admin, `apply-g1` |
+| `ranker.settings_version` | int | 0 | the API, bumped on every ranking-relevant settings change (spec 06 §7) |
+| `question_sets.active` | `{enrich?: id, match?: id, cluster?: id, suggest?: id}` | `{}` | seed (only when a kind is absent), admin |
+| `signup_mode` | `'invite'\|'open'\|'closed'` | env `SIGNUP_MODE` | admin |
+| `ops.events` | `[{kind, detail, at}]`, the last 50 | `[]` | `POST /admin/ops-event` |
+| `alerts.state` | `{[alertKey]: {firstAt, lastSentAt, active}}` | `{}` | `house.alerts` |
+| `metrics.daily.<YYYY-MM-DD>` | metrics JSON (spec 10 §7) | — | `house.metrics` |
+
+`pnpm db:seed` inserts **only** `card_text_mode` and `question_sets.active = {}` when they are missing.
+Keys with an env fallback are never seeded, so the env default stays effective until an admin sets a
+value.
 
 ---
 
@@ -284,6 +383,7 @@ CREATE TABLE article_facets (                     -- Call A answers
   answers          jsonb NOT NULL,               -- normalized answers (spec 04 §2)
   features         jsonb NOT NULL,               -- flattened numeric features (spec 05 §3.4)
   created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),   -- bumped whenever answers or features change (e.g. L2 topics arrive)
   PRIMARY KEY (article_id, question_set_id)
 );
 
@@ -300,7 +400,8 @@ CREATE TABLE topics (                             -- taxonomy (spec 05 §3.2), s
 CREATE TABLE interest_cards (
   id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   kind            text NOT NULL CHECK (kind IN ('interest','label')),
-  title           text NOT NULL,                  -- short display name (≤ 60 chars)
+  slug            text NULL UNIQUE,               -- library cards only; stable seed identity (spec 05 §8)
+  title           text NOT NULL,                  -- default display name (≤ 60 chars); per-user override in user_cards.title_override
   body            jsonb NOT NULL,                 -- {interest, not_for?, interest_en?, not_for_en?, examples_yes?: string[], examples_no?: string[]}
   text_hash       text NOT NULL UNIQUE,           -- spec 05 §5.1
   lang            text NOT NULL DEFAULT 'en',
@@ -324,7 +425,7 @@ CREATE TABLE card_answers (                       -- Call B answers
   model             text NULL,
   question_set_sha  text NOT NULL,
   state_variant     text NOT NULL CHECK (state_variant IN ('native','translated')),
-  created_at        timestamptz NOT NULL DEFAULT now(),
+  answered_at       timestamptz NOT NULL DEFAULT now(),   -- set to now() on every insert AND upsert
   PRIMARY KEY (article_id, card_id)
 );
 CREATE INDEX card_answers_card_idx ON card_answers (card_id);
@@ -381,7 +482,7 @@ CREATE TABLE subscriptions (
   feed_id           bigint NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
   title_override    text NULL,
   folder            text NULL,
-  allow_duplicates  boolean NOT NULL DEFAULT false,  -- false = fold story clusters (spec 06 §3)
+  allow_duplicates  boolean NOT NULL DEFAULT false,  -- false = fold story clusters (spec 08 §5.1)
   hidden            boolean NOT NULL DEFAULT false,  -- hide feed from sidebar, keep ranking
   created_at        timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, feed_id)
@@ -393,6 +494,7 @@ CREATE TABLE user_cards (
   card_id        bigint NOT NULL REFERENCES interest_cards(id) ON DELETE RESTRICT,
   strength       text NOT NULL CHECK (strength IN ('must','love','like','never')),
   scope_feed_id  bigint NULL REFERENCES feeds(id) ON DELETE CASCADE,   -- feed-scoped card
+  title_override text NULL,                        -- the user's own name for the card (cards are shared and immutable)
   created_at     timestamptz NOT NULL DEFAULT now(),
   updated_at     timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, card_id)
@@ -456,7 +558,7 @@ CREATE TABLE feedback_events (                    -- append-only training log
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   article_id  bigint NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
-  kind        text NOT NULL CHECK (kind IN ('rate','unrate','open','read','dwell','prompt_answer',
+  kind        text NOT NULL CHECK (kind IN ('rate','unrate','open','read','unread','dwell','prompt_answer',
                                             'bookmark','unbookmark','label','unlabel','mark_read','hide')),
   value       jsonb NOT NULL DEFAULT '{}',
   created_at  timestamptz NOT NULL DEFAULT now()
@@ -511,23 +613,27 @@ CREATE POLICY t_tenant ON t
   created that way (a branded `TenantTx` type).
 - Without `app.user_id`, per-user tables return no rows. An integration test asserts this for every
   table in §4.
-- `feedit_worker` bypasses RLS and is used only by worker handlers and admin jobs.
+- `feedit_worker` bypasses RLS. It is used only by worker handlers, the eval CLI and housekeeping, and
+  the API never holds its credentials. Cross-tenant reads that the API needs (feed-level refreshes,
+  admin statistics) go through the SECURITY DEFINER functions of §6, which run as the BYPASSRLS owner.
 - `interest_cards` with `visibility = 'private'` are readable through the API only when
   `owner_user_id` equals the tenant. This is enforced in the repository, not by RLS, because the
   table is shared.
 
 ---
 
-## 6. SQL functions
+## 6. SQL functions (SECURITY DEFINER, owned by the BYPASSRLS `feedit_owner`)
 
 ```sql
--- Recompute feed_cards for the given feeds (cards held by any subscriber, respecting scope; plus labels).
+-- Recompute feed_cards for the given feeds: cards and labels held by any (non-deleted) subscriber,
+-- respecting card scope.
 CREATE FUNCTION refresh_feed_cards(p_feed_ids bigint[]) RETURNS void
-LANGUAGE sql SECURITY DEFINER SET search_path = public AS $$
+LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
   DELETE FROM feed_cards WHERE feed_id = ANY(p_feed_ids);
   INSERT INTO feed_cards (feed_id, card_id, holders)
   SELECT s.feed_id, x.card_id, count(DISTINCT s.user_id)
   FROM subscriptions s
+  JOIN users u ON u.id = s.user_id AND u.deleted_at IS NULL
   JOIN (
     SELECT user_id, card_id, scope_feed_id FROM user_cards
     UNION ALL
@@ -539,20 +645,76 @@ LANGUAGE sql SECURITY DEFINER SET search_path = public AS $$
 $$;
 
 -- Keep feeds.subscriber_count and feeds.min_interval_s in sync.
-CREATE FUNCTION refresh_feed_subscribers(p_feed_ids bigint[]) RETURNS void
-LANGUAGE sql SECURITY DEFINER SET search_path = public AS $$
-  UPDATE feeds f SET subscriber_count = coalesce(x.cnt, 0), updated_at = now()
-  FROM (SELECT unnest(p_feed_ids) AS feed_id) ids
-  LEFT JOIN (SELECT feed_id, count(*) AS cnt FROM subscriptions
-             WHERE feed_id = ANY(p_feed_ids) GROUP BY feed_id) x ON x.feed_id = ids.feed_id
-  WHERE f.id = ids.feed_id;
+-- p_plan_min_interval = {"beta": 900, "admin": 300}, built from packages/shared/src/plans.ts.
+CREATE FUNCTION refresh_feed_subscribers(p_feed_ids bigint[], p_plan_min_interval jsonb) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  UPDATE feeds f
+     SET subscriber_count = coalesce(x.cnt, 0),
+         min_interval_s   = coalesce(x.min_iv, 900),
+         updated_at       = now()
+    FROM (SELECT unnest(p_feed_ids) AS feed_id) ids
+    LEFT JOIN (
+      SELECT s.feed_id, count(*) AS cnt,
+             min(coalesce((p_plan_min_interval ->> u.plan)::int, 900)) AS min_iv
+      FROM subscriptions s JOIN users u ON u.id = s.user_id AND u.deleted_at IS NULL
+      WHERE s.feed_id = ANY(p_feed_ids)
+      GROUP BY s.feed_id) x ON x.feed_id = ids.feed_id
+   WHERE f.id = ids.feed_id;
 $$;
+
+-- Admin statistics: how many users hold each card (as interest or label).
+CREATE FUNCTION admin_card_holders(p_card_ids bigint[]) RETURNS TABLE (card_id bigint, holders int)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT c.id,
+         ((SELECT count(*) FROM user_cards uc WHERE uc.card_id = c.id)
+        + (SELECT count(*) FROM user_labels ul WHERE ul.card_id = c.id))::int
+  FROM unnest(p_card_ids) AS c(id);
+$$;
+
+-- Admin usage: per-user attributed cost over the last p_days UTC days.
+-- direct = user-attributed usage_daily rows (backfills, suggestions, fork questions);
+-- shared = platform 'match' cost × (Σ over the user's (feed, card) holdings of 1/holders) / count(feed_cards).
+CREATE FUNCTION admin_usage_attribution(p_days int)
+RETURNS TABLE (user_id uuid, direct_usd numeric, shared_usd numeric)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  WITH win AS (SELECT * FROM usage_daily WHERE day > (now() AT TIME ZONE 'UTC')::date - p_days),
+  direct AS (SELECT w.user_id, sum(w.cost_usd) AS usd FROM win w
+             WHERE w.user_id <> '00000000-0000-0000-0000-000000000000' GROUP BY w.user_id),
+  m AS (SELECT coalesce(sum(cost_usd), 0) AS usd FROM win
+        WHERE user_id = '00000000-0000-0000-0000-000000000000' AND kind = 'match'),
+  tot AS (SELECT greatest(count(*), 1) AS n FROM feed_cards),
+  holding AS (
+    SELECT s.user_id, fc.holders
+    FROM feed_cards fc
+    JOIN subscriptions s ON s.feed_id = fc.feed_id
+    JOIN (SELECT user_id, card_id, scope_feed_id FROM user_cards
+          UNION ALL SELECT user_id, card_id, NULL::bigint FROM user_labels) x
+      ON x.user_id = s.user_id AND x.card_id = fc.card_id
+     AND (x.scope_feed_id IS NULL OR x.scope_feed_id = fc.feed_id)),
+  shared AS (SELECT h.user_id, sum(1.0 / h.holders) AS share FROM holding h GROUP BY h.user_id)
+  SELECT coalesce(d.user_id, sh.user_id), coalesce(d.usd, 0),
+         coalesce(sh.share, 0) * (SELECT usd FROM m) / (SELECT n FROM tot)
+  FROM direct d FULL JOIN shared sh ON sh.user_id = d.user_id;
+$$;
+
+REVOKE EXECUTE ON FUNCTION refresh_feed_cards(bigint[]), refresh_feed_subscribers(bigint[], jsonb),
+  admin_card_holders(bigint[]), admin_usage_attribution(int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION refresh_feed_cards(bigint[]), refresh_feed_subscribers(bigint[], jsonb),
+  admin_card_holders(bigint[]), admin_usage_attribution(int) TO feedit_app, feedit_worker;
 ```
 
-Both are called by the API **in the same transaction** as the change that affects them:
-subscribe/unsubscribe, card add/remove/scope change, label add/remove. `house.reconcile` (spec 11) also
-runs them nightly for all feeds. `min_interval_s` is set by application code from the subscribers'
-plans (spec 08 §6) in the same place.
+**Callers:**
+- **The refresh functions** are called by the API **in the same transaction** as the change that
+  affects them: subscribe/unsubscribe, card add/remove/scope change, label add/remove, account delete
+  and restore. `house.reconcile` (spec 11) also runs them nightly for all feeds.
+- **The `admin_*` functions** are called only from admin routes, after the role check (spec 08 §9).
+
+**Tests** (M0-T4). Both refresh functions give correct rows when called:
+- (a) as `feedit_app` inside `withTenant(A)`, with users A and B both subscribed and holding different
+  cards
+- (b) as `feedit_worker` with no `app.user_id`
+
+Neither may drop B's rows.
 
 ---
 
@@ -574,12 +736,20 @@ CREATE TABLE eval.ratings (rater_id bigint REFERENCES eval.raters(id) ON DELETE 
 CREATE TABLE eval.facet_labels (labeler text NOT NULL, article_id bigint REFERENCES articles(id),
   question_key text NOT NULL, value text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (article_id, question_key, labeler));
+CREATE TABLE eval.sample (article_id bigint PRIMARY KEY REFERENCES articles(id), lang text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE eval.runs (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, experiment text NOT NULL,
   config jsonb NOT NULL, git_sha text NOT NULL, started_at timestamptz NOT NULL DEFAULT now(),
   finished_at timestamptz NULL, results jsonb NULL);
 CREATE TABLE eval.run_answers (run_id bigint REFERENCES eval.runs(id) ON DELETE CASCADE,
   article_id bigint NOT NULL, card_id bigint NULL, question_key text NOT NULL, answer jsonb NOT NULL);
 CREATE INDEX run_answers_run_idx ON eval.run_answers (run_id, article_id);
+GRANT USAGE ON SCHEMA eval TO feedit_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA eval TO feedit_worker;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA eval TO feedit_worker;
+ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner IN SCHEMA eval GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO feedit_worker;
 ```
 
-The `eval` schema is only accessed by `apps/eval` through `DATABASE_URL_WORKER`.
+- The `eval` schema is accessed only by `apps/eval`, through `DATABASE_URL_WORKER`.
+- Rows referenced from `eval.*` (articles in `eval.sample`/`assignments`/`ratings`/`facet_labels`, and
+  cards in `eval.rater_cards`) are exempt from purging and retiring (spec 11 §5–6).

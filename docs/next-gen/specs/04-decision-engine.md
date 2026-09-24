@@ -50,9 +50,34 @@ export interface DecisionEngine {                // implemented by each engine
 
 export interface EngineRouter {                  // the ONLY thing handlers use
   ask(req: EngineRequest): Promise<EngineOutcome>;
-  status(): RouterStatus;                         // breaker state, spend today, budget, queue depth
+  status(): RouterStatus;                         // breakers, spend today, budget, LLM calls today
+  canSpend(estimateUsd: number, priority: Priority): boolean;   // spend-guard check for non-engine paid calls (tier-2 translation)
+  recordExternalCall(call: ExternalCall): Promise<void>;         // logs translation calls through the same store and budget
 }
-export function createEngineRouter(deps: { config; db; logger; clock }): EngineRouter;
+
+export interface ExternalCall {                 // non-engine paid or logged calls (translation, spec 07 §2)
+  engine: 'libretranslate' | 'llm'; kind: 'translate'; model?: string; articleId?: string;
+  inputTokens: number; outputTokens: number; costUsd: number; latencyMs: number;
+  status: 'ok' | 'error' | 'timeout' | 'rate_limited' | 'invalid_response'; error?: string;
+}
+// EngineCallRow and UsageRow mirror the engine_calls and usage_daily columns (spec 02 §3.1).
+// RouterStatus = { breakers: {typesafe, llm}, spendTodayUsd, budgetUsd, llmCallsToday }.
+
+// Port implemented in packages/db (packages/engine never imports packages/db; spec 01 §2)
+export interface EngineStore {
+  insertCall(row: EngineCallRow): Promise<void>;                 // engine_calls
+  upsertUsage(row: UsageRow): Promise<void>;                     // usage_daily
+  spendSince(fromUtc: Date, opts: { excludeKinds: CallKind[] | 'none' }): Promise<number>;
+  getSetting<T>(key: string): Promise<T | undefined>;
+  setSetting<T>(key: string, value: T): Promise<void>;
+}
+
+export function createEngineRouter(deps: {
+  config: EngineConfig; store: EngineStore; logger: Logger; clock: Clock;
+  engines?: Partial<Record<EngineName, DecisionEngine>>;       // inject fakes (tests, E2E, eval dry run)
+  budgetOverrideUsd?: number;                                    // eval: its own spend cap (spec 10 §3)
+  ignoreDailyCaps?: boolean;                                     // eval: ignore llm/tier-2 daily caps
+}): EngineRouter;
 ```
 
 Handlers never see HTTP errors. They get `ok: false` and apply their degraded behaviour.
@@ -135,8 +160,7 @@ call (§6.1). Calls wait for capacity (bulk priority waits behind interactive).
 
 ## 5. Circuit breaker and fallback chain
 
-**Breaker** (per engine, in memory, mirrored to `settings['engine.circuit']` every change, for the admin
-UI):
+**Breaker** (per engine and per worker process, in memory):
 
 - **Rolling window:** the last 5 minutes of logical calls.
 - **Opens** when the window has ≥ 20 calls **and** the failure share is > 20 %. Failures are final
@@ -146,6 +170,13 @@ UI):
   re-opens it.
 - **Auth mode:** a 401/403 opens the breaker until the process restarts or an admin presses "retry" in
   the admin UI. It does not self-heal.
+- **Mirror:** every state change is written to `settings['engine.circuit']` (shape in spec 02 §2), and
+  the worst state across processes wins. The admin UI and the house jobs (`house.rescore-degraded`,
+  `house.alerts`) read **the mirror**, never their own process's breaker.
+- **Reset:** `POST /admin/engine/reset-breaker {engine}` writes
+  `engine.circuit.resetRequested[engine] = now`. Every router polls the key every 10 s. When the value
+  is newer than its last reset, the router closes that breaker (including auth mode), resets the
+  doubling, and writes the new state to the mirror.
 
 **Fallback chain** in `EngineRouter.ask(req)`:
 
@@ -156,7 +187,7 @@ UI):
    - if `LLM_FALLBACK_ENABLED` **and** `req.priority === 'interactive'` **and** the LLM daily call cap
      (`settings['engine.llm_daily_cap']`, default 200) is not reached **and** the LLM breaker is
      closed → LlmFallbackEngine (§8)
-   - (M10) if a fine-tuned Laya checkpoint is configured for `req.kind` → LayaEngine (§9)
+   - (M9) if a fine-tuned Laya checkpoint is configured for `req.kind` → LayaEngine (§9)
 5. Otherwise `circuit_open` or `error`.
 
 **Degraded handling is the caller's job** (spec 03 §1, spec 05, spec 06).
@@ -172,12 +203,16 @@ when the article is re-processed, because personal models must learn from one en
 
 - **Budget:** `settings['engine.daily_budget_usd']`, falling back to `DAILY_BUDGET_USD` (default $2.00).
   The day is UTC.
-- **Spend today:** `SUM(cost_usd) FROM engine_calls WHERE created_at >= date_trunc('day', now())`.
-  Loaded at start, refreshed every 60 s, and incremented locally after each call.
+- **Spend today:**
+  `SELECT coalesce(sum(cost_usd), 0) FROM engine_calls WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AND kind <> 'eval'`.
+  - Loaded at start, refreshed every 60 s, and incremented locally after each call.
+  - Evaluation spend (`kind = 'eval'`) never consumes the production budget. Eval runs use their own cap
+    (`budgetOverrideUsd`, spec 10 §3).
 - **Before each call:** estimate the cost (§6.1). If `spend + estimate > budget`, return `budget`
   without calling.
-- **Alerts:** email all admins once per UTC day at **80 %** and once at **100 %** (the day is recorded
-  in `settings['engine.budget_alerts']`).
+- **Crossings:** when spend first crosses **80 %** or **100 %** of the budget on a UTC day, the router
+  records it in `settings['engine.budget_alerts'] = {day, p80At?, p100At?}`. It sends **no** email:
+  `house.alerts` (spec 11 §6.1) owns every notification.
 - **Interactive allowance:** `interactive` requests may exceed the budget by at most 10 % so users can
   still add a card while the bulk backlog is paused. `bulk` requests stop at 100 %.
 
@@ -196,10 +231,13 @@ After every call, upsert `usage_daily`:
 - `user_id` = `req.userId` if set, otherwise the platform sentinel.
 - Shared Call A and Call B costs are **platform** cost.
 
-Per-user attribution for dashboards is computed on read: a user's share of Call B cost = the sum over
-the cards they hold of `cost_of_card_questions / holders`, estimated from `feed_cards.holders` and each
-question's token share. Exact per-question costs are not stored. The admin usage page (spec 08 §9)
-shows:
+Per-user attribution for dashboards is computed on read by `admin_usage_attribution(days)`
+(spec 02 §6):
+- **direct:** the user-attributed rows
+- **shared:** the platform `match` cost split by the user's share of `(feed, card)` holdings, each
+  weighted `1/holders`
+
+Exact per-question costs are not stored. The admin usage page (spec 08 §9) shows:
 - platform $/day
 - per-user attributed $/day (backfills, suggestions, private forks)
 - the top 20 users by attributed cost
@@ -255,7 +293,7 @@ shows:
 
 ---
 
-## 9. LayaEngine (M10, optional)
+## 9. LayaEngine (M9, optional)
 
 - Loads a fine-tuned **Laya-multilingual** ONNX checkpoint through the Jev-compatible Node port
   `receptron/laya` (`Laya.load({subfolder})` → `laya.systemOne(state, questions)`).
@@ -272,7 +310,9 @@ shows:
 
 ## 10. Fixtures and tests
 
-- `packages/testing/fixtures/typesafe/*.json`: recorded request/response pairs for:
+- `packages/testing/fixtures/typesafe/*.json`: request/response pairs, hand-written from the
+  documented shapes in §3. They are replaced by real recordings (`RECORD=1`) once a key is available.
+  They cover:
   - enrich-v1
   - a match call with 3 cards
   - a cluster call
@@ -289,5 +329,28 @@ shows:
 - LLM schema generation
 - attribution
 
-**Integration test:** a fake HTTP server simulates TypeSafe with 30 % 503s and asserts that the breaker
-opens, the router returns `circuit_open`, and it closes after recovery.
+**Deterministic fake TypeSafe server** (`packages/testing/src/fake-typesafe.ts`, built in M2-T2): an
+HTTP server implementing `POST /v1/systemone` with the documented response shape, so any question set
+gets a plausible, repeatable answer.
+
+| Question type | Answer |
+|---|---|
+| **noul** about a card (instructions contain `interest`) | `0.9` if any ≥ 4-char token of `interest` (normalized with `normalizeText`) occurs in the state's title or excerpt; otherwise `0.1`. If `not_for` tokens match instead, `0.2` |
+| **other noul** | `0.3` |
+| **choice** | the first option whose key or description shares a token with the state gets 0.7, the rest share 0.3 equally (with no match, a uniform distribution); `confidence` from §2 |
+| **score** | probability 1.0 on the middle level |
+
+- `usage.input_tokens` = the §6.1 estimate. `model` = `jev-fake`.
+- **Options:** `latencyMs`, `failRate` (a share of *logical* requests, chosen deterministically by
+  `sha256(body)` so every retry of that request also fails), `status` overrides, and `recordRequests`.
+- It is used by M2-T11, M3a-T8, M5-T6, M6-T9 (E2E) and M8-T8 (load test). The worker points at it
+  through `TYPESAFE_BASE_URL`, and in-process tests can inject it through `engines`.
+
+**Integration test `engine-breaker.int.test.ts`:**
+- The fake server fails **every attempt** of 30 % of logical calls (`failRate: 0.3`, status 503).
+- With fake timers, 40 calls go through the router: the breaker opens, the next calls return
+  `circuit_open` without reaching the server (the request counter is asserted), and the mirror in
+  `settings['engine.circuit']` shows `open`.
+- After `failRate` is set to 0 and the open duration elapses, the half-open probe succeeds and the
+  breaker closes.
+- A reset request (`resetRequested`) closes an auth-mode breaker within one polling interval.

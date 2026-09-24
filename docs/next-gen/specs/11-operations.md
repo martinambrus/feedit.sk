@@ -20,8 +20,8 @@ when something needs a human, before users notice.
 
 | Service | Image | Memory limit | Notes |
 |---|---|---|---|
-| `postgres` | `postgres:16` | 6 GB | volume `pgdata`. Config: `shared_buffers=4GB`, `work_mem=32MB`, `maintenance_work_mem=512MB`, `max_connections=100`, `wal_compression=on`. Not published to the host network |
-| `migrate` | api image, command `pnpm --filter @feedit/db migrate` | 512 MB | runs once per deploy; `api`/`worker` depend on its successful completion |
+| `postgres` | `postgres:16` | 6 GB | volume `pgdata`; `infra/postgres/init.sh` mounted into `/docker-entrypoint-initdb.d/` (spec 02 §1.1) with `POSTGRES_PASSWORD` and `FEEDIT_{OWNER,APP,WORKER}_PASSWORD` from `.env`. Config: `shared_buffers=4GB`, `work_mem=32MB`, `maintenance_work_mem=512MB`, `max_connections=100`, `wal_compression=on`. Not published to the host network |
+| `migrate` | api image, command `pnpm db:migrate` | 512 MB | runs once per deploy; `api`/`worker` depend on its successful completion |
 | `api` | built from `apps/api` | 768 MB | healthcheck `GET /readyz` |
 | `worker` | built from `apps/worker` | 1.5 GB (3.5 GB once Laya is enabled) | healthcheck on its metrics port |
 | `libretranslate` | `libretranslate/libretranslate:latest` (pin a digest) | 3 GB | `LT_LOAD_ONLY=en,sk,cs`, `LT_DISABLE_WEB_UI=true`. Compose profile `translate`, started only when some language mode is `translate` or `card_text_mode = english` |
@@ -29,7 +29,9 @@ when something needs a human, before users notice.
 
 - **Logging:** the Docker `json-file` driver with `max-size=20m`, `max-file=5` for every service.
 - **Restart policy:** `unless-stopped`.
-- **Secrets:** `/opt/feedit/.env` (mode 600): DB passwords for the three roles, `TYPESAFE_API_KEY`,
+- **Compose project name:** every compose file sets a top-level `name:` (`feedit-prod`, `feedit-dev`,
+  `feedit-test`), and host ports come from env, so stacks never replace each other's containers.
+- **Secrets:** `/opt/feedit/.env` (mode 600): the superuser password and the passwords for the three roles, `TYPESAFE_API_KEY`,
   `OLLAMA_API_KEY`, `SMTP_URL`, `SESSION_PEPPER`, `METRICS_TOKEN`, `ADMIN_EMAILS`.
 
 ---
@@ -49,7 +51,8 @@ when something needs a human, before users notice.
 
 ## 4. Backups (`infra/scripts/backup.sh`, host cron at 02:30)
 
-- `pg_dump -Fc` of the `feedit` database (including `pgboss` and `eval`) into `/opt/feedit/backups/`,
+- `docker compose exec -T postgres pg_dump -U postgres -Fc feedit` (as the **superuser**, so every
+  schema and all RLS-protected rows are included, `pgboss` and `eval` too) into `/opt/feedit/backups/`,
   then `rclone copy` to an S3-compatible bucket (off-site).
 - **Retention:** 7 daily, 4 weekly (Sunday), 6 monthly (1st). Enforced both locally and in the bucket.
 - **Weekly restore test** (`infra/scripts/restore-test.sh`, Sunday 04:00):
@@ -91,33 +94,39 @@ when something needs a human, before users notice.
 | `house.purge-auth` | `20 * * * *` | expired login codes and sessions per §5 |
 | `house.reconcile` | `0 2 * * *` | `refresh_feed_subscribers` + `refresh_feed_cards` for all feeds; recompute `feeds.lang_hint` |
 | `house.archive` | `15 3 * * *` | archive read items older than 31 days (not bookmarked); enforce the 1,000 unread cap per user per feed |
-| `house.purge-articles` | `30 3 * * *` | delete unreferenced articles older than 90 days (§5), in batches of 5,000 |
+| `house.purge-articles` | `30 3 * * *` | delete unreferenced articles older than 90 days (§5), in batches of 5,000. Articles referenced from `eval.*` are never purged |
 | `house.purge-bodies` | `45 3 * * *` | `body_text = NULL` for extractions older than 30 days |
 | `house.purge-engine-calls` | `0 4 * * *` | delete `engine_calls` older than 180 days |
-| `house.retire-cards` | `30 4 * * *` | set `retired_at` on non-library cards with no holders; delete their `card_answers` 30 days later |
+| `house.retire-cards` | `30 4 * * *` | set `retired_at` on non-library cards with no holders (`user_cards`/`user_labels`) that are not referenced by `eval.rater_cards`; delete their `card_answers` 30 days later |
 | `house.purge-users` | `0 5 * * *` | hard-delete users past the 7-day grace period |
-| `house.nightly-learn` | `0 1 * * *` | enqueue `user.learn` for users with new labels, and `user.suggest` for users active in the last 7 days |
+| `house.nightly-learn` | `0 1 * * *` | enqueue `user.learn` for users with explicit labels newer than their last training, and `user.suggest` for users active in the last 7 days (**built in M7-T4**) |
 | `house.metrics` | `10 0 * * *` | online metrics (spec 10 §7) |
-| `house.alerts` | `*/5 * * * *` | evaluate the alert rules (§6.1) |
+| `house.alerts` | `*/5 * * * *` | evaluate the alert rules (§6.1) and send **all** operational emails. Other components only record state: `engine.circuit`, `engine.budget_alerts`, `ops.events` |
+| `house.reenrich` | on demand (admin changes the active enrich set) | re-enqueue `article.enrich` for articles first seen in the last 7 days, in batches of 200, stopping while the budget is exhausted |
+| `house.translate-cards` | on demand (`card_text_mode` switched to `english`) | spec 07 §5 |
 
 Every job is idempotent, logs `{job, durationMs, affected}`, and exposes a counter.
 
 ### 6.1 Alerts (emails to `ADMIN_EMAILS`, de-duplicated: each alert at most once per 6 h until resolved)
 
+`house.alerts` keeps its state in `settings['alerts.state']` (`{[alertKey]: {firstAt, lastSentAt, active}}`).
+It sends through the shared mailer (`packages/shared/src/mail/`, which uses `SMTP_URL`, `MAIL_FROM` and
+`MAIL_TRANSPORT`). The worker therefore needs the mail settings too (spec 01 §3).
+
 | Alert | Condition |
 |---|---|
-| Engine breaker open | TypeSafe breaker open for more than 30 min, or in auth mode (immediately) |
-| Budget | 80 % and 100 % of the daily budget (spec 04 §6) |
+| Engine breaker open | `settings['engine.circuit'].typesafe` is `open` with `openedAt` more than 30 min ago, or it is `auth` (immediately) |
+| Budget | `settings['engine.budget_alerts']` has `p80At` or `p100At` for today (spec 04 §6) |
 | Pipeline backlog | any queue with more than 5,000 waiting jobs, or its oldest job older than 30 min |
 | Degraded share | more than 20 % of the last hour's new articles degraded |
 | Feed failures | more than 10 % of active subscribed feeds errored in the last 24 h |
 | Disk | Postgres volume more than 80 % full (checked from inside the worker with `statfs` on a mounted path) |
-| Backups | the backup script or the restore test reported failure (the scripts call `POST /api/v1/admin/ops-event` with `METRICS_TOKEN`) |
+| Backups | the backup script or the restore test reported failure through `POST /api/v1/admin/ops-event` (stored in `settings['ops.events']`), or no `backup_ok` event in the last 26 h |
 | Metrics | `for_you` like-rate below `maybe` like-rate for 3 consecutive days (spec 10 §7) |
 
 ---
 
-## 7. Security checklist (verified in M9)
+## 7. Security checklist (verified in M8-T6)
 
 - **TLS:** Caddy-managed certificates with HSTS (`max-age=31536000`).
 - **Headers** set by Caddy:
@@ -155,7 +164,7 @@ Every job is idempotent, logs `{job, durationMs, affected}`, and exposes a count
 
 ---
 
-## 9. Launch checklist (invite-only beta, end of M9)
+## 9. Launch checklist (invite-only beta, end of M8)
 
 - [ ] All milestones through M8 are done. G1 decisions are applied in production settings.
 - [ ] `TYPESAFE_MODEL` is pinned. The daily budget is set from the G1 recommendation.
@@ -164,5 +173,10 @@ Every job is idempotent, logs `{job, durationMs, affected}`, and exposes a count
 - [ ] The admin account exists. 10 invites were created for testers. The waitlist form works.
 - [ ] Starter bundles verified (every feed fetches, languages are correct).
 - [ ] Privacy page and contact email published. SMTP SPF/DKIM verified (mail-tester score ≥ 9/10).
-- [ ] Load sanity: 20 simulated users × 50 feeds × 10 cards for 1 hour on the target box. CPU < 70 %,
-      p95 API latency < 300 ms for `GET /articles`, no queue backlog alerts.
+- [ ] Load sanity (M8-T8): 20 simulated users × 50 feeds × 10 cards for 1 hour.
+      - **Setup:** a generated fixture feed server (1,000 feeds, 5 new items per feed per hour, from
+        `packages/testing`) and the fake TypeSafe server with `latencyMs: 300`. The API runs with
+        `RATE_LIMITS_ENABLED=false`, and `autocannon` scripts simulate readers (list, open, rate).
+      - **On the target box:** CPU < 70 %, p95 `GET /articles` < 300 ms, no queue-backlog alert.
+      - **On a local production-like stack** (when there is no host access): the same p95 and backlog
+        criteria. CPU is reported but not gated.

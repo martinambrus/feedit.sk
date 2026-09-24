@@ -12,25 +12,33 @@ handler `user.rank` does the I/O (§7). The same functions run inside `apps/eval
 ## 1. Inputs to `rankArticle(ctx, item, now)`
 
 ```ts
+type Strength = 'must' | 'love' | 'like' | 'never';
+type Reason = 'clickbait' | 'promo' | 'shallow' | 'seen' | 'off_topic' | 'other';
 interface UserRankContext {
   userId: string;
-  cards: { cardId: string; title: string; strength: 'must'|'love'|'like'|'never'; scopeFeedId?: string }[];
+  cards: { cardId: string; title: string; strength: Strength; scopeFeedId?: string;
+           interest: string; interestEn?: string }[];                    // texts are needed by BM25 (§9)
   labels: { cardId: string; name: string }[];
-  rules: { kind: RuleKind; value: string; expiresAt?: Date }[];          // non-expired only
-  prefs: UserPreferences;                                                  // spec 08 §5.2
-  reasonCounts90d: Record<'clickbait'|'promo'|'shallow'|'seen'|'off_topic'|'other', number>;
+  rules: { id: string; kind: RuleKind; value: string; expiresAt?: Date }[];   // non-expired only
+  prefs: UserPreferences;                                                  // spec 08 §3.1
+  reasonCounts90d: Record<Reason, number>;
+  staleDislikes90d: number;        // dislikes (any reason) on items that were stale when rated (§5)
   model?: ActiveModel;                                                     // §8
   subscriptions: { feedId: string; allowDuplicates: boolean }[];
-  readClusterIds: Set<string>;                                             // clusters with a read member
+  readClusterIds: Set<string>;                                             // clusters with a member read in the window
+  bm25: Bm25Corpus;                                                        // document frequencies over the user's whole window (§9)
 }
 interface RankItem {
-  articleId: string; feedIds: string[]; domain: string; author: string | null;
-  titleNorm: string; excerptNorm: string; translatedTitleNorm?: string;
+  articleId: string;
+  feedIds: string[];               // the article's feeds ∩ the user's subscriptions
+  domain: string; author: string | null;
+  titleNorm: string; excerptNorm: string; translatedTitleNorm?: string; translatedExcerptNorm?: string;
   firstSeenAt: Date; wordCount: number | null; hasImage: boolean; lang: string;
   clusterId?: string; clusterSize: number;
   pipelineState: string;
   facets?: Record<string, number>;                 // article_facets.features (spec 05 §3.4)
-  cardAnswers: Record<string, { p: number; engine: 'typesafe'|'llm'|'laya'|'prefilter' }>;
+  cardAnswers: Record<string, { p: number; engine: 'typesafe'|'llm'|'laya'|'prefilter' }>;  // the user's interest AND label cards
+  labelIds: string[];                              // labels already assigned (user_article.label_ids)
   translation?: { engine: string; quality: string };
 }
 interface RankResult {
@@ -41,26 +49,41 @@ interface RankResult {
 }
 ```
 
+`Explain` is defined once, as a zod schema, in `packages/shared/src/dto/explain.ts`. The ranker imports
+that type, and the API and web client read it (§6.2).
+
 ---
 
-## 2. Order of evaluation
+## 2. Order of evaluation (normative)
 
-1. **Hard rules** (§3.1). A hide rule returns `hidden` immediately. Boosts set a floor, applied at step 6.
-2. **Base probability `P`**:
-   - active personal model → `P = model(x)` (§8), `scoreSource = 'model'`
-   - otherwise, cards with answers → `P = cardScore` (§4), `scoreSource = 'cards'`
-   - otherwise, the article is degraded and the user has cards → BM25 (§9), `scoreSource = 'degraded'`
-   - otherwise → `lane = 'new'`, `P = null`, `scoreSource = 'none'`
-3. **Anti-interest cards** (§4.2): hide, or cap at `maybe`.
-4. **Quality demotions** (§5). Only when `scoreSource = 'cards'`, because the model learns these itself.
-5. **Lane from `P`** (§6.1), then the caps: `never_soft`, degraded → `maybe`, an `llm`-answered deciding
-   card → `for_you` only if `P ≥ 0.85`.
-6. **Floors:** a `must` card with `p ≥ 0.5`, or a boost rule → at least `for_you`.
-7. **Story rule:** if the article's cluster has a member the user has read → at most `everything`,
-   with rule `seen_story`.
-8. **Tier** from `P` (§6.1). **Label suggestions** (§6.3). **Explain** (§6.2).
+Lane order for "at most" and "at least": `hidden < everything < maybe < for_you`.
 
-Every rule that changes the outcome appends a code to `rulesFired` (§3.2).
+```
+rankArticle(ctx, item, now):
+  1. if item.pipelineState == 'stale'                → lane 'new', P null, source 'none'
+  2. if a hide rule matches (§3.1)                   → 'hidden' (fire its code)
+  3. if a never-card has p ≥ never.hide (§4.2)       → 'hidden' (fire never:<id>)
+  4. base probability P:
+       a. active model and the item has no 'llm' answers → P = model(x), source 'model' (§8)
+       b. else, some positive card of the user is answered → P = cardScore (§4), source 'cards';
+          apply quality demotions (§5)
+       c. else, pipelineState ∈ {'degraded','failed'} and the user has positive cards
+                                                     → P = bm25P (§9), source 'degraded'
+       d. else                                        → lane 'new', P null, source 'none'
+                                                        (label suggestions are still computed)
+  5. lane = laneFromP(P) (§6.1)
+  6. precedence of modifiers, the first that applies wins:
+       i.   seen_story: the item's cluster is in readClusterIds → lane = min(lane, 'everything')
+       ii.  source 'degraded'                              → lane = 'maybe' (floors are ignored)
+       iii. floor: a 'must' card with p ≥ mustFloor, or a boost_feed/boost_domain rule
+                                                       → lane = 'for_you' and P = max(P, lanes.forYou)
+       iv.  caps (both may apply): a never-card with never.soft ≤ p < never.hide → lane = min(lane, 'maybe');
+            the deciding card's answer engine is 'llm' and P < llmForYouMin → lane = min(lane, 'maybe')
+  7. tier = tierFromP(P); labelSuggestions (§6.3); explain (§6.2)
+```
+
+The "deciding card" is the positive card achieving `cardScore`. Every rule that changes the outcome
+appends its code to `rulesFired` (§3.2).
 
 ---
 
@@ -72,7 +95,7 @@ Every rule that changes the outcome appends a code to `rulesFired` (§3.2).
 |---|---|---|---|
 | `mute_keyword` | a keyword or phrase | `normalizeText(value)` (same as `title_norm`) occurs as a whole-word sequence in `titleNorm`, `excerptNorm` or `translatedTitleNorm` | hidden |
 | `mute_story` | cluster id | `item.clusterId === value` | hidden |
-| `block_feed` | feed id | every one of `item.feedIds` is blocked by the user | hidden |
+| `block_feed` | feed id | **every** feed in `item.feedIds` (the user's subscribed feeds carrying it) is blocked | hidden |
 | `block_domain` | registrable domain | `item.domain === value` | hidden |
 | `block_author` | author name | case- and diacritic-insensitive equality | hidden |
 | `boost_feed` | feed id | any feed matches | floor `for_you` |
@@ -121,7 +144,7 @@ These apply even when the personal model is active.
 | `clickbait` | `facets.clickbait ≥ 0.8` | `clickbait` |
 | `promotional` | `facets.promotional ≥ 0.8` | `promo` |
 | `shallow` | `facets.depth ≤ 0.25` (depth level ≤ 1) | `shallow` |
-| `stale` | `facets.time_sensitive ≥ 0.7` **and** article age > 72 h | — (always "auto on" once the user has 3 dislikes of any reason on stale items; otherwise off) |
+| `stale` | `facets.time_sensitive ≥ 0.7` **and** article age > 72 h | — ("auto" turns on when `staleDislikes90d ≥ 3`, i.e. three dislikes, of any reason, on items that met this condition when rated) |
 
 A flag is **active** for the user if `prefs.demote[flag] === 'on'`, or if it is `'auto'` (the default)
 and the user has ≥ 3 dislikes with the matching reason in the last 90 days.
@@ -137,7 +160,7 @@ Each active and triggered flag multiplies `P` by **0.6** and fires `demote:<flag
 | Lane | Condition |
 |---|---|
 | `hidden` | a hide rule or `never` hard rule fired |
-| `for_you` | `P ≥ 0.65` (after caps and floors) |
+| `for_you` | `P ≥ 0.65`, or raised by a floor (§2 step 6iii, which also raises `P` to at least 0.65 so the tier matches) |
 | `maybe` | `0.35 ≤ P < 0.65`, or capped to `maybe` |
 | `everything` | `P < 0.35` |
 | `new` | no score yet |
@@ -147,7 +170,7 @@ null. The web client's tier slider (FeedIt's 1–5) filters `for_you` + `maybe` 
 
 All thresholds come from `RankerConfig` (§11), which gate G1 may override.
 
-### 6.2 Explain (`user_article.explain`, version 1)
+### 6.2 Explain (`user_article.explain`, version 1; zod schema in `packages/shared/src/dto/explain.ts`)
 
 ```ts
 interface Explain {
@@ -157,7 +180,7 @@ interface Explain {
   cards: { id: string; title: string; strength: Strength; p: number; engine: string }[];   // the user's cards with answers, p desc, ≤ 10
   facets?: { contentType: { choice: string; p: number }; topic: { l1: string; p: number; l2?: string };
              depth: number; clickbait: number; promotional: number; timeSensitive: number; evergreen: number };
-  rules: { code: string; detail?: string }[];
+  rules: { code: string; ruleId?: string; cardId?: string; detail?: string }[];   // ids let the UI offer "undo"
   model?: { version: number; top: { feature: string; label: string; contribution: number }[] };   // top 3 by |contribution|
   translation?: { engine: string; quality: string };
   cluster?: { id: string; size: number };
@@ -168,44 +191,58 @@ Labels in `explain` use the English names; the web client localizes the topic id
 
 ### 6.3 Label suggestions
 
-For each of the user's labels with an answer `p ≥ 0.8` that is not already in `label_ids`, add the label
-to `labelSuggestions`. The UI shows them as tappable chips ("tap to keep", as in FeedIt).
+For each of the user's labels with an answer `p ≥ 0.8` that is not already in `item.labelIds`, add the
+label to `labelSuggestions`. The UI shows them as tappable chips ("tap to keep", as in FeedIt).
 
 ---
 
 ## 7. The `user.rank` handler
 
-1. **Load `UserRankContext`**, including `readClusterIds` (clusters of articles the user read in the
-   last 14 days).
+**Versioning:** `score_version = RANKER_VERSION * 10000 + settings['ranker.settings_version']`.
+- `RANKER_VERSION` is a constant in `packages/ranker`, bumped whenever the ranking semantics change.
+- The API bumps `ranker.settings_version` on every change to `ranker.thresholds` (and to any future
+  ranking-relevant key), and then enqueues `user.rank {full: true}` for users active in the last 7 days.
+- Inactive users catch up on their next visit: `GET /articles` enqueues a full rank when the user's
+  newest `score_version` is outdated.
+
+**Steps:**
+
+1. **Load `UserRankContext`**, including:
+   - `readClusterIds`: clusters with any member read by the user in the window
+   - `bm25`: document frequencies over **all** window articles, not just the dirty ones (§9)
 2. **Dirty set** (SQL, window `RankerConfig.windowDays` = 14, capped at 5,000, newest first). Articles
    from the user's subscriptions with `first_seen_at ≥ now − 14 days`, not archived for the user,
    where any of these holds:
    - no `user_article` row
-   - `ua.score_version < RANKER_VERSION`
-   - `ua.scored_at` is older than the newest of `article_facets.created_at` and
-     `card_answers.created_at` for the user's cards
+   - `ua.score_version < current score_version`
+   - `ua.scored_at` is older than the newest of `article_facets.updated_at`,
+     `card_answers.answered_at` (for the user's cards and labels) and `article_translations.created_at`
+   - the article's cluster has a member whose `read_at` for this user is newer than `ua.scored_at`
+     (the `seen_story` rule)
    - the payload says `full: true`, which re-ranks the whole window
 
    Stale articles (`pipeline_state = 'stale'`) are ranked as `new` without a score.
-3. **Batch-load** facets, card answers (only the user's cards), translations, clusters, feed ids, and the
-   domain (via `tldts`).
+3. **Batch-load** facets, card answers (the user's cards and labels), translations, clusters, the
+   user's `label_ids`, the feed ids (intersected with the subscriptions), and the domain (via `tldts`).
 4. Run `rankArticle` for each item.
 5. **Upsert** the ranking columns of `user_article` in batches of 500:
    `lane, tier, p_like, score_source, rules_fired, explain, label_suggestions, score_version, scored_at`.
    Reader-state columns are never touched.
-6. **Weak-translation escalation** (spec 07 §3): for items newly placed in `maybe` whose only
-   translation is a tier-1 `weak` one, enqueue `article.translate {forceTier2: true}` once per article.
-7. `RANKER_VERSION` is a constant in `packages/ranker`. Bumping it makes everything dirty. Bump it
-   whenever the ranking semantics or the config change.
+6. **Weak-translation escalation** (spec 07 §3): for items newly placed in `maybe` whose best
+   translation is a tier-1 `weak` one **and** that have no `ollama` translation row yet (a skipped
+   attempt also leaves a row), enqueue `article.translate {forceTier2: true}`. This happens once per
+   article.
 
-**Enqueued by:**
+**Enqueued by** (incremental runs are debounced; full runs use their own key, spec 03 §2):
 
 | Event | `full`? |
 |---|---|
-| match finished | no |
+| match finished; enrich degraded | no |
+| a read, mark-read or open on an article that belongs to a cluster | no (the dirty set picks up `seen_story`) |
 | card or label added/removed/strength/scope changed | yes |
-| rule created/deleted/expired | yes (expiry is picked up by the nightly `house.expire-rules`) |
-| preferences changed (`demote`, thresholds) | yes |
+| rule created/deleted, or expired (hourly `house.expire-rules`) | yes |
+| preferences changed (`demote`) | yes |
+| `ranker.thresholds` changed | yes (users active in 7 days; the others lazily, as above) |
 | new active model | yes |
 | subscription added/removed | yes |
 
@@ -223,7 +260,7 @@ to `labelSuggestions`. The UI shows them as tappable chips ("tap to keep", as in
 | Freshness | one-hot `age.lt6h/lt24h/lt72h/older`: age at the time of the label for training, now for scoring |
 | Language | one-hot `lang.en/sk/cs/other` |
 | Other | `has_image`, `cluster_log = ln(1 + clusterSize)` |
-| Source | `feed.h<k>`, one-hot with k = murmur3(feedId) mod 32 (the first feed carrying the item). `author.h<k>`, one-hot with k = murmur3(normalized author) mod 16 (none if there is no author) |
+| Source | `feed.h<k>`, one-hot with k = murmur3(feedId) mod 32, using the lowest id in `item.feedIds`. `author.h<k>`, one-hot with k = murmur3(`normalizeText(author)`) mod 16 (none if there is no author). murmur3 = **MurmurHash3 x86 32-bit, seed 0, over the UTF-8 bytes** of the decimal id string or the normalized author |
 
 Only answers from the **same engine family** are used. If a card answer or facet came from `llm`, the
 item is left out of training and scored with the cards path until Jev re-answers it.
@@ -264,14 +301,17 @@ The most recent explicit signal wins per article. Un-rating removes the label. O
 - **Contributions** for "Why this?": `w_i · x̃_i`; the top 3 by absolute value, mapped to
   human-readable labels (`card.<id>` → the card title, `t1.x` → the topic name, `feed.h*` → "this
   source", `len.*` → "article length", and so on).
-- Keep the last 3 versions per user. Delete older ones.
+- **Retention:** keep the **active** version plus the 3 newest versions per user; delete the rest. The
+  active version is never deleted.
 
 ### 8.4 When to train (`user.learn {userId}`)
 
 - **Enqueued:**
-  - by the API after every 10th new explicit label since the active model's `trained_at` (debounced,
-    singleton 60 s)
-  - by the nightly cron for users with any new labels
+  - **by the API.** After writing a rating or prompt answer, it counts
+    `n = count(*) FROM user_article WHERE user_id = me AND rating IS NOT NULL AND rated_at > coalesce((SELECT max(trained_at) FROM user_models WHERE user_id = me), users.created_at)`,
+    and enqueues when `n > 0 AND n % 10 = 0` (debounced, spec 03 §2). Prompt answers are stored as
+    ratings (spec 08 §5.3), so they count.
+  - **by `house.nightly-learn`** for users with any explicit label newer than their last training.
 - **Handler:** build the samples → train → store the version → if it is activated, enqueue
   `user.rank {full: true}` and `user.suggest`.
 
@@ -286,8 +326,10 @@ baseline (spec 10).
   tokens shorter than 2 chars and stop-words (small built-in EN/SK/CZ lists, ~150 words each).
 - **Document:** the title twice, then the excerpt (translated text instead, when a translation exists).
 - **Query:** the card's `interest` (or `interest_en`).
-- **Corpus statistics:** the candidate set being ranked in this run (IDF with +0.5 smoothing).
-  `k1 = 1.2`, `b = 0.75`.
+- **Corpus statistics:** document frequencies over **all** articles in the user's rank window (14 days
+  of their subscriptions). They are computed once per `user.rank` run, so scores don't depend on how
+  many items happen to be dirty. IDF uses +0.5 smoothing. `k1 = 1.2`, `b = 0.75`. The eval builds the
+  corpus from the rater's assigned articles.
 - `s = max over positive cards of BM25(card, doc)`. `P = 1 − exp(−s / 3)`.
 - The lane is **always `maybe`**: never hidden and never `for_you`, because keywords are not trusted to
   hide or promote.
@@ -303,7 +345,9 @@ baseline (spec 10).
   - if `maybe` has fewer than 10, fill from `everything` with the highest P
 - **"Did you like it?" prompt** (from FeedIt's todo list), shown when the reader returns to the app
   after opening an article:
-  - only if `dwell_ms ≥ 6,000`, the article is unrated, and it has not been prompted before
+  - only if `dwell_ms ≥ 6,000`, the article is unrated, and `feedback_prompted_at` is null
+  - whenever `POST /articles/:id/dwell` answers `prompt: true`, it also sets `feedback_prompted_at`, so
+    an ignored prompt never returns
   - and either `lane = 'maybe'` or `random() < f`, with f from `prefs.feedbackPrompt`:
     `often` = 1/5, `occasionally` = 1/20, `never` = 0
   - when the preference is `never`, no prompt is shown at all, even for Maybe items

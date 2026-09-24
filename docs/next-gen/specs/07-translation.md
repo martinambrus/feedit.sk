@@ -28,9 +28,16 @@ Claude is not used, for cost reasons (a locked decision).
 The container runs with `LT_LOAD_ONLY=en,sk,cs` and `LT_DISABLE_WEB_UI=true`. Its API port is only
 reachable on the compose network.
 
-**Daily cap for tier 2:** `settings['translate.tier2_daily_cap']`, default **300** calls. Tier-2 cost is
-counted in the spend guard (spec 04 §6) and logged in `engine_calls` with `engine = 'llm'`,
-`kind = 'translate'`.
+**Daily cap for tier 2:** `settings['translate.tier2_daily_cap']`, default **300** calls. The eval CLI
+ignores this cap (spec 10 §3).
+
+**Logging and budget:** `packages/translate` only makes HTTP calls. The `article.translate` handler
+records every call through `EngineRouter.recordExternalCall` (spec 04 §1):
+- tier 1 → `engine_calls` with `engine = 'libretranslate'`, `kind = 'translate'`, cost 0
+- tier 2 → `engine = 'llm'`, `kind = 'translate'`, the cost from token usage
+
+Before a tier-2 call the handler checks `router.canSpend(estimate, 'bulk')`, so tier-2 spend counts
+against the daily budget (spec 04 §6).
 
 ---
 
@@ -41,9 +48,13 @@ counted in the spend guard (spec 04 §6) and logged in `engine_calls` with `engi
    `{ q: [title, excerpt, body_lead].filter(Boolean), source: lang, target: 'en', format: 'text' }`.
    - Timeout 30 s, 2 attempts.
    - Store an `article_translations` row with `engine='libretranslate'` and `quality` from §4.
-3. **Tier 2** if:
-   - tier-1 quality is `fail`, or `forceTier2` is set, or the feed has `fetch_options.translate_strong`
-   - and `OLLAMA_API_KEY` is set, the daily cap is not reached, and the budget allows
+3. **Tier 2** is wanted if tier-1 quality is `fail`, or `forceTier2` is set, or the feed has
+   `fetch_options.translate_strong`. It is **allowed** if `OLLAMA_API_KEY` is set, the daily cap is not
+   reached, and `router.canSpend(...)` is true.
+
+   If it is wanted but not allowed, store an `ollama` row with `quality = 'fail'` and
+   `quality_detail = {skipped: 'no_key'|'cap'|'budget'}`. The attempt is on record, so the ranker's
+   escalation (spec 06 §7) never re-enqueues it.
 
    Call Ollama `/api/chat` with:
 
@@ -56,15 +67,18 @@ counted in the spend guard (spec 04 §6) and logged in `engine_calls` with `engi
        { "role": "user", "content": "{\"title\":\"…\",\"excerpt\":\"…\",\"body_lead\":\"…\"}" } ] }
    ```
 
-   Store an `engine='ollama'` row with its own quality.
+   Store an `engine='ollama'` row (upsert: it replaces an earlier skipped row) with its own quality.
 4. **Best translation for state builders:** the highest quality among the rows (`ok` > `weak` > `fail`).
    Ties prefer `ollama`. If only `fail` rows exist, the state is built from native text.
 5. Set `pipeline_state = 'translated'` and hand over to enrich.
 
-**Re-translation of weak items** (the ranker's side-effect, handled in `user.rank`): when an article
-lands in `maybe` for any user, has only a tier-1 translation of quality `weak`, and has not been
-re-translated, enqueue `article.translate {forceTier2: true}`. This is followed by re-enrich and
-re-match (spec 05), once per article.
+**Re-translation of weak items** (triggered by `user.rank`, spec 06 §7 step 6):
+- `article.translate {forceTier2: true}` runs step 3 only.
+- If the new `ollama` row's quality is better than the previous best, call
+  `resetArticleAnswers(articleId)` (spec 05 §5.6) and enqueue `article.enrich`, so the article is
+  re-enriched and re-matched on the better text.
+- Otherwise nothing else happens.
+- This runs once per article: the `ollama` row, even a skipped one, prevents repeats.
 
 ---
 
@@ -87,12 +101,21 @@ Names and brands legitimately survive translation, so the 0.5 share is deliberat
 
 ## 5. Card text translation (`CARD_TEXT_MODE = 'english'`)
 
-On card create or edit:
-- if `detectLanguage(interest)` ∉ {`en`, `und`}, translate `interest` and `not_for` with tier 1 into
-  `interest_en` and `not_for_en`
-- on `fail`, keep the original text only (no tier 2 for cards; users can rephrase)
+On card create or edit, the **API service** (it has `LIBRETRANSLATE_URL`, spec 01 §3) does this before
+inserting a new card row:
+1. `lang = detectLanguage(interest + ' ' + (not_for ?? ''), { hint: user.locale, minLength: 10 })`
+   (spec 03 §8.3), stored in `interest_cards.lang`.
+2. If `lang ∉ {en}`, translate `interest` and `not_for` with tier 1 into `interest_en` and `not_for_en`.
+   Short texts are fine: the locale hint makes detection work for 2–3-word interests.
+3. On `fail`, keep the original text only. There is no tier 2 for cards; users can rephrase.
 
-Library cards already ship with English text.
+**Switching the mode on later:**
+- `PATCH /admin/settings {card_text_mode: 'english'}` enqueues the one-off `house.translate-cards`.
+- It fills `interest_en`/`not_for_en` for every non-retired card where they are null and `lang ≠ en`.
+  This is the only allowed in-place write to a card body (spec 05 §5.1), and runs as `feedit_worker`.
+- New answers then use the English text. Existing answers stay until the articles age out.
+
+Library cards already ship with English text (`lang = 'en'`).
 
 ---
 
