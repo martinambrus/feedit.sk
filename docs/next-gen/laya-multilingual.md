@@ -102,7 +102,8 @@ requires hand-labelling thousands of items.
      returns probabilities, which make better soft targets for calibration than hard labels.
    - ~~A generative LLM as a direct teacher reading SK/CZ natively.~~ **Not used**: the LLM is approved only
      for fallback and translation (PLAN §7.6). Its approved role here is **translating** SK/CZ articles so
-     that Jev can act as the teacher.
+     that Jev can act as the teacher. Translation comes from OPUS-MT / LibreTranslate first, with Ollama Cloud
+     GLM as the fallback (PLAN §4.6).
 
    ⚠️ **Check the teacher's terms first.** Some providers restrict using outputs to train models that compete
    with them. Read the TypeSafe and LLM-provider terms before distilling.

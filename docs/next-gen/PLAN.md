@@ -8,8 +8,8 @@
 > **Decisions taken (2026-09-24):** TypeScript monorepo; multi-tenant from day one; a generative LLM is
 > allowed only as the fallback decision engine and for translation; no data or accounts migrate from
 > FeedIt.sk, and everything is trained or fine-tuned from scratch; self-hosted on one box with minimal
-> spend and no GPU; invite-only signups at launch; translation via local Ollama/GLM is acceptable at lower
-> quality. See §7.6.
+> spend and no GPU; invite-only signups at launch; translation runs on free CPU models first, with Ollama Cloud GLM as
+> the fallback, and Claude is out of the picture for cost reasons. See §7.6.
 >
 > Companion document: [`jev-questions.md`](./jev-questions.md) holds the concrete Jev question sets,
 > request shapes and cost math. [`laya-multilingual.md`](./laya-multilingual.md) evaluates Laya, the
@@ -556,7 +556,7 @@ interface DecisionEngine {
   - `TypeSafeEngine`: the SDK, direct API.
   - `GatewayEngine`: the same model via Vercel AI Gateway (`typesafe-ai/jev`) or OpenRouter (`typesafe/jev-1.13`). Useful for zero data retention and as a failover path.
   - `DegradedEngine`: no model at all. Keyword-baseline ranking, everything goes to *Maybe*, and articles are queued for re-scoring. This is the default fallback on the CPU-only box (§4.6).
-  - `LlmFallbackEngine`: turns Choice/Score/Noul into a strict JSON schema for any structured-output LLM (Ollama/GLM locally, or a paid API with a spend cap). Newsjack has this adapter. It is slower, so on a CPU-only box it is used only for a trickle of articles (§4.6).
+  - `LlmFallbackEngine`: turns Choice/Score/Noul into a strict JSON schema for any structured-output LLM (Ollama Cloud GLM). Newsjack has this adapter. It is slower and concurrency-limited, so it is used only for a trickle of articles (§4.6).
   - `LayaEngine`: the open-weights Laya model, self-hosted through the Jev-compatible ONNX port `receptron/laya`. It needs fine-tuning before it is useful; it is a candidate for SK/CZ enrichment. See [`laya-multilingual.md`](./laya-multilingual.md).
 - **Operational rules copied from newsjack:**
   - a concurrency pool
@@ -644,24 +644,33 @@ to object storage (`pg_dump` + WAL archiving).
 | Readability extraction, dedup, ranker, personal logistic models | ✅ trivial on CPU |
 | Dedicated MT models (OPUS-MT / Argos / LibreTranslate) | ✅ designed for CPU. See the translation table below |
 | Laya-multilingual through ONNX | ⚠️ about 140–460 ms per call on a decent CPU is fine at invite-only scale, but a small 4 vCPU VPS measured **49 s per call**, so it needs a real 8-core-class CPU. Fine-tuning uses free Kaggle GPUs and never touches the server |
-| A local generative LLM (Ollama + GLM) for **bulk** translation or as the fallback engine | ❌ too slow for per-article work on CPU. It is fine for occasional, small jobs (below) |
+| Generative LLM | ✅ not local: **Ollama Cloud** (remote API), used only as a fallback |
 
-**Translation backends** (only needed if Phase 0 selects option (c), §7.2):
+**Translation: a free local model first, Ollama Cloud GLM as the fallback** (only needed if Phase 0 selects
+option (c), §7.2):
 
-| Backend | Runs on | SK/CZ → EN quality | Throughput on the box | Cost | Verdict |
+| Tier | Backend | Runs on | SK/CZ → EN quality | Speed | Cost |
 |---|---|---|---|---|---|
-| **OPUS-MT** `Helsinki-NLP/opus-mt-sk-en` + `opus-mt-cs-en` (Marian, via CTranslate2 int8) or **LibreTranslate/Argos** (has `sk→en`, `cs→en` packages) | CPU, about 300 MB–1 GB RAM per model | adequate: literal, sometimes clumsy, but the *gist* survives | tens to hundreds of ms per title + excerpt; thousands of articles/hour | €0 | **Default.** Built for exactly this on CPU |
-| **Ollama + GLM**: `glm4:9b` (about 5.5 GB) or `glm-4.7-flash` (MoE, about 19 GB download) | CPU | better than OPUS-MT on idioms and headlines | a 200-token output takes tens of seconds per article on CPU, so about 6–15 CPU-hours/day for one heavy user; it would also compete with Postgres for RAM | €0 plus RAM | Only for small, rare jobs (e.g. re-translating the few articles that land in *Maybe*), not the bulk path |
-| **Claude Haiku 4.5 via the API** ($1 / $5 per MTok; Message Batches −50 %) | remote | best | unlimited | title + excerpt is about 250 in + 200 out tokens → about $0.0006/article with batching. At about 1,000 SK/CZ articles/day that's about $0.6/day (more than Jev's own cost for a single user) | **Quality ceiling in the Phase 0 eval**, and an optional paid tier later |
-| Claude Code subscription | — | — | — | — | ❌ Not for this. A personal subscription is meant for interactive use by its owner, not for serving a multi-tenant pipeline. Automated, product-side calls belong on the API with its own key and billing |
+| **1 · primary** | **OPUS-MT** (`Helsinki-NLP/opus-mt-sk-en`, `opus-mt-cs-en`: small Marian models of about 300 MB each, served through CTranslate2 int8) **or LibreTranslate** (a ready-made self-hosted service with `sk→en` / `cs→en` Argos packages) | the box's CPU, about 1 GB RAM for both language pairs | adequate: literal, sometimes clumsy, but the *gist* survives, which is what classification needs | tens to hundreds of ms per title + excerpt; thousands of articles/hour | **€0** |
+| **2 · fallback** | **Ollama Cloud**, `glm-5.3-flash` (or `glm-5.3` for harder text) through its HTTP API with `OLLAMA_API_KEY` | remote | better on idioms, slang and headlines | seconds per call; concurrency 1 on the Free plan, 3 on Pro, 10 on Max | per 1M tokens: `glm-5.3-flash` $0.15 in / $0.50 out, `glm-5.3` $1.40 / $4.40, cheaper off-peak. Title + excerpt (≈250 in + 200 out) costs about **$0.00014/article** on flash |
+
+**When tier 2 is used:**
+- OPUS-MT fails (an error, or empty or garbled output detected by simple heuristics such as length ratio and the
+  share of untranslated words).
+- An article lands in *Maybe* **and** the tier-1 translation looks weak. It is re-translated with GLM and
+  re-asked once.
+- The admin enables it for specific feeds known to be hard (slang, heavy idioms).
+
+Every translation stores its `engine`, so results can be compared later and a tier-2 re-translation never
+overwrites the tier-1 row. Ollama Cloud states that prompt and response data are never logged or trained on,
+and that it hosts primarily in the US.
 
 **Key point for Phase 0:** translation quality is measured by its **effect on classification**, not by
 reading the translations. Run the golden set's SK/CZ articles through Jev three ways (native, OPUS-MT → EN,
-Haiku → EN) and compare AUC and accuracy. If OPUS-MT is within a point or two of Haiku, cheap MT wins, and
-the likely outcome is that Jev only needs the gist.
+Ollama Cloud GLM → EN) and compare AUC and accuracy. If OPUS-MT is within a point or two of GLM, the free
+model wins outright. The likely outcome is that Jev only needs the gist.
 
-**The fallback engine on a CPU-only box.** A local LLM can't carry the full per-article load, so the
-fallback becomes a chain:
+**The fallback engine on a CPU-only box.** When Jev is unavailable:
 
 1. **`DegradedEngine` (default):**
    - rank with the keyword baseline (BM25 of card text against title + excerpt), which already exists for evaluation
@@ -669,15 +678,17 @@ fallback becomes a chain:
    - queue the articles for re-scoring when Jev is back
 
    It costs nothing and is always available.
-2. **`LlmFallbackEngine` (optional, configured per deployment):**
-   - either Ollama/GLM on CPU for a trickle (e.g. only articles a user is actively viewing)
-   - or a paid API model with a daily spend cap
-
-   Off by default.
+2. **`LlmFallbackEngine` on Ollama Cloud (optional, off by default):** the same Choice/Score/Noul question
+   sets rendered as a JSON-schema prompt for `glm-5.3-flash`.
+   - A Call A-sized request (≈2k in + ≈300 out) costs about $0.00045.
+   - Concurrency limits mean it suits a trickle, such as articles a user is actively viewing, rather than the
+     full ingest backlog.
+   - Its answers are marked `engine = llm` and re-scored by Jev when Jev returns, because the personal model's
+     features must come from one engine.
 3. **`LayaEngine`**, once fine-tuned (`laya-multilingual.md`), becomes the main fallback for Call A.
 
 **Spend guard.** A daily budget, in `$` from `jev_calls.input_tokens` (and translation calls if they go to a
-paid API). When it's exhausted, new articles go to `DegradedEngine` until midnight UTC, and an admin alert
+Ollama Cloud). When it's exhausted, new articles go to `DegradedEngine` until midnight UTC, and an admin alert
 fires. At invite-only scale, Jev costs dollars per day (see `jev-questions.md` §5), so the cap is a safety
 net rather than a normal operating mode.
 
@@ -779,9 +790,9 @@ options, to be decided by the eval (§6), not upfront:
   measured.
 - **(c)** Translate the title + excerpt (+ body lead) to English before Call A/B, and store the translation
   (`article_translations`). Translation happens once per article and is shared by all tenants. On the
-  CPU-only box the bulk path is a **dedicated MT model** (OPUS-MT / LibreTranslate, free and fast on CPU).
-  Ollama/GLM handles only small jobs, and Claude Haiku is the quality ceiling in the eval. Backends and
-  numbers are in §4.6.
+  CPU-only box the primary path is a **dedicated MT model** (OPUS-MT / LibreTranslate, free and fast on
+  CPU). **Ollama Cloud GLM** is the fallback for failures and weak translations. Backends and numbers are
+  in §4.6.
 
 - **(d)** Fine-tune the open-weights **Laya-multilingual** model (Apache 2.0, mmBERT-base) on EN/SK/CZ
   data labelled by a teacher, and route SK/CZ articles to it for the fixed enrichment questions. Laya is
@@ -823,7 +834,7 @@ enterprise plans.
 
 | 5 | Hosting | **Self-hosted, minimal spend, no GPU** | One 8 vCPU / 16–32 GB box (§4.6). No local bulk LLM. Laya only through ONNX on CPU, fine-tuned on free Kaggle GPUs |
 | 6 | Signups at launch | **Invite-only** | Invites + waitlist in §4.5, which doubles as cost control |
-| 7 | LLM provider | **Claude gives the best translations but costs the most; Ollama + GLM is acceptable at lower quality** | Bulk translation uses a dedicated CPU MT model (OPUS-MT / LibreTranslate), because GLM on CPU is too slow per article. Ollama/GLM handles small jobs and the optional fallback. Claude Haiku through the **API** (not a Claude Code subscription) is the eval quality ceiling and an optional paid upgrade. Phase 0 picks by the effect on classification accuracy (§4.6) |
+| 7 | LLM provider | **Free CPU translation models first; Ollama Cloud GLM for everything else LLM-related; no Claude** (too expensive for the quality needed) | Translation tier 1 is OPUS-MT / LibreTranslate on the box. Tier 2 and `LlmFallbackEngine` use Ollama Cloud (`glm-5.3-flash`, with `glm-5.3` for hard cases). Phase 0 compares them by their effect on classification accuracy (§4.6) |
 
 ---
 
@@ -833,7 +844,7 @@ enterprise plans.
 - Minimal ingestion script (no pipeline yet) over a real EN/SK/CZ feed mix, and the bare-bones rating page in `apps/eval`.
 - Build `golden-v1` (§6): 3–5 raters write cards, then rate; hand-label the Call A questions.
 - Script: Call A + Call B for those articles. Compute AUC vs. ratings and compare with the chronological and keyword baselines.
-- Test the language options (a)/(b)/(c) on Slovak/Czech items, with Laya-multilingual zero-shot as a baseline (§7.2). For (c), compare OPUS-MT, Ollama/GLM and Claude Haiku *by their effect on classification* (§4.6). Measure latency, CPU time and $ on the target box size.
+- Test the language options (a)/(b)/(c) on Slovak/Czech items, with Laya-multilingual zero-shot as a baseline (§7.2). For (c), compare OPUS-MT/LibreTranslate against Ollama Cloud GLM *by their effect on classification* (§4.6). Measure latency, CPU time and $ on the target box size.
 - **Exit criterion:** card-based ranking clearly beats the keyword baseline for every rater, with zero training, and a language option exists where SK/CZ is within about 5 AUC points of EN.
 - Phase 0 now takes about **2 weeks** rather than 1, because the golden set has to be built.
 
@@ -848,7 +859,7 @@ enterprise plans.
 - A PWA with feeds, lanes, swipe/keyboard rating with reason chips, "Why this?", mutes and boosts.
 - Passwordless auth, tenant-scoped API and the quotas from §4.5.
 - `DegradedEngine`, the spend guard and the invite flow.
-- The `translate` stage (OPUS-MT / LibreTranslate container), if Phase 0 selected translation. `LlmFallbackEngine` is optional.
+- The `translate` stage (an OPUS-MT / LibreTranslate container, with an Ollama Cloud GLM fallback), if Phase 0 selected translation. `LlmFallbackEngine` on Ollama Cloud is optional.
 
 **Phase 3: Personal learning (2 weeks).**
 - Per-user logistic model + calibration, and the implicit signals (dwell, return prompt).
