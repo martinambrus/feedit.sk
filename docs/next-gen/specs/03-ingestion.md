@@ -56,7 +56,7 @@ schema, `createQueue` options and typed enqueue helpers (`enqueueFetch`, `enqueu
 | `article.cluster` | `{articleId}` | enrich | 4 | 1 | `stately`, key `cluster:<id>` |
 | `article.match` | `{articleId}` | enrich, `card.backfill`, itself (when rows remain) | 8 | 1 | `stately`, key `match:<id>`; drains all queued cards for the article |
 | `card.backfill` | `{userId, cardIds: string[], feedIds?: string[]}` | API (card or subscription change) | 2 | 2 | `standard` |
-| `user.rank` | `{userId, reason, full?: boolean}` | match, enrich (degraded), API, learn | 4 | 2 | incremental: `sendDebounced(…, 3 s, key rank:<userId>)`; full: a `stately` send with key `rank-full:<userId>`. A full request is never swallowed by a pending incremental one (spec 06 §7) |
+| `user.rank` | `{userId, reason, full?: boolean}` | match, enrich (degraded), ingest, API, learn | 4 | 2 | queue `policy: 'stately'`. Incremental: `sendDebounced('user.rank', data, {}, 3, 'rank:<userId>')`. Full: `send('user.rank', {…, full: true}, {singletonKey: 'rank-full:<userId>'})`. Different keys mean a full request is never swallowed by a pending incremental one, while duplicates of each are merged (spec 06 §7) |
 | `user.learn` | `{userId}` | API (ratings), `house.nightly-learn` | 2 | 1 | `sendDebounced(…, 60 s, key learn:<userId>)` |
 | `user.suggest` | `{userId}` | learn, `house.nightly-learn` | 1 | 1 | `sendThrottled(…, 86,400 s, key suggest:<userId>)`: at most daily |
 | `house.rescore-degraded`, `house.expire-rules`, `house.purge-auth`, `house.reconcile`, `house.archive`, `house.purge-articles`, `house.purge-bodies`, `house.purge-engine-calls`, `house.retire-cards`, `house.purge-users`, `house.nightly-learn`, `house.metrics`, `house.alerts` | `{}` | cron (spec 11 §6) | 1 | 1 | `policy: 'singleton'` (never two runs at once) |
@@ -141,7 +141,7 @@ All outbound HTTP for feeds, pages, discovery and robots.txt goes through `safeF
 8. **Error codes:** `FEED_BLOCKED_ADDRESS`, `FEED_DNS_ERROR`, `FEED_TIMEOUT`, `FEED_TLS_ERROR`,
    `FEED_CONNECTION_ERROR`, `FEED_TOO_LARGE`, `FEED_HTTP_<status>`, `FEED_TOO_MANY_REDIRECTS`.
 9. **Testing escape hatch:** `FETCH_ALLOW_PRIVATE=true` disables **both** the address checks and the
-   port allow-list, so local fixture servers on random ports work (M1-T9, E2E). Config validation
+   port allow-list, so local fixture servers on random ports work (M1-T8, E2E). Config validation
    **rejects** this flag when `NODE_ENV=production`. SSRF tests always run with the hatch **off**, using
    the injected resolver and IP-literal URLs: `127.0.0.1`, `[::1]`, `[::ffff:127.0.0.1]`, `2130706433`,
    `0x7f.1`.
@@ -264,6 +264,16 @@ For one fetch, in **one transaction per item**, so one bad item doesn't roll bac
    - Otherwise `'ingested'`, and the article is new.
 6. Insert `feed_items`.
 
+**A feed newly carrying an already-processed article** applies to steps 2–4, and to the extract
+merge (§8.1 step 4) and feed merge (§9) whenever a `feed_items` row is **newly inserted** for an
+article whose `pipeline_state` is `enriched`, `matched` or `degraded`. In the same transaction:
+- `INSERT INTO match_queue (article_id, card_id, priority) SELECT $article, card_id, 5 FROM feed_cards WHERE feed_id = $feed ON CONFLICT DO NOTHING`
+- after commit, enqueue `article.match` for the article (it skips cards already answered)
+- enqueue an incremental `user.rank` for the feed's subscribers
+
+Otherwise readers who follow only this feed (typical for Google-News-style aggregators) would never
+get answers for the article.
+
 After all items:
 - Update the feed row (§9).
 - Update `feeds.publish_stats.recent_gaps_s` with the gaps between the newest ≤ 20 `published_at`
@@ -359,7 +369,7 @@ MIN   = feed.min_interval_s                       (≥ 300)
 MAX   = 86_400 if last_new_item_at within 30 days, else 864_000     (24 h / 10 days)
 
 on success (HTTP 200/304):
-  consecutive_errors = 0; first_error_at = null; status = 'active'; quarantine_count = 0
+  consecutive_errors = 0; first_error_at = null; status = 'active'; quarantine_count = 0; last_success_at = now
   if n_new > 0:
       factor   = n_new >= 5 ? 0.5 : n_new >= 2 ? 0.75 : 1.0
       interval = interval * factor

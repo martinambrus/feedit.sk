@@ -53,12 +53,25 @@ SQL
 `feedit_owner` must have `BYPASSRLS`. The SECURITY DEFINER functions in §6 run as the owner and must
 see every tenant's rows. `FORCE ROW LEVEL SECURITY` would otherwise apply to the owner too.
 
-**Test databases** (`infra/compose.test.yml` runs the same `init.sh`):
-- The test helper in `packages/testing` connects with `TEST_ADMIN_DATABASE_URL` (the superuser).
-- It creates a migrated template database `feedit_template` once.
-- Per worktree and package it creates
-  `feedit_test_<worktree-hash>_<package>` with `CREATE DATABASE … TEMPLATE feedit_template OWNER feedit_owner`.
-- Parallel sessions and packages therefore never share a test database (spec 01 §6).
+**Test databases** (`infra/compose.test.yml` runs the same `init.sh`). The helper in
+`packages/testing` connects with `TEST_ADMIN_DATABASE_URL` (the superuser):
+
+1. **Template per schema version:** `feedit_template_<h>`, where `h` = the first 12 hex digits of
+   `sha256(migration journal file + pinned pg-boss version)`. A changed migration therefore yields a new
+   template, and parallel branches with different migrations never share one.
+2. **Creation** runs under `pg_advisory_lock(hashtext('feedit_template'))`, so parallel test runs never
+   race. If the template is missing:
+   - `CREATE DATABASE feedit_template_<h> OWNER feedit_owner`
+   - as the superuser, `CREATE EXTENSION IF NOT EXISTS citext, pg_trgm, pgcrypto` in it (a new database
+     has no extensions)
+   - the full **migrate job** as `feedit_owner`: Drizzle migrations, the pg-boss schema and the queues
+     (§1.2)
+3. **Per worktree and package:** `feedit_test_<worktree-hash>_<package>`, created with
+   `CREATE DATABASE … TEMPLATE feedit_template_<h> OWNER feedit_owner` (dropped and recreated per run).
+4. **E2E and eval dry-run databases** are created the same way, from the template for the current
+   journal, and are then **seeded** (`pnpm db:seed`) before any process uses them.
+
+Parallel sessions and packages therefore never share a test database (spec 01 §6).
 
 ### 1.2 Privileges (first migration, run as `feedit_owner`)
 
@@ -84,8 +97,8 @@ ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner REVOKE EXECUTE ON FUNCTIONS FROM 
 | `story_clusters` | `INSERT, UPDATE` | mute-story creates a cluster |
 | `articles` | `UPDATE (story_cluster_id)` | mute-story |
 | `interest_cards` | `INSERT`; `UPDATE (retired_at, title, topic_ids, i18n, slug, visibility)` | card create/reuse (un-retire), admin library and promotion (`shared` → `public`). **Never** the text or examples: cards are immutable (spec 05 §5.1) |
-| `feedback_events` | `INSERT` | reader actions |
-| every per-user table (§4) | `INSERT, UPDATE, DELETE` | RLS applies |
+| `feedback_events` | `INSERT` | reader actions (append-only; rows disappear only through `ON DELETE CASCADE` when the worker purges a user) |
+| every **other** per-user table (§4) | `INSERT, UPDATE, DELETE` | RLS applies |
 | `drizzle.__drizzle_migrations` | `SELECT` (with `USAGE ON SCHEMA drizzle`) | `/readyz` |
 
 **pg-boss** (pg-boss 10; the schema is created by a migration and never by a running process):
@@ -201,12 +214,13 @@ through `PATCH /admin/settings`.
 | `card_text_mode` | `'as_written'\|'english'` | `'as_written'` | admin, `apply-g1` |
 | `translate.tier2_daily_cap` | int | 300 | admin, `apply-g1` |
 | `ranker.thresholds` | deep partial of `RankerConfig` (spec 06 §11) | `{}` | admin, `apply-g1` |
-| `ranker.settings_version` | int | 0 | the API, bumped on every ranking-relevant settings change (spec 06 §7) |
+| `ranker.settings_version` | int | 0 | bumped by the API on ranking-relevant settings changes, and by `eval apply-g1` (spec 06 §7) |
 | `question_sets.active` | `{enrich?: id, match?: id, cluster?: id, suggest?: id}` | `{}` | seed (only when a kind is absent), admin |
 | `signup_mode` | `'invite'\|'open'\|'closed'` | env `SIGNUP_MODE` | admin |
 | `ops.events` | `[{kind, detail, at}]`, the last 50 | `[]` | `POST /admin/ops-event` |
 | `alerts.state` | `{[alertKey]: {firstAt, lastSentAt, active}}` | `{}` | `house.alerts` |
 | `metrics.daily.<YYYY-MM-DD>` | metrics JSON (spec 10 §7) | — | `house.metrics` |
+| `worker.heartbeat` | `{[processId]: {at: iso, queues: string[], evalIngestOnly: boolean}}` | `{}` | every worker process, every 30 s (entries older than 1 h are pruned). `eval ingest-sample` needs an entry younger than 90 s with `evalIngestOnly = true` (spec 10 §2.1) |
 
 `pnpm db:seed` inserts **only** `card_text_mode` and `question_sets.active = {}` when they are missing.
 Keys with an env fallback are never seeded, so the env default stays effective until an admin sets a
@@ -709,7 +723,7 @@ GRANT EXECUTE ON FUNCTION refresh_feed_cards(bigint[]), refresh_feed_subscribers
   and restore. `house.reconcile` (spec 11) also runs them nightly for all feeds.
 - **The `admin_*` functions** are called only from admin routes, after the role check (spec 08 §9).
 
-**Tests** (M0-T4). Both refresh functions give correct rows when called:
+**Tests** (M0-T5). Both refresh functions give correct rows when called:
 - (a) as `feedit_app` inside `withTenant(A)`, with users A and B both subscribed and holding different
   cards
 - (b) as `feedit_worker` with no `app.user_id`

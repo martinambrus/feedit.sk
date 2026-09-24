@@ -10,9 +10,36 @@ instead of failing the pipeline.
 ## 1. Public API
 
 ```ts
-// packages/engine/src/types.ts
+// ── packages/shared/src/ports.ts  (shared, because packages/db implements EngineStore; engine re-exports) ──
 export type EngineName = 'typesafe' | 'llm' | 'laya';
-export type CallKind = 'enrich' | 'match' | 'cluster' | 'suggest' | 'eval';
+export type CallKind = 'enrich' | 'match' | 'cluster' | 'suggest' | 'translate' | 'eval';
+export type CallStatus = 'ok' | 'error' | 'timeout' | 'rate_limited' | 'invalid_request' | 'invalid_response' | 'auth_error';
+
+export interface EngineCallRow {               // mirrors engine_calls (spec 02 §3.1)
+  engine: EngineName | 'libretranslate'; kind: CallKind; model?: string; articleId?: string;
+  questionSetId?: string; cardIds?: string[]; userId?: string; nQuestions: number;
+  inputTokens: number; outputTokens: number; costUsd: number; latencyMs?: number;
+  attempts: number; status: CallStatus; error?: string; createdAt: Date;
+}
+export interface UsageRow {                    // mirrors usage_daily
+  day: string /* YYYY-MM-DD, UTC */; userId: string /* or the platform sentinel */;
+  engine: string; kind: CallKind; calls: number; inputTokens: number; outputTokens: number; costUsd: number;
+}
+export interface ExternalCall {                // non-engine calls logged through the router (translation, spec 07 §2)
+  engine: 'libretranslate' | 'llm'; kind: 'translate' | 'eval'; model?: string; articleId?: string;
+  inputTokens: number; outputTokens: number; costUsd: number; latencyMs: number;
+  status: CallStatus; error?: string;
+}
+export interface EngineStore {                 // implemented in packages/db
+  insertCall(row: EngineCallRow): Promise<void>;                 // engine_calls
+  upsertUsage(row: UsageRow): Promise<void>;                     // usage_daily
+  spendSince(fromUtc: Date, opts: { excludeKinds: CallKind[] | 'none' }): Promise<number>;
+  getSetting<T>(key: string): Promise<T | undefined>;
+  setSetting<T>(key: string, value: T): Promise<void>;
+}
+
+// ── packages/engine/src/types.ts ──
+export type { EngineName, CallKind, CallStatus, EngineCallRow, UsageRow, ExternalCall, EngineStore } from '@feedit/shared';
 export type Priority = 'interactive' | 'bulk';
 
 export type Criteria = string | JsonObject | JsonArray | null;          // TypeSafe "EntryType"
@@ -27,7 +54,7 @@ export type ScoreAnswer  = { type: 'score';  score: number; probabilities: numbe
 export type Answer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
 
 export interface EngineRequest {
-  kind: CallKind;
+  kind: CallKind;                          // never 'translate' (that is ExternalCall only)
   state: JsonValue;
   questions: Record<string, Question>;     // keys: [a-zA-Z0-9_.-]{1,64}
   questionSetId?: string;                  // for logging
@@ -48,37 +75,32 @@ export interface DecisionEngine {                // implemented by each engine
   ask(req: EngineRequest, signal: AbortSignal): Promise<EngineOutcome>;
 }
 
+export interface RouterStatus {
+  breakers: { typesafe: BreakerState; llm: BreakerState };  // BreakerState as in settings['engine.circuit'] (spec 02 §2)
+  spendTodayUsd: number; budgetUsd: number; llmCallsToday: number;
+}
+
 export interface EngineRouter {                  // the ONLY thing handlers use
   ask(req: EngineRequest): Promise<EngineOutcome>;
-  status(): RouterStatus;                         // breakers, spend today, budget, LLM calls today
+  status(): RouterStatus;
   canSpend(estimateUsd: number, priority: Priority): boolean;   // spend-guard check for non-engine paid calls (tier-2 translation)
   recordExternalCall(call: ExternalCall): Promise<void>;         // logs translation calls through the same store and budget
-}
-
-export interface ExternalCall {                 // non-engine paid or logged calls (translation, spec 07 §2)
-  engine: 'libretranslate' | 'llm'; kind: 'translate'; model?: string; articleId?: string;
-  inputTokens: number; outputTokens: number; costUsd: number; latencyMs: number;
-  status: 'ok' | 'error' | 'timeout' | 'rate_limited' | 'invalid_response'; error?: string;
-}
-// EngineCallRow and UsageRow mirror the engine_calls and usage_daily columns (spec 02 §3.1).
-// RouterStatus = { breakers: {typesafe, llm}, spendTodayUsd, budgetUsd, llmCallsToday }.
-
-// Port implemented in packages/db (packages/engine never imports packages/db; spec 01 §2)
-export interface EngineStore {
-  insertCall(row: EngineCallRow): Promise<void>;                 // engine_calls
-  upsertUsage(row: UsageRow): Promise<void>;                     // usage_daily
-  spendSince(fromUtc: Date, opts: { excludeKinds: CallKind[] | 'none' }): Promise<number>;
-  getSetting<T>(key: string): Promise<T | undefined>;
-  setSetting<T>(key: string, value: T): Promise<void>;
 }
 
 export function createEngineRouter(deps: {
   config: EngineConfig; store: EngineStore; logger: Logger; clock: Clock;
   engines?: Partial<Record<EngineName, DecisionEngine>>;       // inject fakes (tests, E2E, eval dry run)
-  budgetOverrideUsd?: number;                                    // eval: its own spend cap (spec 10 §3)
+  budgetOverrideUsd?: number;                                    // eval only; see below
   ignoreDailyCaps?: boolean;                                     // eval: ignore llm/tier-2 daily caps
 }): EngineRouter;
 ```
+
+**Eval routers.** A router created with `budgetOverrideUsd`:
+- records **every** call, engine and external (translation), with `kind = 'eval'`, so eval spend never
+  counts against the production daily budget (spec 04 §6 excludes `kind = 'eval'`)
+- enforces its own budget: the router's **cumulative spend since it was created** (kept in memory,
+  starting at 0) plus the estimate must stay ≤ `budgetOverrideUsd`, otherwise the call returns `budget`
+- uses one router per `eval run` invocation, so `--max-usd` is a per-invocation cap (spec 10 §3)
 
 Handlers never see HTTP errors. They get `ok: false` and apply their degraded behaviour.
 
@@ -335,9 +357,9 @@ gets a plausible, repeatable answer.
 
 | Question type | Answer |
 |---|---|
-| **noul** about a card (instructions contain `interest`) | `0.9` if any ≥ 4-char token of `interest` (normalized with `normalizeText`) occurs in the state's title or excerpt; otherwise `0.1`. If `not_for` tokens match instead, `0.2` |
+| **noul** about a card or label (instructions contain `interest`, or `definition` for labels) | `0.9` if any ≥ 4-char token of that text (normalized with `normalizeText`) occurs in the state's title or excerpt; otherwise `0.1`. If `not_for` tokens match instead, `0.2` |
 | **other noul** | `0.3` |
-| **choice** | the first option whose key or description shares a token with the state gets 0.7, the rest share 0.3 equally (with no match, a uniform distribution); `confidence` from §2 |
+| **choice** | the first option whose key or description shares a **≥ 4-char** normalized token with the state gets 0.7, the rest share 0.3 equally (with no match, a uniform distribution); `confidence` from §2 |
 | **score** | probability 1.0 on the middle level |
 
 - `usage.input_tokens` = the §6.1 estimate. `model` = `jev-fake`.

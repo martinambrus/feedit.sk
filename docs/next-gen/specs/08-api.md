@@ -79,8 +79,8 @@ Every per-user query runs under row-level security, and every limit that bounds 
   **5** verify attempts per code.
 - The requested `locale` and the `inviteCode` are stored on the `login_codes` row.
 - A new request invalidates older unconsumed codes for the email.
-- Emails come from localized templates (en/sk) in `apps/api/src/emails/`, with a plain-text and an
-  HTML part.
+- Emails come from localized templates (en/sk) in `packages/shared/src/mail/templates/` (shared with
+  the worker's alert emails), with a plain-text and an HTML part.
 
 **The signup mode** is `settings['signup_mode']` if set, otherwise `SIGNUP_MODE` (spec 02 §2).
 
@@ -103,7 +103,8 @@ email never hits the unique constraint through the signup path.
 
 **Session cookie:** `fi_sid` = 32 random bytes, base64url, stored hashed.
 - Attributes: `HttpOnly`, `Secure` (production), `SameSite=Lax`, `Path=/`, `Max-Age = SESSION_TTL_DAYS`.
-- Sliding: `last_seen_at` and `expires_at` are refreshed at most every 5 minutes.
+- Sliding: `sessions.last_seen_at`, `sessions.expires_at` **and `users.last_active_at`** are refreshed
+  at most every 5 minutes. "Active in the last N days" everywhere means `users.last_active_at`.
 
 ### 2.2 Invites and waitlist
 
@@ -121,7 +122,7 @@ email never hits the unique constraint through the signup path.
 |---|---|---|
 | `GET /me` | — | `Me` = `{id, email, displayName, locale, timezone, role, plan, invitesLeft, preferences, quotas: {used, limits}}` |
 | `PATCH /me` | `{displayName?, locale?, timezone?, preferences?}` | Partial update. `preferences` is deep-merged and validated (§3.1). A change to `demote` enqueues `user.rank {full:true}` |
-| `DELETE /me` | — | Sets `deleted_at` and revokes all sessions → `204`. `house.purge-users` hard-deletes after 7 days |
+| `DELETE /me` | — | Sets `deleted_at`, revokes all sessions, and calls `refresh_feed_subscribers` and `refresh_feed_cards` for the user's feeds (soft-deleted users no longer count) → `204`. `house.purge-users` hard-deletes after 7 days |
 | `GET /me/export` | — | `application/json` attachment: `{user, subscriptions, opml, cards, labels, rules, ratings: [{url, title, rating, reason, ratedAt}], bookmarks: [{url, title, bookmarkedAt}]}` |
 
 ### 3.1 `UserPreferences` (stored in `users.preferences`; zod defaults applied on read)
@@ -151,11 +152,11 @@ email never hits the unique constraint through the signup path.
 | Endpoint | Body / query | Behaviour |
 |---|---|---|
 | `GET /subscriptions` | — | `[{feed: FeedInfo, titleOverride, folder, allowDuplicates, hidden, unread: {forYou, maybe, everything, new}}]` |
-| `POST /subscriptions` | `{url, folder?}` | Discovery (spec 03 §10). One feed → `201 {subscription}` and a backfill of the user's cards. Several → `200 {status: 'choose', candidates: [{url, title, type}]}` (the client posts again with the chosen URL). Errors `FEED_*` (422). Quota `maxFeeds` |
+| `POST /subscriptions` | `{url, folder?}` | Discovery (spec 03 §10). One feed → `201 {subscription}`, plus a backfill of the user's cards for that feed **and** `user.rank {full: true}` (answers may already exist, so ranking alone makes the feed appear). Several → `200 {status: 'choose', candidates: [{url, title, type}]}` (the client posts again with the chosen URL). Errors `FEED_*` (422). Quota `maxFeeds` |
 | `PATCH /subscriptions/:feedId` | `{titleOverride?, folder?, allowDuplicates?, hidden?}` | Update |
 | `DELETE /subscriptions/:feedId` | — | Delete, then `refresh_feed_subscribers`, `refresh_feed_cards`, `user.rank {full}` |
 | `POST /subscriptions/:feedId/mark-read` | `{olderThan?}` | Mark all unread items of the feed read |
-| `POST /subscriptions/import-opml` | multipart `file` (≤ 1 MB) | spec 03 §11. `200 {added, existing, invalid: [...]}`. Quota `opmlMaxFeeds` and `maxFeeds` |
+| `POST /subscriptions/import-opml` | multipart `file` (≤ 1 MB) | spec 03 §11. `200 {added, existing, invalid: [...]}`. Enqueues one backfill for the new feeds and `user.rank {full: true}`. Quota `opmlMaxFeeds` and `maxFeeds` |
 | `GET /subscriptions/export-opml` | — | `text/x-opml` attachment |
 | `POST /subscriptions/folders/rename` | `{from, to}` | Rename a folder across the user's subscriptions and in `preferences.folderOrder` → `200 {count}` |
 
@@ -221,7 +222,7 @@ TopReason =                                        // structured; the web client
 
 `topReason` is derived from `explain`:
 - a fired floor or cap rule → `rule`
-- otherwise, source `cards` → the deciding card
+- otherwise, source `cards` → the deciding card (`explain.decidingCardId`)
 - otherwise, source `model` → its top contribution
 - otherwise, source `degraded` → `keyword`
 
@@ -344,6 +345,7 @@ client must replace its cached id.
 | `GET /admin/settings` / `PATCH /admin/settings` | Allow-listed keys only (spec 02 §2 registry): `engine.daily_budget_usd`, `engine.llm_daily_cap`, `language_modes`, `card_text_mode`, `ranker.thresholds`, `translate.tier2_daily_cap`, `question_sets.active`, `signup_mode`. Each key is validated by its zod schema. **Side effects:** `ranker.thresholds` bumps `ranker.settings_version` and enqueues `user.rank {full}` for users active in the last 7 days; `question_sets.active.enrich` enqueues `house.reenrich`; `card_text_mode = 'english'` enqueues `house.translate-cards`; `language_modes` applies to new articles only |
 | `POST /admin/engine/reset-breaker` | `{engine}`: writes `engine.circuit.resetRequested[engine] = now`. Worker routers close that breaker (including auth mode) within 10 s (spec 04 §5) |
 | `GET /admin/feeds?status=&q=` / `PATCH /admin/feeds/:id` / `POST /admin/feeds/:id/reset` | Feed health; edit `fetch_options`; clear quarantine/dead |
+| `GET /admin/library/candidates?minHolders=3` | Promotion candidates: all non-retired `shared` interest cards, with holder counts from `admin_card_holders` (spec 02 §6), filtered to `holders ≥ minHolders`, sorted by holders descending, at most 100 |
 | `GET /admin/library` / `POST /admin/library` / `PATCH /admin/library/:id` / `POST /admin/library/promote` | Manage library cards (`PATCH` edits only `title`, `topic_ids`, `i18n`; texts are immutable). `promote {cardId, title, titleSk, topicIds}` requires a `shared` card with ≥ 3 holders (`admin_card_holders`) and **updates it in place** to `visibility = 'public'` with that title, i18n and topics. The text and id don't change, so holders and answers stay valid |
 | `GET /admin/users?q=` / `PATCH /admin/users/:id` | Role, plan, `invites_left` |
 | `GET /admin/invites?status=unused\|used\|expired` / `POST /admin/invites` | List all invites; create `{count ≤ 50, email?, note?, expiresDays ≤ 90}` → codes |

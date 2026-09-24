@@ -16,7 +16,7 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
 
 1. `apps/eval/reports/G1-<date>.md`: the human-readable report (the tables in §4, the decisions in §5,
    costs).
-2. `config/g1.json`:
+2. `apps/eval/config/g1.json`:
 
    ```json
    { "language_modes": { "en": "native", "sk": "…", "cs": "…" },
@@ -29,8 +29,9 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
      "notes": "…" }
    ```
 
-3. `pnpm evaluate apply-g1 config/g1.json` writes the settings below (dev DB). In production,
-   an admin applies the same values through `PATCH /admin/settings`.
+3. `pnpm evaluate apply-g1 apps/eval/config/g1.json` (paths are relative to the repository root; the
+   CLI resolves them from there) writes the settings below to the dev DB. In production, an admin
+   applies the same values through `PATCH /admin/settings`.
 
    | `g1.json` field | `settings` key |
    |---|---|
@@ -47,15 +48,16 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
 
 ### 2.1 Feeds and articles
 
-- **Feed list:** `apps/eval/data/feeds-golden.txt`, about 60 feeds: about 20 English, 20 Slovak and
-  20 Czech. It mixes news, tech, science, sport, lifestyle, local and classifieds, and includes at least
+- **Feed list:** `apps/eval/data/feeds-golden.txt`, 54–66 feeds: 18–22 each for English, Slovak and
+  Czech. It mixes news, tech, science, sport, lifestyle, local and classifieds, and includes at least
   one Google News feed and one feed with poor excerpts.
-- **`eval ingest-sample --feeds data/feeds-golden.txt`:**
+- **`eval ingest-sample --feeds apps/eval/data/feeds-golden.txt`:**
   - creates or reuses the internal system user `eval@feedit.local` (role `user`, never logs in) and
     subscribes it to the feeds
-  - **requires a running worker** with `EVAL_INGEST_ONLY=true` (the command checks the worker's
-    heartbeat and exits with instructions if it is missing), so enrich and match never run and there are
-    no Jev costs
+  - **requires a running worker** with `EVAL_INGEST_ONLY=true`: the command checks
+    `settings['worker.heartbeat']` for an entry younger than 90 s with `evalIngestOnly = true` (spec 02
+    §2) and exits with instructions if there is none. So enrich and match never run, and there are no
+    Jev costs
   - fetches each feed once immediately, waits until the `article.extract` queue for these articles has
     drained, and prints per-language article counts
   - **`--watch`** keeps the eval user subscribed and prints counts every 10 minutes, until stopped
@@ -119,9 +121,11 @@ Each run:
   (default `~/.cache/feedit-eval`, outside the repository and shared by worktrees), so re-runs and
   report tweaks cost nothing
 - uses the production packages: `questions`, `engine`, `translate`, `ranker`
-- builds its own `EngineRouter` with `kind: 'eval'` on every call, `budgetOverrideUsd = --max-usd`
-  (default 10) and `ignoreDailyCaps: true`. Eval spend therefore never touches the production daily
-  budget or the tier-2 cap (spec 04 §6).
+- builds its own `EngineRouter` (spec 04 §1, "Eval routers") with `budgetOverrideUsd = --max-usd`
+  (default 10) and `ignoreDailyCaps: true`. Every call, translations included, is recorded as
+  `kind = 'eval'`, so eval spend never touches the production daily budget or the tier-2 cap.
+  `--max-usd` caps **this invocation**. To keep a total across several invocations, pass the remaining
+  amount each time.
 - prints the cost estimate first. Above $1 it asks for confirmation unless `--yes` is given. Unattended
   goals always pass `--yes --max-usd <n>`.
 
@@ -150,11 +154,12 @@ Each run:
 
 **Other commands:**
 - **`eval dry-run`:** runs the whole pipeline on synthetic data (M3a-T8) in a **separate database**
-  `feedit_eval_dryrun` (created from the template, spec 02 §1.1). It writes
+  `feedit_eval_dryrun`, freshly created from the current template **and seeded** (spec 02 §1.1). The
+  eval process connects through `TEST_ADMIN_DATABASE_URL` only to create it. It writes
   `reports/DRYRUN-<date>.md` and `reports/DRYRUN-<date>.g1.json`, both git-ignored, and never touches
   the real `eval` tables.
 - **`eval replay`:** §6. Implemented in M3a-T6, first used after G1.
-- **`eval learning-curve`:** M7-T7. Reads `eval.run_answers` of the runs listed in `config/g1.json`
+- **`eval learning-curve`:** M7-T7. Reads `eval.run_answers` of the runs listed in `apps/eval/config/g1.json`
   `runs`.
 
 ---

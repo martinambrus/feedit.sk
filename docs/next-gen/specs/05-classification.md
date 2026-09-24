@@ -5,7 +5,7 @@ absolute yes/no question per *distinct* interest card on the article's feeds (Ca
 questions as possible into each call, because Jev bills per input token and reads the state once per
 call. Keep every raw answer so ranking can change without new calls.
 
-Code: `packages/questions` (pure: question sets, builders, taxonomy, hashing, packing, library seed),
+Code: `packages/questions` (pure: question sets, builders, taxonomy, set hashing, packing, library seed data),
 and `apps/worker/src/handlers/article-{enrich,match,cluster}.ts`, `card-backfill.ts`, `user-suggest.ts`.
 
 ---
@@ -225,11 +225,12 @@ A card's `body`:
 
 ```
 norm(s) = NFC, trim, collapse whitespace, lower-case
+// cardTextHash(card) in packages/shared, so the packages/db card repository can use it (spec 01 §2)
 text_hash = sha256Hex(canonicalJson({ kind, interest: norm(interest), not_for: norm(not_for ?? ''),
                                    title: kind === 'label' ? norm(title) : null,
                                    examples_yes: examples_yes ?? [], examples_no: examples_no ?? [],
                                    owner: visibility === 'private' ? owner_user_id : null }))
-// canonicalJson, sha256Hex and normalizeText live in packages/shared (spec 01 §2)
+// canonicalJson, sha256Hex, normalizeText and cardTextHash live in packages/shared (spec 01 §2)
 ```
 
 **Immutability** (the rule that keeps answers valid):
@@ -392,13 +393,14 @@ The caller then enqueues extract or enrich. Match follows automatically.
    SET LOCAL pg_trgm.similarity_threshold = 0.35;           -- makes `%` use the GIN trigram index
    SELECT * FROM (
      SELECT DISTINCT ON (a.id) a.id, a.title, a.excerpt, a.first_seen_at, f.id AS feed_id, f.title AS feed,
-            similarity(a.title_norm, $3) AS sim
+            similarity(a.title_norm, $3::text) AS sim
      FROM articles a
      JOIN feed_items fi ON fi.article_id = a.id
      JOIN feeds f ON f.id = fi.feed_id
      WHERE a.id <> $1
-       AND a.title_norm % $3
-       AND a.first_seen_at BETWEEN $2 - interval '72 hours' AND $2 + interval '1 hour'
+       AND a.title_norm % $3::text
+       AND a.first_seen_at BETWEEN $2::timestamptz - interval '72 hours' AND $2::timestamptz + interval '1 hour'
+       -- explicit casts: node-postgres sends parameters untyped
      ORDER BY a.id, fi.first_seen_at
    ) c
    ORDER BY sim DESC
@@ -543,7 +545,7 @@ replaces `llm`/`prefilter`, never the reverse). The eval replay (spec 10 §6) de
 - suggestion candidate selection
 
 **Integration** (worker handlers with fixture engines):
-- enrich → match → rank end-to-end for one article with 3 cards and 1 label
+- enrich → match → `user.rank` enqueued, end-to-end for one article with 3 cards and 1 label (the rank handler itself is M5)
 - a backfill creates the expected queue rows and drains them in ≤ 2 calls
 - a prefilter case
 - degraded enrich leaves `pipeline_state = 'degraded'`

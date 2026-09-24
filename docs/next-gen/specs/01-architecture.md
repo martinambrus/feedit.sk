@@ -83,12 +83,15 @@ feedit-ng/
 │       │   ├── experiments/      # one file per experiment (B0, B1, E1–E5)
 │       │   ├── metrics/          # auc.ts, precision-at-k.ts, calibration.ts, bootstrap.ts
 │       │   └── report/           # markdown + HTML report writer
+│       ├── config/               # g1.json (committed by M3b; spec 10 §1)
+│       ├── data/                 # feeds-golden.txt
 │       └── reports/              # generated reports (git-ignored except committed decision reports)
 ├── packages/
 │   ├── shared/                   # config (zod env, per process), settings registry (settings.ts), DTO schemas
 │   │                             # (incl. dto/explain.ts), jobs.ts (queues, payloads, enqueue helpers), plans.ts,
-│   │                             # error types, ids, time utils, logger factory, mail/ (mailer + templates),
-│   │                             # text utils: normalizeText, detectLanguage, canonicalJson, sha256Hex
+│   │                             # ports.ts (EngineStore & co.), error types, ids, time utils, logger factory,
+│   │                             # mail/ (mailer + en/sk templates for auth and alert emails),
+│   │                             # text utils: normalizeText, detectLanguage, canonicalJson, sha256Hex, cardTextHash
 │   ├── db/                       # Drizzle schema, migrations, repositories, RLS helpers (spec 02)
 │   ├── feeds/                    # fetch (SSRF-safe), parse, canonicalize, dedup keys, extract, OPML (spec 03)
 │   ├── engine/                   # DecisionEngine, EngineRouter, TypeSafe/LlmFallback/Laya engines, breaker,
@@ -96,8 +99,10 @@ feedit-ng/
 │   ├── questions/                # question sets, builders, taxonomy, card library seed, hashing (spec 05)
 │   ├── translate/                # LibreTranslate + Ollama Cloud translators, quality heuristics (spec 07)
 │   ├── ranker/                   # rules, lanes, BM25 baseline, features, logistic model, calibration (spec 06)
-│   └── testing/                  # fixtures (feeds, HTML pages, Jev responses), factories, per-worktree test DBs,
-│                                 # fixture feed server, fake TypeSafe server (spec 04 §10), feed generator
+│   └── testing/                  # fixtures (feeds, HTML pages, Jev responses), factories, per-worktree test DBs
+│                                 # (templates keyed by the migration journal), fixture feed server, fake TypeSafe
+│                                 # server (spec 04 §10), fake LibreTranslate server, load-test feed generator;
+│                                 # scripts e2e:prepare and fixtures:serve (spec 09 §9)
 ├── infra/
 │   ├── compose.yml               # production stack (spec 11)
 │   ├── compose.dev.yml           # dev overrides (ports, volumes, hot reload)
@@ -136,6 +141,10 @@ root `package.json` defines these shortcut scripts, and every doc uses them:
 - `packages/ranker` imports `shared` and `questions` (types only). It is **pure**: no I/O, no DB access,
   all inputs passed in.
 - `packages/testing` may import any package (it is only used by tests).
+- **Exception for the migrate job:** `packages/db/src/migrate/` may import `pg-boss` and
+  `@feedit/shared` (`jobs.ts`), because the migrate job creates the pg-boss schema and queues
+  (spec 02 §1.2). The "no pg-boss in `packages/db`" rule applies to everything else in
+  `packages/db/src/**`.
 - **Repositories return effects, apps enqueue jobs.** `packages/db` never imports pg-boss. Repository
   functions return effect descriptors (e.g. `{refreshFeedIds, backfill, rankFull}`). App services
   enqueue jobs after commit through `shared/src/jobs.ts`.
@@ -157,9 +166,11 @@ listed under "Used by"**. An invalid config makes the process exit with a readab
 | `DATABASE_URL` | — (required) | all | connection as role `feedit_app` (RLS enforced) |
 | `DATABASE_URL_WORKER` | — (required) | worker, eval | connection as role `feedit_worker` (BYPASSRLS) |
 | `DATABASE_URL_MIGRATE` | — (required) | migrate | connection as role `feedit_owner` |
-| `TEST_ADMIN_DATABASE_URL` | `postgres://postgres:postgres@localhost:${PG_TEST_PORT}/postgres` | test | superuser connection used only to create per-worktree test databases (spec 02 §1.1) |
+| `TEST_ADMIN_DATABASE_URL` | `postgres://postgres:postgres@localhost:${PG_TEST_PORT}/postgres` | test, eval | superuser connection used only to create template, test, E2E and dry-run databases (spec 02 §1.1) |
+| `PG_TEST_PORT` | `5433` | compose.test.yml, test | host port of the test Postgres |
+| `PG_DEV_PORT` | `5432` | compose.dev.yml | host port of the dev Postgres |
 | `POSTGRES_PASSWORD`, `FEEDIT_OWNER_PASSWORD`, `FEEDIT_APP_PASSWORD`, `FEEDIT_WORKER_PASSWORD` | — | compose / `init.sh` | database bootstrap only; never read by the apps |
-| `PUBLIC_BASE_URL` | `http://localhost:5173` | api, email | used in links and the fetcher User-Agent |
+| `PUBLIC_BASE_URL` | `http://localhost:5173` | api, worker, eval | used in links, the CSRF `Origin` check (spec 08 §1) and the fetcher User-Agent |
 | `API_PORT` | `3000` | api | |
 | `SESSION_COOKIE_NAME` | `fi_sid` | api | |
 | `SESSION_TTL_DAYS` | `60` | api | sliding expiry |
@@ -172,21 +183,21 @@ listed under "Used by"**. An invalid config makes the process exit with a readab
 | `TYPESAFE_API_KEY` | — | worker, eval | Jev key; if missing, the engine runs in Degraded mode |
 | `TYPESAFE_MODEL` | `jev-1.13.0` | worker, eval | always a pinned version in production |
 | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | worker, eval | |
-| `TYPESAFE_PRICE_PER_MTOK_USD` | `0.042` | worker | cost accounting |
-| `ENGINE_CONCURRENCY` | `8` | worker | max in-flight Jev calls per worker process |
+| `TYPESAFE_PRICE_PER_MTOK_USD` | `0.042` | worker, eval | cost accounting (without it, eval's `--max-usd` could never trigger) |
+| `ENGINE_CONCURRENCY` | `8` | worker, eval | max in-flight Jev calls per process |
 | `DAILY_BUDGET_USD` | `2.00` | worker | spend guard ([spec 04 §6](./04-decision-engine.md)) |
 | `OLLAMA_API_KEY` | — | worker, eval | Ollama Cloud; if missing, tier-2 translation and LLM fallback are disabled |
 | `OLLAMA_BASE_URL` | `https://ollama.com` | worker, eval | |
-| `OLLAMA_MODEL_FAST` | `glm-5.3-flash` | worker | |
-| `OLLAMA_MODEL_STRONG` | `glm-5.3` | worker | |
-| `OLLAMA_MAX_CONCURRENCY` | `1` | worker | match the Ollama plan (Free 1, Pro 3, Max 10) |
+| `OLLAMA_MODEL_FAST` | `glm-5.3-flash` | worker, eval | |
+| `OLLAMA_MODEL_STRONG` | `glm-5.3` | worker, eval | |
+| `OLLAMA_MAX_CONCURRENCY` | `1` | worker, eval | match the Ollama plan (Free 1, Pro 3, Max 10) |
 | `LLM_FALLBACK_ENABLED` | `false` | worker | enables `LlmFallbackEngine` in the fallback chain |
 | `LIBRETRANSLATE_URL` | `http://libretranslate:5000` | api, worker, eval | tier-1 translation (the API translates card texts, spec 07 §5) |
 | `LANGUAGE_MODES` | `{"en":"native","sk":"native","cs":"native"}` | worker | JSON; per-language classification mode, set from the G1 result ([spec 07 §1](./07-translation.md)) |
-| `FETCH_USER_AGENT` | `FeedItBot/1.0 (+${PUBLIC_BASE_URL}/bot)` | worker | honest UA; per-feed override allowed |
-| `FETCH_MAX_BYTES` | `5242880` | worker | 5 MB for feeds and pages |
-| `FETCH_TIMEOUT_MS` | `20000` | worker | |
-| `FETCH_ALLOW_PRIVATE` | `false` | worker | tests only; refused when `NODE_ENV=production` (spec 03 §4) |
+| `FETCH_USER_AGENT` | `FeedItBot/1.0 (+${PUBLIC_BASE_URL}/bot)` | api, worker, eval | honest UA; per-feed override allowed |
+| `FETCH_MAX_BYTES` | `5242880` | api, worker, eval | 5 MB for feeds and pages |
+| `FETCH_TIMEOUT_MS` | `20000` | api, worker, eval | (the API fetches during discovery, the first fetch and OPML import) |
+| `FETCH_ALLOW_PRIVATE` | `false` | api, worker, eval | tests only; refused when `NODE_ENV=production` (spec 03 §4) |
 | `INGEST_MAX_AGE_DAYS` | `14` | worker | older items are stored as `stale` and never enriched |
 | `PREFILTER_MIN_CARDS` | `60` | worker | spec 05 §5.5 |
 | `EVAL_INGEST_ONLY` | `false` | worker | M3a: stop the pipeline after extract (spec 10 §2.1) |
@@ -297,8 +308,10 @@ Secrets are never needed in CI. All third-party calls use fixtures.
 
 ## 8. Local development
 
-- `pnpm i && docker compose -f infra/compose.dev.yml up -d postgres` (add `--profile translate` to
-  also start LibreTranslate)
+- `pnpm i && docker compose -f infra/compose.dev.yml up -d --no-recreate postgres` (add
+  `--profile translate` to also start LibreTranslate). **Always use `--no-recreate`**: every worktree
+  shares these containers, and a plain `up -d` from another worktree (a different bind-mount path)
+  would recreate them under running sessions. The same applies to `compose.test.yml`.
 - `pnpm db:migrate && pnpm db:seed` (settings defaults, the taxonomy, question sets and the card
   library; no users)
 - The first admin signs in with an address listed in `ADMIN_EMAILS`, which needs no invite
@@ -342,6 +355,7 @@ M0 writes this file verbatim, and later milestones append to its "Current state"
   - Subagents never run `pnpm add`, never edit the lockfile, and never commit.
   - The lead commits each task by path.
   - Only one active branch at a time may add database migrations.
+- Start shared containers only with `docker compose … up -d --no-recreate`. Other worktrees use them.
 - Commit per task: `<task-id>: <summary>` (e.g. `M1-T1: SSRF-safe fetch dispatcher`).
 - Never call live third-party APIs in tests; use packages/testing fixtures.
 - Deviations from a spec: follow docs/specs/01-architecture.md §9 and log them in docs/DECISIONS.md.

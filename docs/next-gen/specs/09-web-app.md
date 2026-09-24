@@ -219,7 +219,7 @@ Plain tables and forms, no polish needed:
 - **Usage:** a spend chart (last 30 days) and top users.
 - **Settings:** JSON editors with validation per key.
 - **Feeds:** filter by status; reset.
-- **Library:** CRUD; promote from shared cards (holders ≥ 3).
+- **Library:** CRUD; a "Promotion candidates" list (`GET /admin/library/candidates`) with a Promote action (`POST /admin/library/promote`).
 - **Users:** plan, role, invites.
 - **Invites and waitlist.**
 
@@ -227,14 +227,21 @@ Plain tables and forms, no polish needed:
 
 ## 9. E2E smoke tests (Playwright)
 
-**Environment** (`apps/web/playwright.config.ts`, the `webServer` array starts everything):
-- `packages/testing` **fixture feed server** on a random port, with 3 feeds and article pages
-- the **fake TypeSafe server** (spec 04 §10) with `latencyMs: 50`
-- `apps/api` and `apps/worker` with:
-  - `NODE_ENV=test`, `SIGNUP_MODE=open`, `RATE_LIMITS_ENABLED=false`, `FETCH_ALLOW_PRIVATE=true`
-  - `MAIL_TRANSPORT=log`, `TYPESAFE_API_KEY=test`, `TYPESAFE_BASE_URL=<fake>`
-  - `DATABASE_URL*` pointing at a fresh per-run test database (spec 02 §1.1)
-- `vite preview` of the built web app, proxied to the API
+**Environment** (`apps/web/playwright.config.ts`). Playwright starts the `webServer` entries **before**
+`globalSetup`, so preparation happens in the first entry. The entries are, in order:
+1. `pnpm --filter @feedit/testing e2e:prepare && pnpm --filter @feedit/testing fixtures:serve`.
+   `e2e:prepare` creates `feedit_e2e_<runId>` from the current template (spec 02 §1.1) and runs
+   `pnpm db:seed` against it. `fixtures:serve` then serves 3 feeds and their article pages, plus the
+   **fake TypeSafe server** (spec 04 §10, `latencyMs: 50`) on fixed test ports.
+2. `apps/api` and 3. `apps/worker`, each with:
+   - `NODE_ENV=test`, `SIGNUP_MODE=open`, `RATE_LIMITS_ENABLED=false`, `FETCH_ALLOW_PRIVATE=true`
+   - `MAIL_TRANSPORT=log`, `SESSION_PEPPER=test`
+   - `TYPESAFE_API_KEY=test`, `TYPESAFE_BASE_URL=<fake server URL>`
+   - `PUBLIC_BASE_URL=http://localhost:<preview port>`, so the browser's `Origin` passes the CSRF check
+     (spec 08 §1)
+   - `DATABASE_URL*` for `feedit_e2e_<runId>`
+4. `pnpm --filter @feedit/web exec vite build && pnpm --filter @feedit/web exec vite preview --port <preview port>`,
+   with the preview server proxying `/api` to the API.
 
 Test files are named `*.pw.ts` so Vitest never picks them up (spec 01 §6).
 
@@ -249,7 +256,9 @@ Test files are named `*.pw.ts` so Vitest never picks them up (spec 01 §6).
 5. **Keyboard:** `j`, `k`, `+`, `-`, `b` work on the list.
 6. **Mobile viewport:** a swipe right likes the item.
 
-**PWA check** (M6-T8, a separate `pwa.pw.ts`; Lighthouse ≥ 12 no longer has a PWA category):
+**PWA check** (M6-T8, a separate `pwa.pw.ts`; Lighthouse ≥ 12 no longer has a PWA category). It uses
+`chromium.launchPersistentContext(tmpDir, { channel: 'chromium' })`, because the default headless
+shell and incognito contexts report `in-incognito` installability errors:
 - `navigator.serviceWorker.ready` resolves
 - the manifest link is present and valid
 - the Chrome DevTools Protocol call `Page.getInstallabilityErrors` returns `[]`

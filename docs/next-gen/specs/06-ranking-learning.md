@@ -37,6 +37,7 @@ interface RankItem {
   clusterId?: string; clusterSize: number;
   pipelineState: string;
   facets?: Record<string, number>;                 // article_facets.features (spec 05 §3.4)
+  facetsEngine?: 'typesafe' | 'llm' | 'laya';      // articles.enrich_engine
   cardAnswers: Record<string, { p: number; engine: 'typesafe'|'llm'|'laya'|'prefilter' }>;  // the user's interest AND label cards
   labelIds: string[];                              // labels already assigned (user_article.label_ids)
   translation?: { engine: string; quality: string };
@@ -60,17 +61,20 @@ Lane order for "at most" and "at least": `hidden < everything < maybe < for_you`
 
 ```
 rankArticle(ctx, item, now):
-  1. if item.pipelineState == 'stale'                → lane 'new', P null, source 'none'
-  2. if a hide rule matches (§3.1)                   → 'hidden' (fire its code)
-  3. if a never-card has p ≥ never.hide (§4.2)       → 'hidden' (fire never:<id>)
+  1. if a hide rule matches (§3.1)                   → RETURN 'hidden' (fire its code)
+  2. if item.pipelineState == 'stale'                → RETURN lane 'new', P null, source 'none'
+  3. if a never-card has p ≥ never.hide (§4.2)       → RETURN 'hidden' (fire never:<id>)
   4. base probability P:
-       a. active model and the item has no 'llm' answers → P = model(x), source 'model' (§8)
+       a. active model AND item.facets present AND pipelineState ∉ {'degraded','failed'}
+          AND item.facetsEngine ≠ 'llm' AND no card answer has engine 'llm'
+                                                     → P = model(x), source 'model' (§8)
        b. else, some positive card of the user is answered → P = cardScore (§4), source 'cards';
-          apply quality demotions (§5)
+          apply quality demotions (§5); remember the deciding card
        c. else, pipelineState ∈ {'degraded','failed'} and the user has positive cards
                                                      → P = bm25P (§9), source 'degraded'
-       d. else                                        → lane 'new', P null, source 'none'
+       d. else                                        → RETURN lane 'new', P null, source 'none'
                                                         (label suggestions are still computed)
+     Steps 5–7 run only when P is set.
   5. lane = laneFromP(P) (§6.1)
   6. precedence of modifiers, the first that applies wins:
        i.   seen_story: the item's cluster is in readClusterIds → lane = min(lane, 'everything')
@@ -82,8 +86,8 @@ rankArticle(ctx, item, now):
   7. tier = tierFromP(P); labelSuggestions (§6.3); explain (§6.2)
 ```
 
-The "deciding card" is the positive card achieving `cardScore`. Every rule that changes the outcome
-appends its code to `rulesFired` (§3.2).
+The "deciding card" is the positive card achieving `cardScore`, stored as `explain.decidingCardId`.
+Every rule that changes the outcome appends its code to `rulesFired` (§3.2).
 
 ---
 
@@ -177,6 +181,7 @@ interface Explain {
   v: 1;
   source: 'cards'|'model'|'degraded'|'none';
   p: number | null; lane: Lane; tier: number | null;
+  decidingCardId?: string;                         // source 'cards': the card achieving cardScore (spec 08 §5.1 topReason)
   cards: { id: string; title: string; strength: Strength; p: number; engine: string }[];   // the user's cards with answers, p desc, ≤ 10
   facets?: { contentType: { choice: string; p: number }; topic: { l1: string; p: number; l2?: string };
              depth: number; clickbait: number; promotional: number; timeSensitive: number; evergreen: number };
@@ -199,7 +204,9 @@ label to `labelSuggestions`. The UI shows them as tappable chips ("tap to keep",
 ## 7. The `user.rank` handler
 
 **Versioning:** `score_version = RANKER_VERSION * 10000 + settings['ranker.settings_version']`.
-- `RANKER_VERSION` is a constant in `packages/ranker`, bumped whenever the ranking semantics change.
+- `RANKER_VERSION` and `scoreVersion(settingsVersion)` are exported by `packages/ranker`. They are
+  created in the ranker bootstrap (M2-T10), so both the API (M4) and the rank handler (M5) can use
+  them. The constant is bumped whenever the ranking semantics change.
 - The API bumps `ranker.settings_version` on every change to `ranker.thresholds` (and to any future
   ranking-relevant key), and then enqueues `user.rank {full: true}` for users active in the last 7 days.
 - Inactive users catch up on their next visit: `GET /articles` enqueues a full rank when the user's

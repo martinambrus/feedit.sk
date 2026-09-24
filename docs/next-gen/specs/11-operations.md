@@ -43,6 +43,8 @@ when something needs a human, before users notice.
    volume).
 3. `docker compose run --rm migrate`. Migrations must be **backward compatible** with the previous
    release: expand/contract, never drop a column in the same release that stops using it.
+   Then `docker compose run --rm worker pnpm db:seed`. The seed is idempotent and required: topics,
+   question sets, the active-set setting and the card library (spec 05 §2, §8).
 4. `docker compose up -d api worker caddy`.
 5. Smoke check: `curl -fsS https://<host>/api/v1/readyz`. On failure, roll back to the previous tag
    (step 1 with the old tag, then skip migrations).
@@ -97,7 +99,7 @@ when something needs a human, before users notice.
 | `house.purge-articles` | `30 3 * * *` | delete unreferenced articles older than 90 days (§5), in batches of 5,000. Articles referenced from `eval.*` are never purged |
 | `house.purge-bodies` | `45 3 * * *` | `body_text = NULL` for extractions older than 30 days |
 | `house.purge-engine-calls` | `0 4 * * *` | delete `engine_calls` older than 180 days |
-| `house.retire-cards` | `30 4 * * *` | set `retired_at` on non-library cards with no holders (`user_cards`/`user_labels`) that are not referenced by `eval.rater_cards`; delete their `card_answers` 30 days later |
+| `house.retire-cards` | `30 4 * * *` | set `retired_at` on cards with `visibility <> 'public'` (library and promoted cards are never retired) that have no holders (`user_cards`/`user_labels`) and are not referenced by `eval.rater_cards`; delete their `card_answers` 30 days later |
 | `house.purge-users` | `0 5 * * *` | hard-delete users past the 7-day grace period |
 | `house.nightly-learn` | `0 1 * * *` | enqueue `user.learn` for users with explicit labels newer than their last training, and `user.suggest` for users active in the last 7 days (**built in M7-T4**) |
 | `house.metrics` | `10 0 * * *` | online metrics (spec 10 §7) |
