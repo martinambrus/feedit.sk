@@ -244,9 +244,11 @@ options, to be decided by the eval ([spec 10](./specs/10-evaluation.md)), not up
   near random zero-shot, so it can't replace Jev for free-form interest cards without further work. The
   full analysis is in [`laya-multilingual.md`](./laya-multilingual.md).
 
-The recommendation is to prototype (a) and (b) on the golden set in week 1, with Laya zero-shot as a
-baseline. Adopt (c) if both underperform, and start (d) in parallel only if SK/CZ accuracy stays
-clearly below EN.
+How this is decided is now fixed in [spec 10 §5](./specs/10-evaluation.md) (gate G1, milestone M3b):
+- (a) and (b) are experiments E1 and E2
+- (c) is E3/E3b (LibreTranslate) and E4 (Ollama GLM)
+- (d) is the optional M9 track, recommended automatically when neither native nor translated text
+  closes the gap
 
 ### 3.3 Adversarial or promotional content
 
