@@ -5,6 +5,10 @@
 > ([DreamCatcher](https://github.com/martinambrus/DreamCatcher), TypeScript + Kafka + Postgres).
 > The plan is meant to move into its own repository later.
 >
+> **Decisions taken (2026-09-24):** TypeScript monorepo; multi-tenant from day one; a generative LLM is
+> allowed only as the fallback decision engine and for translation; no data or accounts migrate from
+> FeedIt.sk, and everything is trained or fine-tuned from scratch. See §7.6.
+>
 > Companion document: [`jev-questions.md`](./jev-questions.md) holds the concrete Jev question sets,
 > request shapes and cost math. [`laya-multilingual.md`](./laya-multilingual.md) evaluates Laya, the
 > open-weights Jev alternative, for EN + SK + CZ fine-tuning and self-hosting.
@@ -246,8 +250,8 @@ article is shown, hidden or uncertain.
 7. *As a reader of aggregators* (Google News and the like) I see one story once, with "3 more sources" folded
    underneath.
 
-**Non-goals for v1:** summaries or AI-written text (Jev can't write; an LLM summary is a later, optional
-add-on), social features, a full-text search engine, and native apps. A PWA covers mobile.
+**Non-goals for v1:** summaries or AI-written text (Jev can't write, and the LLM is approved only
+for fallback and translation), social features, a full-text search engine, and native apps. A PWA covers mobile.
 
 ---
 
@@ -395,16 +399,23 @@ stays reachable.
 | marked read without opening | weak negative (weight 0.1) | personal model (optional, off by default) |
 | bookmark / share / label assigned | strong positive | personal model |
 
-**Proposing new interest cards without text generation.** Jev can't write card text, so there are two paths:
+**Proposing new interest cards without text generation.** Jev can't write card text. Generative LLMs are approved only for fallback and translation
+(§7.6), so card proposals come from the library and from the user:
 
 1. **Library pick (Jev only).** Keep a curated library of a few hundred cards organized by the same topic
    taxonomy. When a user likes several articles no current card explains (all their card P's < 0.3), run
    one Choice with the library cards under the matching `topic_l1` branch as options. The top 1–3 become
    suggestions: "Looks like you enjoy *Space launches*. Add as an interest?"
-2. **LLM authoring (optional, rare).** Once a week, or on demand, a small generative model looks at the
-   unexplained likes and drafts 1–2 new card texts for the user to accept or edit. This is the *only*
-   generative-LLM use in the core loop, and it is out of the per-article path, so its cost and latency don't
-   matter.
+2. **"Make a card from this" (user-written).** On a liked article that no card explains, the UI opens a
+   card editor prefilled with the article's topic path (from Call A) and its title as the first
+   `examples_yes`. The user writes or edits the one-line interest. A new card is backfilled over recent
+   articles, so its effect shows immediately.
+3. **Library growth.** Popular user-written cards (identical normalized text held by several users, or
+   close variants merged by an admin) are promoted into the shared library. The library grows from real
+   use, with no generative model involved.
+
+LLM-drafted card suggestions were considered and set aside. They can come back if the LLM policy in §7.6
+changes.
 
 ### 3.4 Labels
 
@@ -427,7 +438,7 @@ candidates and a Jev Choice picks the right one.
 
 ## 4. Architecture
 
-### 4.1 Stack recommendation
+### 4.1 Stack (decided: TypeScript monorepo)
 
 - **TypeScript on Node 22, as a monorepo** (pnpm workspaces). This continues DreamCatcher's language, and the
   official `@typesafe-ai/sdk` is TS/JS.
@@ -439,6 +450,27 @@ candidates and a Jev Choice picks the right one.
 - **Observability:** OpenTelemetry (kept from DreamCatcher) plus a `jev_calls` table that is the audit log.
 - **Deployment:** a single `docker compose` with postgres, api, worker(s) and web. Scale workers
   horizontally. Introduce Kafka/Redis only if a measured bottleneck requires it.
+- **Monorepo tooling:** pnpm workspaces + Turborepo, TypeScript project references, Vitest, ESLint +
+  Prettier, and Drizzle (or Prisma) with **one** schema and migrations owned by `packages/db`. This avoids
+  DreamCatcher's vendored-copy drift.
+
+**Monorepo layout (decided):**
+
+```
+apps/
+  api/          Fastify: auth, feeds, subscriptions, reading, feedback, cards, labels, admin
+  web/          PWA: lanes, swipe/keyboard rating, "Why this?", card editor, settings
+  worker/       all pipeline stages as pg-boss job handlers (one image, stage chosen by env or queue)
+  eval/         CLI: golden-set replay, engine comparison, threshold tuning, cost reports
+packages/
+  db/           schema, migrations, typed queries, tenant-scoped repositories
+  engine/       DecisionEngine interface + TypeSafeEngine, GatewayEngine, LlmFallbackEngine, LayaEngine
+  questions/    versioned question sets (Call A, Call B builders, cluster check) + sha256 hashing
+  feeds/        fetch, parse (RSS/Atom/JSON Feed), canonicalize, dedup, extract (Readability)
+  translate/    optional translation step (LLM or MT), cached per article
+  ranker/       post-rules, lane assignment, per-user logistic model (train + score), calibration
+  shared/       types, config, logging/OTel, errors
+```
 
 ### 4.2 Services (logical stages, which can run in one process at first)
 
@@ -455,6 +487,7 @@ scheduler ──► fetch ──► ingest ──► extract ──► enrich(A)
 | `fetch` | HTTP with lock, charset, redirects, RSS/Atom/JSON Feed parse; adaptive interval update | DreamCatcher `rss_fetch` + SQL interval functions (and FeedIt's SimplePie tolerance as test fixtures) |
 | `ingest` | canonicalize URL (strip utm_*, AMP, Google News wrappers), content hash, **unique insert**, story-cluster candidate lookup | new; FeedIt's title+description+image dedup rules as fallbacks |
 | `extract` | full-text extraction (use Mozilla Readability instead of the jQuery `:contains()` heuristic), language detection (per article) | DreamCatcher `rss_links_fetch`, improved |
+| `translate` | *only if the Phase 0 language test selects it* (§7.2): translate title + excerpt (+ body lead) of non-English articles to English with the LLM, once per article, cached in `article_translations` | new |
 | `enrich` | Jev Call A; store answers + model version + question-set hash | new |
 | `match` | Jev Call B for cards and labels relevant to the feed's subscribers; also on card creation, a backfill for recent articles | new |
 | `rank` | per-user score and lane, computed on demand for the visible page and cached; recomputed on feedback or card change | replaces FeedIt `links-trainer` + `updateMany` fan-out |
@@ -474,6 +507,8 @@ articles(id, feed_id, canonical_url, url, title, author, categories TEXT[], exce
          published_at, fetched_at, lang, word_count, content_hash,
          story_cluster_id, UNIQUE(feed_id, canonical_url))
 article_bodies(article_id PK, body_text, extracted_at, extractor_version)
+article_translations(article_id, target_lang, title, excerpt, body_lead, engine, created_at,
+                     PRIMARY KEY(article_id, target_lang))
 story_clusters(id, representative_article_id, created_at)
 
 -- Jev results (append-only, versioned)
@@ -527,6 +562,57 @@ interface DecisionEngine {
   - more than 20 % failures in a window trips a circuit breaker to the fallback engine
 - **Pin the model version** (`jev-1.13.0`, not `jev-latest`) in production. On a new release, replay the eval
   set (§6) before switching.
+
+### 4.5 Multi-tenancy from day one
+
+The shared article layer (feeds, articles, facets, card answers, translations) is global by design. Only
+what a user *does* is tenant data. What that requires from day one:
+
+- **Isolation.**
+  - Every per-user table carries `user_id` in its primary key, and all access goes through tenant-scoped
+    repositories in `packages/db`, never raw queries in route handlers.
+  - Postgres **row-level security** on per-user tables serves as a second line of defence (`SET app.user_id`
+    per request/transaction).
+  - Workers that touch per-user data (ranker, learner) take the `user_id` from the job payload, and the same
+    policies apply to them.
+- **Card privacy.**
+  - Card dedup is by normalized-text hash, so two users can share the same card *row*. They never see each
+    other's cards, examples or strengths.
+  - A card with personal examples is always a private fork. Its examples (the user's liked titles) are
+    used only in that user's questions.
+  - Library cards are public. A user card is promoted to the library only through an explicit admin step
+    and only when several users hold it.
+- **Quotas per plan** (enforced in the API, with counts stored on `users`):
+  - feeds per user
+  - cards and labels per user
+  - personal-example forks per user
+  - the minimum fetch interval of feeds they add
+  - OPML import size
+
+  These bound the only per-user Jev costs: card forks and backfills.
+- **Fairness in the queue.**
+  - pg-boss jobs carry `tenant_id` where per-user (backfills, model refits), with per-tenant concurrency
+    limits, so one user importing 500 feeds or creating 50 cards can't starve everyone else.
+  - Shared stages (fetch, enrich, match) are keyed by feed or article, not by user.
+- **Cost attribution.**
+  - Every `jev_calls` row records which cards were asked. Shared Call A cost is platform overhead. Call B
+    cost is split across the subscribers holding each card.
+  - Card-fork and backfill costs go to the owning user.
+  - This gives per-tenant $/day for plan design and abuse detection.
+- **A safe fetcher.** Users can add arbitrary URLs, so the fetcher is an SSRF risk from day one.
+  - Resolve DNS and block private, link-local and metadata IP ranges, including after redirects.
+  - Cap response size and time, and allow only http(s).
+  - Keep TLS verification on (DreamCatcher's `rejectUnauthorized: false` must not return).
+  - Rate-limit feed additions per user.
+- **Auth and accounts.**
+  - Passwordless email codes with rate limiting, per-device session tokens, and account deletion that
+    removes all per-user rows plus private card forks.
+  - Data export (OPML, cards, ratings) covers GDPR access and portability.
+- **Personal models** are stored per user (`user_models`) and trained only on that user's labels. There is
+  no cross-user learning in v1, with one exception: *anonymized aggregate* counts may later help order the
+  card library.
+- **Admin surface** (in `apps/api`, role-gated): the card library, feed health, the engine circuit-breaker
+  state, and per-tenant usage.
 
 ---
 
@@ -585,12 +671,16 @@ checked in code).
 
 The cost of Jev calls is small enough that evaluation can be continuous:
 
-- **Golden set.** Export the ratings from the old FeedIt MongoDB (`training-<id>.rated`, titles, feeds). This
-  data already exists and gives thousands of labelled like/dislike examples from a real user. Replay them
-  through Call A + B against interest cards written *after the fact*, then measure:
-  - AUC and precision@k of card-based ranking vs. the old `score_conformed` order
+- **Golden set, built from scratch.** No FeedIt data is reused (§7.6), so Phase 0 builds a new one:
+  - Ingest about 2 weeks of articles from a real mix of EN/SK/CZ feeds.
+  - Recruit **3–5 raters** (Martin plus a few testers with different tastes; multi-tenant means the ranking must work for more than one person's taste). Each writes 5–10 interest cards *before* rating, then rates about 300 articles in a bare-bones rating page (`apps/eval`), about 100 per language where their feeds allow.
+  - Separately, hand-label about 100 articles per language for the Call A questions (content type, clickbait, promo, depth, topic). This is the accuracy check for enrichment, and the clean test set for Laya later.
+  - Freeze it as `golden-v1` and grow it later with opted-in, anonymized production feedback.
+- **What to measure on it:**
+  - AUC and precision@k of card-based ranking vs. two cheap baselines: **chronological** order and a **keyword baseline** (BM25 of card text against title + excerpt). Jev has to clearly beat keyword matching to justify itself.
   - learning curves of the personal model (how many labels to reach X)
   - calibration (reliability diagram of P(like) vs. actual like rate)
+  - the same metrics split **per language** (EN / SK / CZ)
 - **Per-release replay.** Store `question_set.sha256` + `model_version` with every answer. Any change to
   questions, thresholds or model version runs the golden set and posts a diff.
 - **Online metrics:**
@@ -615,14 +705,15 @@ versions, stored raw answers, and the fact that no user data is locked into the 
 TypeSafe states that English is the primary training language and other languages are lower-accuracy. The
 options, to be decided by the eval (§6), not upfront:
 
-- **(a)** Send native text and rely on it. Measure on the golden set first. The old FeedIt data is largely
-  Slovak/Czech, which makes it a perfect test.
+- **(a)** Send native text and rely on it. Measure on the golden set first (§6), which is deliberately
+  balanced across EN/SK/CZ.
 - **(b)** Keep the questions and card text in English but the state in the native language. The model then
   handles cross-lingual matching. It is often better than fully native prompts, but that needs to be
   measured.
-- **(c)** Machine-translate the title + excerpt to English with a cheap MT API or small LLM before Call
-  A/B, and store the translation. This adds cost and latency on non-English articles only, and gives the
-  best expected accuracy.
+- **(c)** Translate the title + excerpt (+ body lead) to English with the LLM (approved use, §7.6) before
+  Call A/B, and store the translation (`article_translations`). This adds cost and latency on non-English
+  articles only, and gives the best expected accuracy. Translation happens once per article and is shared
+  by all tenants.
 
 - **(d)** Fine-tune the open-weights **Laya-multilingual** model (Apache 2.0, mmBERT-base) on EN/SK/CZ
   data labelled by a teacher, and route SK/CZ articles to it for the fixed enrichment questions. Laya is
@@ -653,24 +744,32 @@ Card texts and ratings are personal data. The article content sent to Jev is pub
 example titles leave our system. Vercel AI Gateway supports zero data retention, and TypeSafe offers ZDR on
 enterprise plans.
 
-### 7.6 Decisions for Martin
+### 7.6 Decisions (taken 2026-09-24)
 
-1. Is the stack TypeScript monorepo (recommended) or something else?
-2. Single-user self-hosted first, or multi-tenant SaaS from day one? The schema above supports both.
-   Self-hosted first is faster to validate.
-3. Is an optional generative LLM acceptable for card authoring, the fallback engine and possibly
-   translation, or must the core be Jev-only?
-4. Should the migration path import old FeedIt accounts and ratings, or only use them as the golden set?
+| # | Question | Decision | Consequence in this plan |
+|---|---|---|---|
+| 1 | Stack | **TypeScript monorepo** | Layout in §4.1 |
+| 2 | Single-user first or multi-tenant? | **Multi-tenant from day one** | §4.5 covers isolation, quotas, fairness, cost attribution and the SSRF-safe fetcher |
+| 3 | Generative LLM use | **Allowed only as the fallback decision engine and for translation** | `LlmFallbackEngine` + `translate` stage. No LLM card authoring (§3.3), no summaries, and no LLM as a direct labelling teacher for Laya (see `laya-multilingual.md` §3) |
+| 4 | Migration from FeedIt.sk | **None. Everything is trained or fine-tuned from scratch** | New golden set built in Phase 0 (§6). No account import. The old code stays only as a design reference |
+
+**Still open** (none of these block Phase 0):
+
+- **Hosting target** for the multi-tenant service (a single VPS with a managed Postgres, or a cloud provider). This decides whether a GPU for Laya is realistic later.
+- **Signup model** at launch: open signup, invite-only beta, or a waitlist. Invite-only fits the "rate limits adjusting dynamically" situation at TypeSafe.
+- **Which LLM provider** to use for fallback and translation. Pick one with structured output, zero data retention and good SK/CZ quality.
 
 ---
 
 ## 8. Roadmap
 
 **Phase 0: Spike (1 week).** No UI; the goal is to prove the core bet.
-- Export the old FeedIt ratings. Write 5–10 interest cards for the author's own feeds.
-- Script: Call A + Call B for those articles. Compute AUC vs. ratings and compare with the old `score_conformed`.
+- Minimal ingestion script (no pipeline yet) over a real EN/SK/CZ feed mix, and the bare-bones rating page in `apps/eval`.
+- Build `golden-v1` (§6): 3–5 raters write cards, then rate; hand-label the Call A questions.
+- Script: Call A + Call B for those articles. Compute AUC vs. ratings and compare with the chronological and keyword baselines.
 - Test the language options (a)/(b)/(c) on Slovak/Czech items, with Laya-multilingual zero-shot as a baseline (§7.2). Measure latency and $.
-- **Exit criterion:** card-based ranking ≥ the old engine's ranking on held-out ratings, with zero training.
+- **Exit criterion:** card-based ranking clearly beats the keyword baseline for every rater, with zero training, and a language option exists where SK/CZ is within about 5 AUC points of EN.
+- Phase 0 now takes about **2 weeks** rather than 1, because the golden set has to be built.
 
 **Phase 1: Ingestion core (2–3 weeks).**
 - Monorepo, Postgres schema, pg-boss.
@@ -681,7 +780,8 @@ enterprise plans.
 - The `DecisionEngine` package with a TypeSafe impl, retries, circuit breaker and call logging.
 - Call A and Call B with global card dedup. The interest card library (≈150 cards).
 - A PWA with feeds, lanes, swipe/keyboard rating with reason chips, "Why this?", mutes and boosts.
-- Passwordless auth.
+- Passwordless auth, tenant-scoped API and the quotas from §4.5.
+- The `translate` stage and `LlmFallbackEngine`, if Phase 0 selected translation.
 
 **Phase 3: Personal learning (2 weeks).**
 - Per-user logistic model + calibration, and the implicit signals (dwell, return prompt).
@@ -693,9 +793,9 @@ enterprise plans.
 - Archive/retention jobs, and the eval dashboard (online metrics, replay on version change).
 
 **Phase 5: Optional extras.**
-- LLM card authoring, and an optional translation step for non-English articles.
+- Fine-tuned Laya-multilingual for SK/CZ enrichment, if Phase 0 showed a language gap (`laya-multilingual.md`).
 - RAG "ask my archive" using DreamCatcher's hybrid search.
-- Summaries, native wrappers, premium plans (fetch interval, feed count, card count).
+- Native wrappers, premium plans (fetch interval, feed count, card count). Summaries only if the LLM policy (§7.6) is widened.
 
 ---
 

@@ -100,18 +100,18 @@ requires hand-labelling thousands of items.
    **same question set** (`jev-questions.md` §1). The teacher can be:
    - **Jev on English**: native English articles, plus SK/CZ articles machine-translated to English. Jev
      returns probabilities, which make better soft targets for calibration than hard labels.
-   - **A generative LLM** with structured output, reading SK/CZ natively (the `LlmFallbackEngine` adapter
-     from the plan). It costs a few dollars for a dataset this size.
-   - Where both are available, keep only the items where they agree, or weight each item by agreement.
+   - ~~A generative LLM as a direct teacher reading SK/CZ natively.~~ **Not used**: the LLM is approved only
+     for fallback and translation (PLAN §7.6). Its approved role here is **translating** SK/CZ articles so
+     that Jev can act as the teacher.
 
    ⚠️ **Check the teacher's terms first.** Some providers restrict using outputs to train models that compete
    with them. Read the TypeSafe and LLM-provider terms before distilling.
-2. **Real user ratings.** The old FeedIt MongoDB has like/dislike data on mostly SK/CZ titles. It can't
-   supervise the enrichment questions, but it is the **ground truth for the end-to-end ranking eval** (PLAN
-   §6). If it's paired with interest cards written after the fact, it also becomes positive and negative
-   examples for card matching.
-3. **Human spot checks.** Hand-check about 200–300 items per language as a clean test set. Never train on
-   these.
+2. **Real user ratings.** Nothing is migrated from FeedIt (PLAN §7.6). Ratings come from the new
+   `golden-v1` set built in Phase 0 (PLAN §6), and later from opted-in production feedback. They can't
+   supervise the enrichment questions, but they are the **ground truth for the end-to-end ranking eval**,
+   and paired with the raters' cards they are positive and negative examples for card matching.
+3. **Human spot checks.** The hand-labelled Call A items in `golden-v1` (about 100 per language), grown to
+   about 200–300 per language before fine-tuning, are the clean test set. Never train on these.
 
 ---
 
@@ -180,8 +180,8 @@ sits on top of whichever engine produced the features.
 
 ## 6. Recommendation
 
-1. **Extend the Phase 0 spike** (PLAN §8) with Laya. It's cheap, since everything runs on the existing
-   golden set. Compare, per language (EN / SK / CZ):
+1. **Extend the Phase 0 spike** (PLAN §8) with Laya. It's cheap, since everything runs on the new
+   `golden-v1` set. Compare, per language (EN / SK / CZ):
    - Jev with native text
    - Jev with English questions and native state
    - Jev with a machine-translated state
