@@ -157,7 +157,9 @@ sits on top of whichever engine produced the features.
   - A modern desktop or server CPU through ONNX (about 140–460 ms per call) handles this in minutes a day.
   - The 49 s/call result on a small 4 vCPU VPS means **cheap VPSs are not enough**. Use a real CPU, Apple
     silicon, or quantized weights (GGUF / q8, which is still untested).
-- **Multi-tenant** (about 150k articles/day):
+- **Decided hosting is CPU-only** (PLAN §4.6, no GPU). At invite-only scale that's fine on an 8-core-class
+  box. The GPU numbers below matter only if the service ever grows far beyond that.
+- **Large multi-tenant** (about 150k articles/day, hypothetical):
   - One T4-class GPU at about 72 ms per 10 questions gives more than 10 calls/s, which is plenty.
   - Compare that with about $79/day on Jev at that scale (`jev-questions.md` §5). Laya's savings only become
     significant at large scale.
