@@ -97,18 +97,18 @@ requires hand-labelling thousands of items.
 
 1. **Teacher labels (distillation).** Take about 5–10k articles from the shared store, balanced across
    EN/SK/CZ; DreamCatcher's seed feeds already mix these. Label them with a strong teacher using the
-   **same question set** (`jev-questions.md` §1). The teacher can be:
+   **same question set** ([spec 05 §3.3](./specs/05-classification.md)). The teacher can be:
    - **Jev on English**: native English articles, plus SK/CZ articles machine-translated to English. Jev
      returns probabilities, which make better soft targets for calibration than hard labels.
    - ~~A generative LLM as a direct teacher reading SK/CZ natively.~~ **Not used**: the LLM is approved only
-     for fallback and translation (PLAN §7.6). Its approved role here is **translating** SK/CZ articles so
+     for fallback and translation (PLAN §2, decision 3). Its approved role here is **translating** SK/CZ articles so
      that Jev can act as the teacher. Translation comes from OPUS-MT / LibreTranslate first, with Ollama Cloud
-     GLM as the fallback (PLAN §4.6).
+     GLM as the fallback ([spec 07](./specs/07-translation.md)).
 
    ⚠️ **Check the teacher's terms first.** Some providers restrict using outputs to train models that compete
    with them. Read the TypeSafe and LLM-provider terms before distilling.
-2. **Real user ratings.** Nothing is migrated from FeedIt (PLAN §7.6). Ratings come from the new
-   `golden-v1` set built in Phase 0 (PLAN §6), and later from opted-in production feedback. They can't
+2. **Real user ratings.** Nothing is migrated from FeedIt (PLAN §2, decision 4). Ratings come from the new
+   `golden-v1` set built in M3a ([spec 10 §2](./specs/10-evaluation.md)), and later from opted-in production feedback. They can't
    supervise the enrichment questions, but they are the **ground truth for the end-to-end ranking eval**,
    and paired with the raters' cards they are positive and negative examples for card matching.
 3. **Human spot checks.** The hand-labelled Call A items in `golden-v1` (about 100 per language), grown to
@@ -158,15 +158,15 @@ sits on top of whichever engine produced the features.
   - A modern desktop or server CPU through ONNX (about 140–460 ms per call) handles this in minutes a day.
   - The 49 s/call result on a small 4 vCPU VPS means **cheap VPSs are not enough**. Use a real CPU, Apple
     silicon, or quantized weights (GGUF / q8, which is still untested).
-- **Decided hosting is CPU-only** (PLAN §4.6, no GPU). At invite-only scale that's fine on an 8-core-class
+- **Decided hosting is CPU-only** (PLAN §2 decision 5; [spec 11 §1](./specs/11-operations.md)). At invite-only scale that's fine on an 8-core-class
   box. The GPU numbers below matter only if the service ever grows far beyond that.
 - **Large multi-tenant** (about 150k articles/day, hypothetical):
   - One T4-class GPU at about 72 ms per 10 questions gives more than 10 calls/s, which is plenty.
-  - Compare that with about $79/day on Jev at that scale (`jev-questions.md` §5). Laya's savings only become
+  - Compare that with about $79/day on Jev at that scale ([spec 05 §9](./specs/05-classification.md)). Laya's savings only become
     significant at large scale.
   - For one user, Jev costs about $0.29/day. At that size the case for Laya is **language, privacy and vendor
     independence**, not price.
-- **Integration:** it plugs in as `LayaEngine` behind the plan's `DecisionEngine` interface (PLAN §4.4),
+- **Integration:** it plugs in as `LayaEngine` behind the plan's `DecisionEngine` interface ([spec 04 §9](./specs/04-decision-engine.md)),
   using `receptron/laya` from Node. The request shape is the same, so the question sets are reused as they
   are. Differences to plan for:
   - ≤ 20 options per Choice
@@ -183,7 +183,7 @@ sits on top of whichever engine produced the features.
 
 ## 6. Recommendation
 
-1. **Extend the Phase 0 spike** (PLAN §8) with Laya. It's cheap, since everything runs on the new
+1. **Extend the G1 evaluation** (PLAN §9, experiment E5 in [spec 10 §3](./specs/10-evaluation.md)) with Laya. It's cheap, since everything runs on the new
    `golden-v1` set. Compare, per language (EN / SK / CZ):
    - Jev with native text
    - Jev with English questions and native state

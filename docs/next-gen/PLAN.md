@@ -1,895 +1,876 @@
-# FeedIt Next Gen: an RSS reader that asks instead of trains
+# FeedIt Next Gen: execution plan
 
-> Status: design plan, September 2026. Written inside the `feedit.sk` repo so it can be compared
-> against the first prototype (this repo, PHP + MongoDB) and the follow-up
-> ([DreamCatcher](https://github.com/martinambrus/DreamCatcher), TypeScript + Kafka + Postgres).
-> The plan is meant to move into its own repository later.
+> **What this is.** The build plan for FeedIt Next Gen, an RSS reader that classifies articles with
+> TypeSafe's **Jev** decision model against each reader's plain-language **interest cards**, instead
+> of a hand-tuned word-scoring engine. It is written so that Claude Code can execute it milestone by
+> milestone as `/goal`s, with minimal interpretation.
 >
-> **Decisions taken (2026-09-24):** TypeScript monorepo; multi-tenant from day one; a generative LLM is
-> allowed only as the fallback decision engine and for translation; no data or accounts migrate from
-> FeedIt.sk, and everything is trained or fine-tuned from scratch; self-hosted on one box with minimal
-> spend and no GPU; invite-only signups at launch; translation runs on free CPU models first, with Ollama Cloud GLM as
-> the fallback, and Claude is out of the picture for cost reasons. See §7.6.
+> **Document set** (copy the whole folder into the new repository's `docs/`):
 >
-> Companion document: [`jev-questions.md`](./jev-questions.md) holds the concrete Jev question sets,
-> request shapes and cost math. [`laya-multilingual.md`](./laya-multilingual.md) evaluates Laya, the
-> open-weights Jev alternative, for EN + SK + CZ fine-tuning and self-hosting.
+> | File | Role |
+> |---|---|
+> | `PLAN.md` (this file) | goals, milestones, tasks, order, parallelism, acceptance criteria |
+> | [`specs/01-architecture.md`](./specs/01-architecture.md) | stack, repo layout, conventions, config, CI, deviation process |
+> | [`specs/02-data-model.md`](./specs/02-data-model.md) | full PostgreSQL schema, roles, RLS, SQL functions |
+> | [`specs/03-ingestion.md`](./specs/03-ingestion.md) | queues, safe fetcher, parsing, dedup, extraction, language, fetch schedule |
+> | [`specs/04-decision-engine.md`](./specs/04-decision-engine.md) | Jev client, router, retries, breaker, spend guard, LLM fallback, Laya |
+> | [`specs/05-classification.md`](./specs/05-classification.md) | question sets, taxonomy, interest cards, matching, clustering, suggestions, library |
+> | [`specs/06-ranking-learning.md`](./specs/06-ranking-learning.md) | rules, lanes, tiers, explain, rank handler, personal model, BM25 |
+> | [`specs/07-translation.md`](./specs/07-translation.md) | LibreTranslate tier 1, Ollama Cloud tier 2, quality checks |
+> | [`specs/08-api.md`](./specs/08-api.md) | HTTP API, auth, invites, quotas, admin |
+> | [`specs/09-web-app.md`](./specs/09-web-app.md) | PWA screens, interactions, keyboard, onboarding |
+> | [`specs/10-evaluation.md`](./specs/10-evaluation.md) | golden set, experiments, metrics, gate G1, replay |
+> | [`specs/11-operations.md`](./specs/11-operations.md) | deploy, housekeeping jobs, backups, alerts, security, launch |
+> | [`background.md`](./background.md) | why: lessons from FeedIt.sk and DreamCatcher, Jev research, risks |
+> | [`laya-multilingual.md`](./laya-multilingual.md) | evaluation of the open-weights Laya model (optional M9) |
+>
+> Specs are **binding** and are the source of truth for behaviour. This file is the source of truth for
+> *order* and *done-ness*.
 
 ---
 
-## 0. TL;DR
+## 0. How to run this plan with Claude Code
 
-FeedIt had one core promise: **"show me only the articles I care about, and learn what that means
-from my likes and dislikes."** Both earlier attempts tried to deliver this by building a scoring
-engine by hand:
+### 0.1 One milestone = one `/goal`
 
-- **FeedIt.sk** scored title words, trigrams, authors, categories and phrases per user and per feed. It combined
-  them with hand-tuned constants (`+1`, `+25`, `0.1`, `0.01`, a "well-trained" threshold of `163`, tier
-  cut-offs of 5/10/30/50 %).
-- **DreamCatcher** planned embeddings, hybrid RAG search and a slow generative-LLM pass that returned a
-  JSON score, tags and reasons for every article. That pass was never built.
+Claude Code's `/goal <condition>` keeps a session working, turn after turn, until a separate evaluator
+model judges the condition met. The evaluator reads **only the conversation transcript**. It does not
+run commands or open files. Every milestone below therefore has a ready-made **goal text** (under
+4,000 characters, as `/goal` requires) that:
 
-The next generation replaces the hand-built scoring with **TypeSafe's Jev**, a "System One" decision
-model. You send Jev a *state* (the article) and a set of typed *questions* (Choice / Score / Noul). It
-returns calibrated probabilities plus a confidence value in about 70–500 ms. It costs $0.042 per million input
-tokens, and output is free. It cannot generate text, so it cannot hallucinate free-form answers. It is the
-"smart if-statement" this product always needed.
+- points at the milestone section and the specs to follow
+- states constraints (locked decisions, no scope creep)
+- defines "done" as **evidence printed in the transcript**: a milestone report with every task ticked
+  and its commit hash, plus the verbatim tail of the verification commands and their exit code
+- bounds the run with "or stop after N turns"
 
-The design in one picture:
+### 0.2 Procedure for each milestone
+
+1. **Start a fresh Claude Code session** in the new repository. A goal is session-scoped, one per
+   session.
+2. Switch to **auto mode** so goal turns run unattended (a goal does not change permission mode).
+3. Create the milestone branch, e.g. `git switch -c m1-ingestion`. Parallel milestones use separate
+   **git worktrees** (`git worktree add ../feedit-ng-m2 -b m2-classification`), one session each.
+4. Paste the milestone's goal text after `/goal `.
+5. Claude then:
+   - reads this milestone section and the referenced spec sections
+   - creates one task per row of the task table (TaskCreate), in dependency order
+   - runs tasks from **different lanes in parallel with subagents** when their dependencies are met
+     (lanes touch disjoint directories)
+   - commits once per task as `<task-id>: <summary>`
+   - runs the verification commands and prints the **milestone report** (§0.4)
+6. Review the report, then merge the branch (a PR if you prefer) before starting dependent milestones.
+
+### 0.3 Global rules for every goal
+
+- Follow [`specs/01-architecture.md`](./specs/01-architecture.md) conventions. Read the spec sections
+  a task cites **before** coding it.
+- **Locked decisions (§2) are never changed by the implementer.** If one blocks progress, stop and
+  report.
+- **Spec deviations:** allowed only through spec 01 §9. Log each in `docs/DECISIONS.md` and update the
+  spec in the same commit.
+- **Tests:** no live third-party calls; use `packages/testing` fixtures. Live calls are allowed only
+  in M3b and in explicitly marked manual checks.
+- **Scope:** do not implement other milestones' tasks. Stubs and interfaces that later milestones
+  fill in are fine when a task says so.
+- **Verification commands** (the "full check"):
+  `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int`. From M6 on, also
+  `pnpm --filter web e2e`.
+
+### 0.4 Milestone report format (printed at the end of every goal)
 
 ```
-            ┌───────────── once per article (shared by ALL users) ─────────────┐
- feed ─►  fetch ─► normalize/dedup ─► extract ─► ENRICH (Jev call A)          │
-            │                                     "what is this article?"    │
-            └──────────────────────────────────────────────────────────────────┘
-                                                   │  topic probs, content type,
-                                                   │  depth, clickbait, promo, …
-            ┌──── once per article × *distinct interest cards* on that feed ───┐
-            │  MATCH (Jev call B): "does it satisfy interest card X?" (Nouls)  │
-            └──────────────────────────────────────────────────────────────────┘
-                                                   │
-            ┌──────────────── per user, in code, microseconds ─────────────────┐
-            │  RANK: rules (mutes/boosts) + interest match + tiny learned model │
-            │  → calibrated "P(you'll like it)" → tiers / Maybe lane / hidden   │
-            └──────────────────────────────────────────────────────────────────┘
-                                                   │
-                     user feedback (👍/👎 + one-tap *reason*) ──► updates the tiny model,
-                     proposes new interest cards, feeds the eval set
+## M<n> report
+Branch: m<n>-<slug>   Last commit: <sha>
+| Task | Status | Commit | Evidence |
+| M<n>-T1 … | ✓ | abc1234 | tests: packages/feeds/test/safe-fetch.test.ts (24 passed) |
+…
+### Milestone "Done when"
+- [x] <item> — <evidence: command + result, file path, or test name>
+### Verification
+$ pnpm typecheck && pnpm lint && pnpm test && pnpm test:int
+<last ~15 lines of output>
+exit code: 0
+### Deviations logged
+D-3 (M1-T6): … / none
+### Notes for the next milestone
+…
 ```
-
-Five ideas carry most of the design:
-
-1. **Interest cards instead of word weights.** A user describes what they want in plain language
-   ("new EV battery chemistry, not stock-price news"). The system also offers cards from a shared
-   library. Jev evaluates every new article against every card. There is nothing to train before the
-   first useful result, which removes FeedIt's "train 200 articles first" wall.
-2. **Understand each article once, for everyone.** The per-article enrichment call is shared across
-   tenants. DreamCatcher's global article store already works this way, so reuse it.
-3. **The model's calibration replaces hand balancing.** Jev's probabilities are trained to be calibrated.
-   Tiers become probability buckets instead of hand-tuned percent thresholds. When per-user learning
-   is needed, a tiny logistic model learns the weights, so nobody has to tune them.
-4. **Confidence is a product feature.** High-confidence "no" items get hidden. Low-confidence items go
-   to a *Maybe* lane and are the articles the app asks you to rate. This is active learning: you only
-   train where the model is unsure.
-5. **Feedback carries reasons, not just a sign.** A 👎 comes with an optional one-tap reason
-   ("off-topic", "clickbait", "already seen this story", "too shallow", "promo"). Each reason maps onto a
-   Jev question that already exists, so a dislike becomes negative evidence. The old engine could never
-   use dislikes that way.
 
 ---
 
-## 1. What we learned from the two predecessors
+## 1. Product in one page
 
-### 1.1 FeedIt.sk (this repo): keep the UX, drop the scoring engine
+**Promise:** "Show me what I care about from the moment I subscribe, learn from my 👍/👎, and always
+tell me *why*."
 
-**Worth keeping**
+**How:**
+1. **Ingest** every subscribed feed once for all users, deduplicate, extract text and detect the
+   language.
+2. **Call A (enrich)**, once per article: content type, topic, depth, clickbait, promo, time
+   sensitivity, … (Jev).
+3. **Call B (match)**, once per article × each distinct **interest card** on its feeds: an absolute
+   yes/no probability (Jev).
+4. **Rank** per user, in code: rules (mutes, blocks, boosts) → card score → quality demotions → lanes
+   **For you / Maybe / Everything else** plus tiers 1–5, with an `explain` record for "Why this?".
+5. **Learn:** 👍/👎 with reasons, dwell and bookmarks train a tiny per-user logistic model on top of
+   the Jev features. Maybe-lane items are the ones the app asks about (active learning).
+6. **Degrade safely:** if Jev is unavailable or over budget, the app falls back to keyword ranking in
+   the Maybe lane and never hides anything.
 
-- The whole interaction model, which is the reason the product exists:
-  - swipe or keyboard like/dislike (`js/train-on-swipe.js`, CTRL+PLUS/MINUS)
-  - "train the whole feed" in one action
-  - Simple Mode
-  - a 1–5 tier slider with "Hide non-interesting"
-  - sort by score or by date
-  - status filters: unread, untrained, trained+, all
-  - bookmarks protecting items from archiving
-  - labels with *suggested* labels you tap to make permanent
-  - per-feed settings: duplicates allowed, language, manual priorities, adjustment phrases
-- Passwordless email-code login.
-- The "detailed training" modal, which *explains* what the system thinks about an article. The concept
-  stays, but it now shows interest-card matches and article facets instead of word weights.
-- Duplicate detection: FeedIt already compared link, title + first 80 characters of the description,
-  and image. DreamCatcher only dedups per feed, so this is a regression to fix.
-- Ideas from `todo.txt` that the new design makes cheap:
-  - temporary keyword muting (e.g. for a Google News story you have already read)
-  - the "did you like it?" prompt after returning from an article
-  - article-length buckets
-  - per-article language
-  - linked feeds / copying training between feeds. With interest cards this comes free, because cards
-    are not tied to a feed.
-  - OPML import and export
+**v1 non-goals:** AI summaries or any generated text, social features, a full-text search engine,
+native apps (the PWA covers mobile), and migrating FeedIt.sk data.
 
-**What went wrong, and why the new design avoids it**
+Background and rationale: [`background.md`](./background.md).
 
-| FeedIt.sk problem | Root cause | Next-gen answer |
+---
+
+## 2. Locked decisions
+
+| # | Topic | Decision |
 |---|---|---|
-| Only the **title** is scored. The description and body are ignored. | Word statistics need clean, short text. | Jev reads title, excerpt and the start of the body as structured state. |
-| **Dislikes teach almost nothing.** They only raise `weightings`, which dilutes the interest %. | Positive-evidence-only word counting. | A dislike + reason is a labelled example for the per-user model and maps to explicit negative features. |
-| Magic constants: `+25` trigrams, `0.1` authors, `0.01` categories, `163`, 5/10/30/50 %, ±300/±3000 boosts that push interest % into the thousands. | Hand-balancing heterogeneous signals. | Calibrated probabilities. Where weights are needed, they are *learned*. |
-| Cold start: a feed needs ≥200 articles, 32 % trained and ≥4 % liked before tiers work. The "well-trained" flag is never re-evaluated. | Nothing works until statistics accumulate. | Interest cards work on article #1. Learning only *refines* them. |
-| Every vote runs `updateMany` over every unread article containing the word. | Scores are denormalized into each article row. | Jev answers are stored once. Ranking is a cheap per-user function evaluated at read time or incrementally. |
-| Per-user collections (`words-<id>`, `training-<id>` …), and crons process only the first 100 accounts (`limit => 100`, sorted on a non-existent field). | Tenancy bolted onto per-user collections. | Proper relational multi-tenancy with a shared article layer and per-user state tables. |
-| Labels are predicted by word overlap with previously labelled titles. | Nothing better was available. | A label *is* a question: user-defined labels become Nouls or a Choice over label descriptions. |
-| Training is per feed and cannot be shared (`todo.txt`: "mighty complicated due to all dependencies of dependencies"). | Word weights are tied to feed vocabularies. | Interest cards are feed-independent by construction. |
+| 1 | Stack | **TypeScript monorepo** (pnpm + Turborepo; Node 22; Fastify; Drizzle; pg-boss; React PWA). Details in spec 01 |
+| 2 | Tenancy | **Multi-tenant from day one**: a shared article layer, per-user data under Postgres RLS |
+| 3 | Generative LLM | **Only** as the fallback decision engine and for translation. No LLM card authoring, summaries or labelling teachers |
+| 4 | Migration | **None.** No FeedIt.sk accounts or data. Everything is trained or fine-tuned from scratch; the golden set is built new |
+| 5 | Hosting | **Self-hosted on one box, minimal spend, no GPU** |
+| 6 | Signup | **Invite-only** at launch, with a waitlist |
+| 7 | Translation / LLM provider | Tier 1 = **free CPU machine translation** (LibreTranslate/Argos). Tier 2 and the LLM fallback = **Ollama Cloud GLM** (`glm-5.3-flash`, `glm-5.3`). **No Claude** (too expensive for the quality needed) |
+| 8 | Decision model | **Jev** (TypeSafe) through its HTTP API, pinned version (`jev-1.13.0`). Laya is an optional later engine |
 
-### 1.2 DreamCatcher: keep the ingestion pipeline, cut the ceremony
-
-**Worth keeping** (this is the solid part and should be ported almost verbatim):
-
-- A global, shared feed and article store. Each feed is fetched once for all subscribers, and fetching
-  only happens while a feed has subscribers.
-- The adaptive fetch-interval algorithm (`update_feed_after_fetch_success` / `_failed`):
-  - 5-minute steps
-  - a 20 h grace period for daily feeds
-  - a 10-day cap
-  - quarantine after repeated errors
-- Robust fetching: per-feed distributed lock, keep-alive + DNS cache, charset guessing, URL repair,
-  following redirect pages (Google News), JSON Feed support, and image extraction from enclosure,
-  media:thumbnail or the first `<img>`.
-- Full-article extraction, with the raw title, description and body kept "so we can re-train later".
-  That turns out to be exactly what allows **re-asking Jev** when the question set changes.
-- Crash-replay of in-flight jobs and OpenTelemetry tracing across stages.
-
-**What to change**
-
-- **Too much infrastructure for the stage the product is at.** Three-node Postgres with repmgr, three Kafka nodes,
-  Redis Sentinel and Elasticsearch are not needed before there are users. Start with **one
-  Postgres** plus a Postgres-backed job queue (e.g. `pg-boss` or `graphile-worker`) and keep the *stage
-  boundaries* so a broker can be swapped in later.
-- **Vendored shared libraries synced by GitHub Actions** caused schema drift. Use a monorepo with
-  workspace packages (`packages/db`, `packages/jev`, …) and one Prisma/Drizzle schema.
-- **Dedup is per-feed, check-then-insert, with no unique constraint** (partitioning prevented one).
-  Replace it with a canonical-URL + content-hash unique key and cross-feed story clustering (§5.3).
-- **One partition per feed per month** will explode. Partition `articles` by month only, or not at
-  all until volume demands it.
-- **In-memory retry maps and debounce timers** lose state on restart. Keep all retry state in the job
-  queue.
-- `rejectUnauthorized: false` everywhere: remove it, and allow it only per feed as an explicit opt-in.
-- The RAG layer (chunks, `vector(768)`, hybrid search) is **not needed for classification** in this
-  design. Keep it as an optional later feature for "search my archive / ask about my reading",
-  not on the scoring path.
-- Many seed feeds are **Slovak/Czech**. See §7.2: this is the biggest open technical risk with Jev.
-
-### 1.3 The Jev demos: what they show us
-
-**elvisun/newsjack** (a news-relevance filter, the closest analogue to our problem):
-
-- **A cascade.**
-  - Layer A runs once per headline: an `is_news` Noul, a `desk` Choice, a `story_type` Choice and six 5-level Scores.
-  - It gates on `is_news >= 0.5`.
-  - Layer B then asks **one namespaced question set for all 15 clients in a single call**
-    (`"${clientId}.${key}"`, 90 questions, ~10k tokens, ~320 ms).
-  - This is the model for our per-interest-card matching.
-- **Facts separate from verdicts.** A `decision` Choice (keep / monitor_only / reject) comes with supporting
-  Nouls (`is_news`, `profile_bridge`, `promotional`, `safety_risk`). **Deterministic post-rules in code** then apply
-  floors, e.g. a reject with confidence < 0.55 becomes monitor_only. Every fired rule is recorded.
-- **Asymmetric error costs**, written into the instructions: *"a false positive is cheap, a dropped real
-  opportunity is expensive. When in doubt, keep."* For a reader the same holds. Hiding a great article is
-  worse than showing a mediocre one.
-- **Fallback labels are read from the probability distribution** instead of re-asking.
-- **Operations.**
-  - Worker pool of 8, 4 attempts with exponential backoff on 429/5xx.
-  - A failed item degrades to "monitor", never "drop".
-  - If more than 20 % of calls fail, fall back to an LLM engine.
-  - The sha256 of the question set is stored with each result, and raw answers are kept so results can be
-    re-scored offline without new API calls.
-- **Measured numbers.** 384 headlines in 24.9 s for $0.19. On 176 signals: 8.3 s, $0.013, p50 ≈ 260 ms,
-  and 76.7 % agreement with a Haiku-based filter.
-- **Their doctrine:** tune the *criteria wording*, not the post-rules.
-
-**fhshaik/typesafe-mario** (Jev plays Super Mario from RAM-derived JSON):
-
-- **State is structured JSON grouped by meaning, never prose.** Exact arithmetic is done in code and
-  passed as typed booleans (`jump_must_start_this_decision`). The model only interprets.
-- **Question criteria are built per call** from the currently allowed actions. Our equivalent is building
-  criteria from the user's own interest cards and labels.
-- **Everything is logged:** state, probabilities, confidence and latency, as JSONL. That log is the eval set.
-
-**TypeSafe docs, the parts that matter for us** (`docs.typesafe.ai`, jev-1.13, reviewed 2026-09-17):
-
-- Three primitives:
-  - **Choice**: up to 255 options, returns probabilities + confidence.
-  - **Score**: 2–10 ordered levels, returns a probability-weighted index + confidence.
-  - **Noul**: returns P(yes).
-- `instructions` and `criteria` accept **structured JSON**. Option descriptions can include `what`,
-  `not_for` and **`examples`**. *This is how per-user examples ("articles I liked") get in without
-  fine-tuning.*
-- **Limits.**
-  - 64k tokens per request (state + all questions).
-  - 32k for state + the longest question.
-  - Rate limit of 250k tokens/s and 1,200 req/min, "adjusting dynamically".
-  - Text only.
-  - **English is the primary language**; other languages are "handled but not equally well".
-- **Speculative fan-out:** ask *all* questions in one call. In their test, 13 questions in one call cost 12.2× less and ran 10× faster than 13
-  sequential calls.
-- **Known weak spots, all avoidable by design:**
-  - counting and math
-  - date comparison
-  - multi-hop indirection
-  - a large state full of irrelevant text ("context rot")
-  - adversarial content
-  - Nouls where "true" means "no"
-  - comparing thresholds across different question types
-- **Jev is never fine-tuned per customer.** Customization happens only through state, instructions and
-  criteria. Their own cookbook ("Autoresearch feature discovery") shows the pattern we adopt for
-  personalization: **Jev answers → numeric features → a small classical model trained on labels.**
-- Confidence is *not* the top probability. It measures how concentrated the distribution is, and in
-  practice it runs lower. Newsjack saw a median confidence of 0.53 against a median top probability of 0.68.
-  Thresholds must be tuned on our own data.
+**Decided by measurement at gate G1 (M3b), with defaults until then:**
+- language mode per language (default `native`)
+- card text mode (default `as_written`)
+- lane and tier thresholds (spec 06 §11 defaults)
+- the daily budget (default $2)
 
 ---
 
-## 2. Product vision
+## 3. Glossary
 
-**One sentence:** a fast, mobile-first RSS reader that shows each person what they care about the moment
-they subscribe, gets sharper with every thumbs-up or thumbs-down, and can always tell you *why* an
-article is shown, hidden or uncertain.
-
-**Primary user stories**
-
-1. *As a new user* I add feeds (or import OPML) and write 1–5 interests in plain words, or pick them
-   from suggestions. My first page is already sorted by relevance.
-2. *As a reader* I swipe 👍/👎. On 👎 I can tap one reason. The ranking visibly adapts within seconds.
-3. *As a reader* I see three lanes:
-   - **For you**: high P(like).
-   - **Maybe**: uncertain. This is where the app asks for my opinion.
-   - **Everything else**: collapsed, never silently lost. Hiding is only allowed for a high-confidence no.
-4. *As a reader* I can open "Why this?" on any article and see which interest cards matched, what the
-   article was classified as (topic, depth, clickbait, promo) and which of my rules applied.
-5. *As a power user* I define labels ("Worth sharing with the team", "Deals under 100 €") as short
-   descriptions. The app auto-suggests them on new articles.
-6. *As a power user* I mute keywords or stories temporarily ("mute this story for 3 days") and boost
-   sources.
-7. *As a reader of aggregators* (Google News and the like) I see one story once, with "3 more sources" folded
-   underneath.
-
-**Non-goals for v1:** summaries or AI-written text (Jev can't write, and the LLM is approved only
-for fallback and translation), social features, a full-text search engine, and native apps. A PWA covers mobile.
-
----
-
-## 3. The classification design in detail
-
-### 3.1 Two kinds of Jev calls
-
-Jev is priced per input token, and the state is ingested once per call no matter how many questions there
-are. The design therefore minimizes the number of distinct *states* and packs questions into them.
-
-**Call A: Enrichment (once per article, global).** The state is the article and nothing else:
-
-```json
-{
-  "article": {
-    "title": "…",
-    "feed": { "title": "Ars Technica", "site": "arstechnica.com" },
-    "author": "…",
-    "categories": ["…"],
-    "excerpt": "first ~600 chars of RSS description, HTML-stripped",
-    "body_lead": "first ~1,500 chars of extracted body (if available)",
-    "word_count_bucket": "long"           // computed in code, never asked
-  }
-}
-```
-
-The questions are the same for every article and are defined in [`jev-questions.md`](./jev-questions.md):
-
-| key | type | purpose |
-|---|---|---|
-| `content_type` | Choice | news report / analysis / opinion / tutorial / review / listicle / press-release / deal / job / event / podcast-video / other |
-| `topic_l1` | Choice | top-level topic taxonomy, about 20 nodes, with subtrees shown as criteria values ("walking a taxonomy") |
-| `topic_l2` | Choice | asked in a second call only for the top 1–2 `topic_l1` branches (beam search, as in the hierarchical-classification cookbook) |
-| `depth` | Score (5) | a headline rewrite, brief, standard, in-depth, deep investigation |
-| `clickbait` | Noul | does the title withhold or exaggerate what the article delivers |
-| `promotional` | Noul | press release, sponsored post or vendor marketing |
-| `time_sensitive` | Noul | only relevant for a few days (breaking news, deals, events) |
-| `evergreen` | Noul | still useful months later |
-| `local_scope` | Choice | global / country / region / city, useful for Slovak local news |
-| `sentiment_tone` | Score (5) | alarming … upbeat (optional, for "less doom" users) |
-| `paywalled_or_teaser` | Noul | the excerpt is a teaser for paywalled content |
-
-Estimated size is 1.5–2.5k input tokens, so **≈ $0.0001 per article**. 20,000 new articles a day costs about $2/day for
-*all* users together.
-
-**Call B: Matching (once per article × the distinct interest cards on that feed).** The state is the same
-article (smaller: title, excerpt, body lead). The questions are one Noul per **interest card** that any
-subscriber of the feed holds, namespaced by card id:
-
-```json
-{
-  "state": { "article": { … } },
-  "questions": {
-    "card_812": { "type": "noul",
-      "instructions": { "question": "Does `article` match this reader interest?",
-                        "interest": "New battery chemistry for EVs (solid-state, sodium-ion …)",
-                        "not_for": "Stock-price moves or car launch PR without battery detail" },
-      "criteria": { "true":  { "what": "The article's main subject is the interest", "examples": ["…liked title 1…", "…liked title 2…"] },
-                    "false": { "what": "Mentions it only in passing, or matches a not_for", "examples": ["…disliked title…"] } } },
-    "card_977": { … }
-  }
-}
-```
-
-- **Cards are deduplicated globally.** Card text is normalized and hashed, so if 300 users pick the library
-  card "Rust programming language" it is *one* question. Cost grows with the number of *distinct
-  interests on a feed*, not with users. This is the multi-tenancy win that DreamCatcher's shared store
-  made possible but never used.
-- **Budgeting:** a card question is about 150–400 tokens. The 64k per-request budget fits about 100–150 cards
-  per call, and larger sets are split across several calls with the same state.
-- **Prefiltering (optional, once card counts grow):** each card carries the `topic_l1` nodes it belongs
-  to. Call B is only asked for cards whose topics have probability ≥ 0.05 in the article's Call A answer.
-  Asking extra questions is cheap, and fan-out beats cleverness until the numbers say otherwise.
-- **Personal examples are what make a card personal.** Adding liked and disliked titles to
-  `criteria.true/false.examples` is how the model gets few-shot context without training.
-  - A shared library card uses the library's curated examples.
-  - As soon as a user adds personal examples, a **fork** of the card is created (a new hash).
-  - This is the one place where cost scales per user, and it scales with *engaged* users. That is
-    acceptable, and it can be capped (e.g. max 5 examples per side, rotating the most recent/most
-    informative ones).
-
-**Why not one Choice "which of my interests does this match?"** Because a Choice is *relative*: it always
-picks something. TypeSafe's jaggedness notes make exactly this point, that a Choice settles "which" while
-independent Nouls "can be low for all of them". A reader needs the absolute answer, so each card is its
-own Noul. A Choice is used only where exactly one answer is correct (content type, topic node, label
-picking from a closed set).
-
-### 3.2 Turning answers into a ranking (per user, in code)
-
-For user *u* and article *a* the ranker computes, in this order:
-
-1. **Hard rules** (deterministic, applied first, recorded in `rules_fired`):
-   - Muted keyword or story match → hidden (with an expiry for temporary mutes).
-   - A blocked source or author → hidden.
-   - A pinned or boosted source → floor at the "For you" lane.
-   - Duplicate of an already-read story (§5.3) → folded.
-2. **Interest match** `m = max over u's cards of P(card)`. The card's user-set strength (*must / love /
-   like*) acts as a multiplier, and a matched **anti-interest** card ("never show me crypto") acts as a veto
-   if P ≥ 0.7.
-3. **Quality modifiers** from Call A, only where the user opted in or has *demonstrated* a preference
-   (see 4): e.g. clickbait P ≥ 0.8 or promotional P ≥ 0.8 → demote by one lane.
-4. **Learned personal model** (phase 3, once the user has ≥ ~30 labelled items): a regularized logistic
-   regression per user over a fixed feature vector, described below. The model's output *replaces* steps 2–3
-   as the score, but hard rules still apply first.
-
-   The feature vector:
-   - all card P's for that user's cards
-   - `topic_l1`/`topic_l2` probabilities
-   - `content_type` probabilities
-   - `depth` (expected level) and its uncertainty
-   - the clickbait / promotional / time_sensitive / evergreen / paywalled P's
-   - feed id (one-hot or target-encoded)
-   - author (hashed)
-   - word-count bucket
-   - article age at read time
-   - story-cluster size
-
-   This is TypeSafe's own "Jev answers → features → classical model" recipe, in the same shape as their
-   CatBoost cookbook but smaller. It trains in milliseconds and runs in microseconds. The coefficients
-   are *learned*, not hand-set, which directly retires FeedIt's constant-tuning problem, and its output
-   is P(like) and can be recalibrated per user (Platt scaling on held-out ratings).
-
-**Lanes / tiers.** The final number is always a probability, so the 1–5 tier slider maps to fixed bands
-such as tier 5 = P ≥ 0.85, tier 4 ≥ 0.65, tier 3 ≥ 0.45, tier 2 ≥ 0.25, tier 1 = everything. The bands mean
-the same thing for every user and every feed, and none of it depends on 200 trained articles.
-
-**Uncertainty drives the "Maybe" lane.** An article lands in *Maybe* when any of these hold:
-
-- the best card P is between 0.35 and 0.65
-- Jev's confidence on the deciding answer is low (threshold tuned on our data, starting around 0.5)
-- the personal model's P is near 0.5
-
-Following newsjack's asymmetric-cost rule, **only a confident "no" hides anything**. Everything else
-stays reachable.
-
-### 3.3 Learning from the user
-
-| Signal | Captured as | Used for |
-|---|---|---|
-| 👍 / 👎 (swipe, keyboard, button) | label ±1 | personal model training; candidate examples for card criteria |
-| 👎 + reason chip | label −1 + reason | maps to a feature. "Off-topic" → nearest card's `not_for` examples; "clickbait" → learns a demotion for `clickbait`; "already seen" → cluster fold; "too shallow" → `depth`; "promo" → `promotional` |
-| 👍 + "more like this" | label +1 | offers to create/strengthen a card (see below) |
-| opened + dwell ≥ N s, then returned | weak positive (weight 0.3) | personal model |
-| "Did you like it?" prompt after return (from FeedIt `todo.txt`) | label | asked mainly for *Maybe*-lane items, since that is where a label is worth the most |
-| marked read without opening | weak negative (weight 0.1) | personal model (optional, off by default) |
-| bookmark / share / label assigned | strong positive | personal model |
-
-**Proposing new interest cards without text generation.** Jev can't write card text. Generative LLMs are approved only for fallback and translation
-(§7.6), so card proposals come from the library and from the user:
-
-1. **Library pick (Jev only).** Keep a curated library of a few hundred cards organized by the same topic
-   taxonomy. When a user likes several articles no current card explains (all their card P's < 0.3), run
-   one Choice with the library cards under the matching `topic_l1` branch as options. The top 1–3 become
-   suggestions: "Looks like you enjoy *Space launches*. Add as an interest?"
-2. **"Make a card from this" (user-written).** On a liked article that no card explains, the UI opens a
-   card editor prefilled with the article's topic path (from Call A) and its title as the first
-   `examples_yes`. The user writes or edits the one-line interest. A new card is backfilled over recent
-   articles, so its effect shows immediately.
-3. **Library growth.** Popular user-written cards (identical normalized text held by several users, or
-   close variants merged by an admin) are promoted into the shared library. The library grows from real
-   use, with no generative model involved.
-
-LLM-drafted card suggestions were considered and set aside. They can come back if the LLM policy in §7.6
-changes.
-
-### 3.4 Labels
-
-A label is a user-authored description, e.g. *"Worth sending to the team: concrete, technical, about our
-stack (Postgres, TypeScript)"*. Each label becomes a Noul in Call B, handled exactly like an interest
-card, and is suggested when P ≥ 0.8 (FeedIt's existing "tap to make permanent" UI). Once a user has
-assigned a label several times, the most recent assignments become its examples. This replaces word-overlap
-label prediction.
-
-### 3.5 What stays deterministic (and must not be asked of Jev)
-
-Following the jaggedness list: dates, ages, counting, word counts, prices and currency comparisons ("deals
-under 100 €"), language detection, dedup keys, and time-based mutes are all **computed in code** and, where
-useful, passed *into* state as typed facts (`"price_eur": 89`, `"is_under_user_budget": true`). The old
-FeedIt number-and-unit merging ("5kg") and currency ideas live here as extractors, not as model questions.
-If a price has to be *found* in messy text, the pre-parsed-value cookbook pattern applies: a regex finds the
-candidates and a Jev Choice picks the right one.
-
----
-
-## 4. Architecture
-
-### 4.1 Stack (decided: TypeScript monorepo)
-
-- **TypeScript on Node 22, as a monorepo** (pnpm workspaces). This continues DreamCatcher's language, and the
-  official `@typesafe-ai/sdk` is TS/JS.
-- **PostgreSQL 16** as the only stateful service at the start. Includes the job queue (`pg-boss`), full-text
-  search (tsvector with `simple` + language-specific configs), and optional `pgvector` later.
-- **API:** Fastify (or Hono) with typed routes, and passwordless email codes as in FeedIt.
-- **Web client:** a PWA (Ionic or plain web components, as in FeedIt; React/Solid are fine too). Keep the
-  swipe and keyboard training and the lane UI. Mobile-first.
-- **Observability:** OpenTelemetry (kept from DreamCatcher) plus a `jev_calls` table that is the audit log.
-- **Deployment:** a single `docker compose` with postgres, api, worker(s) and web. Scale workers
-  horizontally. Introduce Kafka/Redis only if a measured bottleneck requires it.
-- **Monorepo tooling:** pnpm workspaces + Turborepo, TypeScript project references, Vitest, ESLint +
-  Prettier, and Drizzle (or Prisma) with **one** schema and migrations owned by `packages/db`. This avoids
-  DreamCatcher's vendored-copy drift.
-
-**Monorepo layout (decided):**
-
-```
-apps/
-  api/          Fastify: auth, feeds, subscriptions, reading, feedback, cards, labels, admin
-  web/          PWA: lanes, swipe/keyboard rating, "Why this?", card editor, settings
-  worker/       all pipeline stages as pg-boss job handlers (one image, stage chosen by env or queue)
-  eval/         CLI: golden-set replay, engine comparison, threshold tuning, cost reports
-packages/
-  db/           schema, migrations, typed queries, tenant-scoped repositories
-  engine/       DecisionEngine interface + TypeSafeEngine, GatewayEngine, DegradedEngine, LlmFallbackEngine, LayaEngine
-  questions/    versioned question sets (Call A, Call B builders, cluster check) + sha256 hashing
-  feeds/        fetch, parse (RSS/Atom/JSON Feed), canonicalize, dedup, extract (Readability)
-  translate/    optional translation step (LLM or MT), cached per article
-  ranker/       post-rules, lane assignment, per-user logistic model (train + score), calibration
-  shared/       types, config, logging/OTel, errors
-```
-
-### 4.2 Services (logical stages, which can run in one process at first)
-
-```
-scheduler ──► fetch ──► ingest ──► extract ──► enrich(A) ──► match(B) ──► rank-cache
-    ▲            │         │           │            │             │            │
-    │            ▼         ▼           ▼            ▼             ▼            ▼
-    └────── feed stats   articles   article_body  article_facets  card_answers  user_article_scores
-```
-
-| Stage | Responsibility | Ported from |
-|---|---|---|
-| `scheduler` | pick due feeds (subscribed only), enqueue `fetch` jobs | DreamCatcher ControlCenter + `fetchable_feeds` |
-| `fetch` | HTTP with lock, charset, redirects, RSS/Atom/JSON Feed parse; adaptive interval update | DreamCatcher `rss_fetch` + SQL interval functions (and FeedIt's SimplePie tolerance as test fixtures) |
-| `ingest` | canonicalize URL (strip utm_*, AMP, Google News wrappers), content hash, **unique insert**, story-cluster candidate lookup | new; FeedIt's title+description+image dedup rules as fallbacks |
-| `extract` | full-text extraction (use Mozilla Readability instead of the jQuery `:contains()` heuristic), language detection (per article) | DreamCatcher `rss_links_fetch`, improved |
-| `translate` | *only if the Phase 0 language test selects it* (§7.2): translate title + excerpt (+ body lead) of non-English articles to English with the LLM, once per article, cached in `article_translations` | new |
-| `enrich` | Jev Call A; store answers + model version + question-set hash | new |
-| `match` | Jev Call B for cards and labels relevant to the feed's subscribers; also on card creation, a backfill for recent articles | new |
-| `rank` | per-user score and lane, computed on demand for the visible page and cached; recomputed on feedback or card change | replaces FeedIt `links-trainer` + `updateMany` fan-out |
-| `learn` | refit per-user logistic model after N new labels (debounced) | new |
-| `housekeeping` | archive, retention, cap unread per feed, delete old answers of inactive cards | FeedIt `auto-archive*`, `auto-remove` |
-
-**Ordering and latency.** An article is visible (unranked, in "New") the moment it is ingested. Enrich and match
-normally finish within about a second, and the item then moves into its lane. The UI never blocks on Jev.
-
-### 4.3 Data model (Postgres, abbreviated)
-
-```sql
--- shared, global
-feeds(id, url UNIQUE, site_url, title, lang_hint, fetch_interval_min, next_fetch_at, last_fetch_at,
-      error_count, quarantined_until, stats JSONB, subscriber_count)
-articles(id, feed_id, canonical_url, url, title, author, categories TEXT[], excerpt, img,
-         published_at, fetched_at, lang, word_count, content_hash,
-         story_cluster_id, UNIQUE(feed_id, canonical_url))
-article_bodies(article_id PK, body_text, extracted_at, extractor_version)
-article_translations(article_id, target_lang, title, excerpt, body_lead, engine, created_at,
-                     PRIMARY KEY(article_id, target_lang))
-story_clusters(id, representative_article_id, created_at)
-
--- Jev results (append-only, versioned)
-question_sets(id, kind 'enrich'|'match', sha256, definition JSONB, created_at)
-jev_calls(id, kind, article_id, question_set_id, model_version, input_tokens, latency_ms,
-          status, error, created_at)
-article_facets(article_id, question_set_id, model_version, answers JSONB,   -- raw Call A answers
-               PRIMARY KEY(article_id, question_set_id))
-interest_cards(id, text_hash UNIQUE, body JSONB, topic_nodes TEXT[], origin 'library'|'user'|'fork',
-               parent_card_id, created_by)
-card_answers(article_id, card_id, p REAL, model_version, created_at, PRIMARY KEY(article_id, card_id))
-
--- tenancy + per-user
-users(id, email_hash, locale, tz, created_at, plan)
-subscriptions(user_id, feed_id, title_override, folder, allow_duplicates, PRIMARY KEY(user_id, feed_id))
-user_cards(user_id, card_id, strength 'must'|'love'|'like'|'never', created_at)
-user_labels(user_id, label_card_id, name)
-user_rules(user_id, kind 'mute_keyword'|'mute_story'|'block_source'|'boost_source', value, expires_at)
-user_article(user_id, article_id, read_at, rating SMALLINT, reason TEXT, dwell_ms, bookmarked,
-             labels TEXT[], lane, p_like REAL, rules_fired TEXT[], scored_at,
-             PRIMARY KEY(user_id, article_id))
-user_models(user_id, version, coef JSONB, calibration JSONB, n_labels, trained_at)
-```
-
-- Rows are created lazily: a `user_article` row exists only once a user sees or acts on an article. The
-  per-user unread view is a query over `articles` joined to the user's `subscriptions`.
-- `article_facets` and `card_answers` keep raw answers, so **changing a threshold never needs an API call**.
-  Changing a *question* creates a new `question_set` and triggers a (cheap) re-enrichment of recent articles.
-
-### 4.4 A decision-engine abstraction (vendor risk)
-
-Jev is new: early access, "rate limits adjusting dynamically", signups paused and resumed in September 2026.
-All Jev access therefore goes through one package:
-
-```ts
-interface DecisionEngine {
-  ask<Q extends Questions>(state: JsonValue, questions: Q, opts?: {model?: string; signal?: AbortSignal})
-    : Promise<{ answers: AnswersFor<Q>; model: string; usage: { inputTokens: number }; latencyMs: number }>;
-}
-```
-
-- **Implementations:**
-  - `TypeSafeEngine`: the SDK, direct API.
-  - `GatewayEngine`: the same model via Vercel AI Gateway (`typesafe-ai/jev`) or OpenRouter (`typesafe/jev-1.13`). Useful for zero data retention and as a failover path.
-  - `DegradedEngine`: no model at all. Keyword-baseline ranking, everything goes to *Maybe*, and articles are queued for re-scoring. This is the default fallback on the CPU-only box (§4.6).
-  - `LlmFallbackEngine`: turns Choice/Score/Noul into a strict JSON schema for any structured-output LLM (Ollama Cloud GLM). Newsjack has this adapter. It is slower and concurrency-limited, so it is used only for a trickle of articles (§4.6).
-  - `LayaEngine`: the open-weights Laya model, self-hosted through the Jev-compatible ONNX port `receptron/laya`. It needs fine-tuning before it is useful; it is a candidate for SK/CZ enrichment. See [`laya-multilingual.md`](./laya-multilingual.md).
-- **Operational rules copied from newsjack:**
-  - a concurrency pool
-  - 4 attempts with exponential backoff on 429/5xx, honouring `retry-after`
-  - a failed article goes to the *Maybe* lane, never hidden
-  - more than 20 % failures in a window, or an exhausted daily spend budget (§4.6), trips a circuit breaker to the fallback chain
-- **Pin the model version** (`jev-1.13.0`, not `jev-latest`) in production. On a new release, replay the eval
-  set (§6) before switching.
-
-### 4.5 Multi-tenancy from day one
-
-The shared article layer (feeds, articles, facets, card answers, translations) is global by design. Only
-what a user *does* is tenant data. What that requires from day one:
-
-- **Isolation.**
-  - Every per-user table carries `user_id` in its primary key, and all access goes through tenant-scoped
-    repositories in `packages/db`, never raw queries in route handlers.
-  - Postgres **row-level security** on per-user tables serves as a second line of defence (`SET app.user_id`
-    per request/transaction).
-  - Workers that touch per-user data (ranker, learner) take the `user_id` from the job payload, and the same
-    policies apply to them.
-- **Card privacy.**
-  - Card dedup is by normalized-text hash, so two users can share the same card *row*. They never see each
-    other's cards, examples or strengths.
-  - A card with personal examples is always a private fork. Its examples (the user's liked titles) are
-    used only in that user's questions.
-  - Library cards are public. A user card is promoted to the library only through an explicit admin step
-    and only when several users hold it.
-- **Quotas per plan** (enforced in the API, with counts stored on `users`):
-  - feeds per user
-  - cards and labels per user
-  - personal-example forks per user
-  - the minimum fetch interval of feeds they add
-  - OPML import size
-
-  These bound the only per-user Jev costs: card forks and backfills.
-- **Fairness in the queue.**
-  - pg-boss jobs carry `tenant_id` where per-user (backfills, model refits), with per-tenant concurrency
-    limits, so one user importing 500 feeds or creating 50 cards can't starve everyone else.
-  - Shared stages (fetch, enrich, match) are keyed by feed or article, not by user.
-- **Cost attribution.**
-  - Every `jev_calls` row records which cards were asked. Shared Call A cost is platform overhead. Call B
-    cost is split across the subscribers holding each card.
-  - Card-fork and backfill costs go to the owning user.
-  - This gives per-tenant $/day for plan design and abuse detection.
-- **A safe fetcher.** Users can add arbitrary URLs, so the fetcher is an SSRF risk from day one.
-  - Resolve DNS and block private, link-local and metadata IP ranges, including after redirects.
-  - Cap response size and time, and allow only http(s).
-  - Keep TLS verification on (DreamCatcher's `rejectUnauthorized: false` must not return).
-  - Rate-limit feed additions per user.
-- **Auth and accounts.**
-  - Passwordless email codes with rate limiting, per-device session tokens, and account deletion that
-    removes all per-user rows plus private card forks.
-  - Data export (OPML, cards, ratings) covers GDPR access and portability.
-- **Personal models** are stored per user (`user_models`) and trained only on that user's labels. There is
-  no cross-user learning in v1, with one exception: *anonymized aggregate* counts may later help order the
-  card library.
-- **Invite-only signup (launch decision).**
-  - Invites are admin-issued or come from existing users (N invites each, configurable). An `invites` table
-    records code, inviter, invitee, used_at and expires_at, and a public waitlist form feeds the admin queue.
-  - Invites are the main cost-control lever. The number of active users bounds the number of distinct cards
-    and forks, and so the Jev and translation spend.
-  - Opening signup later is a config flag, not a redesign.
-- **Admin surface** (in `apps/api`, role-gated): the card library, feed health, the engine circuit-breaker
-  state, and per-tenant usage.
-
-### 4.6 Hosting: one self-hosted box, minimal spend, no GPU
-
-**Target machine.** One dedicated-CPU server or VPS with **8 vCPU / 16–32 GB RAM / NVMe** (a few tens of €
-per month at budget providers). It runs:
-
-- Postgres
-- `api`, `worker` and `web`
-- the translation service (if used)
-- later, Laya through ONNX
-
-Everything runs under one `docker compose`. There's no Kafka, Redis, Elasticsearch or GPU. Backups go
-to object storage (`pg_dump` + WAL archiving).
-
-**What "no GPU" rules out, and what it doesn't:**
-
-| Component | CPU-only verdict |
+| Term | Meaning |
 |---|---|
-| Jev (Call A/B, clusters) | ✅ remote API: nothing runs locally |
-| Readability extraction, dedup, ranker, personal logistic models | ✅ trivial on CPU |
-| Dedicated MT models (OPUS-MT / Argos / LibreTranslate) | ✅ designed for CPU. See the translation table below |
-| Laya-multilingual through ONNX | ⚠️ about 140–460 ms per call on a decent CPU is fine at invite-only scale, but a small 4 vCPU VPS measured **49 s per call**, so it needs a real 8-core-class CPU. Fine-tuning uses free Kaggle GPUs and never touches the server |
-| Generative LLM | ✅ not local: **Ollama Cloud** (remote API), used only as a fallback |
-
-**Translation: a free local model first, Ollama Cloud GLM as the fallback** (only needed if Phase 0 selects
-option (c), §7.2):
-
-| Tier | Backend | Runs on | SK/CZ → EN quality | Speed | Cost |
-|---|---|---|---|---|---|
-| **1 · primary** | **OPUS-MT** (`Helsinki-NLP/opus-mt-sk-en`, `opus-mt-cs-en`: small Marian models of about 300 MB each, served through CTranslate2 int8) **or LibreTranslate** (a ready-made self-hosted service with `sk→en` / `cs→en` Argos packages) | the box's CPU, about 1 GB RAM for both language pairs | adequate: literal, sometimes clumsy, but the *gist* survives, which is what classification needs | tens to hundreds of ms per title + excerpt; thousands of articles/hour | **€0** |
-| **2 · fallback** | **Ollama Cloud**, `glm-5.3-flash` (or `glm-5.3` for harder text) through its HTTP API with `OLLAMA_API_KEY` | remote | better on idioms, slang and headlines | seconds per call; concurrency 1 on the Free plan, 3 on Pro, 10 on Max | per 1M tokens: `glm-5.3-flash` $0.15 in / $0.50 out, `glm-5.3` $1.40 / $4.40, cheaper off-peak. Title + excerpt (≈250 in + 200 out) costs about **$0.00014/article** on flash |
-
-**When tier 2 is used:**
-- OPUS-MT fails (an error, or empty or garbled output detected by simple heuristics such as length ratio and the
-  share of untranslated words).
-- An article lands in *Maybe* **and** the tier-1 translation looks weak. It is re-translated with GLM and
-  re-asked once.
-- The admin enables it for specific feeds known to be hard (slang, heavy idioms).
-
-Every translation stores its `engine`, so results can be compared later and a tier-2 re-translation never
-overwrites the tier-1 row. Ollama Cloud states that prompt and response data are never logged or trained on,
-and that it hosts primarily in the US.
-
-**Key point for Phase 0:** translation quality is measured by its **effect on classification**, not by
-reading the translations. Run the golden set's SK/CZ articles through Jev three ways (native, OPUS-MT → EN,
-Ollama Cloud GLM → EN) and compare AUC and accuracy. If OPUS-MT is within a point or two of GLM, the free
-model wins outright. The likely outcome is that Jev only needs the gist.
-
-**The fallback engine on a CPU-only box.** When Jev is unavailable:
-
-1. **`DegradedEngine` (default):**
-   - rank with the keyword baseline (BM25 of card text against title + excerpt), which already exists for evaluation
-   - put everything in the *Maybe* lane rather than hiding anything
-   - queue the articles for re-scoring when Jev is back
-
-   It costs nothing and is always available.
-2. **`LlmFallbackEngine` on Ollama Cloud (optional, off by default):** the same Choice/Score/Noul question
-   sets rendered as a JSON-schema prompt for `glm-5.3-flash`.
-   - A Call A-sized request (≈2k in + ≈300 out) costs about $0.00045.
-   - Concurrency limits mean it suits a trickle, such as articles a user is actively viewing, rather than the
-     full ingest backlog.
-   - Its answers are marked `engine = llm` and re-scored by Jev when Jev returns, because the personal model's
-     features must come from one engine.
-3. **`LayaEngine`**, once fine-tuned (`laya-multilingual.md`), becomes the main fallback for Call A.
-
-**Spend guard.** A daily budget, in `$` from `jev_calls.input_tokens` (and translation calls if they go to a
-Ollama Cloud). When it's exhausted, new articles go to `DegradedEngine` until midnight UTC, and an admin alert
-fires. At invite-only scale, Jev costs dollars per day (see `jev-questions.md` §5), so the cap is a safety
-net rather than a normal operating mode.
+| **Interest card** | A plain-language description of what a reader wants ("EV battery chemistry, not stock news"). Shared when the text is identical; a **fork** when it has personal examples. Strength: must / love / like / never |
+| **Label** | A user-defined tag with a definition; asked like a card, suggested when p ≥ 0.8 |
+| **Call A / enrich** | Jev call with the fixed question set `enrich-v1` about one article |
+| **Call B / match** | Jev call with one yes/no question per pending card (plus level-2 topic questions) about one article |
+| **Lane** | `new`, `for_you`, `maybe`, `everything`, `hidden` (spec 06 §6) |
+| **Tier** | 1–5 from P(like); FeedIt's slider |
+| **Degraded** | No model answer available; BM25 ranking, Maybe lane only |
+| **Golden set** | The rated articles and facet labels collected in M3a; used for G1 and every later replay |
+| **G1** | The gate after M3b that sets language modes, card text mode and thresholds, or stops the project |
+| **Engine router** | The only entry point to decision models (spec 04) |
 
 ---
 
-## 5. Specific product mechanics
+## 4. Milestone map
 
-### 5.1 Onboarding: useful from the first minute
+```
+M0 Foundations
+ ├─► M1 Ingestion ─────────┐
+ └─► M2 Classification ────┼─► M3a Eval tooling ─► [humans rate ~1–2 weeks] ─► M3b G1 gate ─┐
+                           ├─► M4 API ──────────┐                                            │
+                           └─► M5 Ranking ──────┴─► M6 Web app ─► M7 Learning ─► M8 Ops & launch ─► 🚀 invite-only beta
+                                                                                              ▲
+                                                               (M3b decisions applied before)─┘
+M9 Optional extensions (Laya, image proxy, …): after launch
+```
 
-1. Add feeds (URL, site discovery, OPML import) or pick starter bundles.
-2. "What are you here for?" offers library interest chips grouped by the topic taxonomy, plus free-text
-   interests. Optionally, "never show me…" anti-interests.
-3. Articles already in the global store for those feeds are ranked immediately. Call A answers exist
-   already, and Call B runs only for cards not yet asked, a few seconds of backfill.
-4. The first session shows a *calibration round*: 10 Maybe-lane articles to swipe. That replaces FeedIt's
-   "train 200 articles before tiers work".
+| Milestone | Depends on (merged) | Can run in parallel with | Autonomous? | Size |
+|---|---|---|---|---|
+| **M0** Foundations | — | — | yes | M |
+| **M1** Ingestion core | M0 | M2 | yes (the fixture server is local) | L |
+| **M2** Decision engine & classification | M0 | M1 | yes (fixtures only) | L |
+| **M3a** Evaluation tooling & golden-set collection | M1, M2 | M4, M5 | yes, then a **human step** | M |
+| **M3b** Run gate G1 | M3a + human ratings | M6, M7 | yes (needs API keys and network) | S |
+| **M4** HTTP API | M0, M2 (for `packages/questions`) | M3a, M5 | yes | L |
+| **M5** Ranking & lanes | M2 | M3a, M4 | yes | M |
+| **M6** Web app (PWA) | M4, M5 | M3b | yes | L |
+| **M7** Personal learning & suggestions | M4, M5 (M6 for UI hooks) | M8 | yes | M |
+| **M8** Operations & launch readiness | M4, M5, M6 (and M3b applied) | M7 | mostly (one-time host setup is manual) | M |
+| **M9** Optional extensions | launch | — | per item | — |
 
-### 5.2 "Why this?" (the successor to the detailed-training modal)
-
-It shows:
-
-- the matched cards with their probabilities (as bars)
-- article facets (type, topic path, depth, clickbait, promo)
-- the rules that fired
-- for learned users, the top 3 contributing features
-
-Every line is actionable:
-
-- "not really about *EV batteries*" adds the article to that card's `not_for` examples
-- "never show promo" creates a rule
-- "boost this source"
-
-This keeps FeedIt's best idea, direct manipulation of *why* an article scores, without exposing raw word
-weights.
-
-### 5.3 Duplicates and story clustering
-
-1. **Exact:** the canonical URL + content hash unique key.
-2. **Near-duplicate candidates:** a title-trigram similarity (Postgres `pg_trgm`) or MinHash within a 72 h
-   window, top 5 candidates.
-3. **Verification:** one Jev call per new article, with state `{new, candidates[]}`. Questions:
-   - a Choice "which candidate reports the same story" (options = candidate ids + `none`)
-   - a Noul "same event, not merely same topic"
-
-   This follows the re-ranking / entity-alignment cookbook pattern: cheap retrieval first, Jev judges.
-4. The UI folds clusters: "+3 sources". "Mute this story" mutes the cluster, which covers FeedIt's
-   temporary-keyword-mute todo.
-
-### 5.4 Per-feed settings that survive
-
-Allow duplicates, language override, title override, folder, and *feed-scoped cards* (a card that applies
-only to one feed, e.g. a classifieds feed (bazos.sk) → "road bikes, size L, under 800 €", with the price
-checked in code).
+**Shared files between parallel milestones:**
+- `apps/worker/src/pipeline.ts` and `apps/worker/src/main.ts` are created in M0 with a stub for every
+  stage. M1 fills extract/fetch, M2 fills translate/enrich/match/cluster, M5 fills rank.
+- Queue registration is table-driven (`handlers/index.ts` exports one map), so parallel branches only
+  add entries.
+- Merge conflicts in that map are trivial and resolved at merge time.
 
 ---
 
-## 6. Evaluation: know it works before trusting it
+## 5. M0: Foundations
 
-The cost of Jev calls is small enough that evaluation can be continuous:
+**Outcome:** an empty repository becomes a working monorepo. It has tooling, CI, config, the full
+database schema with RLS, test infrastructure, and runnable (stub) apps, so every later milestone only
+adds code.
 
-- **Golden set, built from scratch.** No FeedIt data is reused (§7.6), so Phase 0 builds a new one:
-  - Ingest about 2 weeks of articles from a real mix of EN/SK/CZ feeds.
-  - Recruit **3–5 raters** (Martin plus a few testers with different tastes; multi-tenant means the ranking must work for more than one person's taste). Each writes 5–10 interest cards *before* rating, then rates about 300 articles in a bare-bones rating page (`apps/eval`), about 100 per language where their feeds allow.
-  - Separately, hand-label about 100 articles per language for the Call A questions (content type, clickbait, promo, depth, topic). This is the accuracy check for enrichment, and the clean test set for Laya later.
-  - Freeze it as `golden-v1` and grow it later with opted-in, anonymized production feedback.
-- **What to measure on it:**
-  - AUC and precision@k of card-based ranking vs. two cheap baselines: **chronological** order and a **keyword baseline** (BM25 of card text against title + excerpt). Jev has to clearly beat keyword matching to justify itself.
-  - learning curves of the personal model (how many labels to reach X)
-  - calibration (reliability diagram of P(like) vs. actual like rate)
-  - the same metrics split **per language** (EN / SK / CZ)
-- **Per-release replay.** Store `question_set.sha256` + `model_version` with every answer. Any change to
-  questions, thresholds or model version runs the golden set and posts a diff.
-- **Online metrics:**
-  - like rate per lane (it should be monotonic with the tier)
-  - Maybe-lane size (it should shrink over time)
-  - share of hidden articles later found and liked (the *regret rate*, which must stay very low)
-  - Jev p50/p95 latency, error rate, $/day
-- **Criteria-wording iteration** (newsjack doctrine): when a card misfires, fix the card text and examples,
-  not the thresholds.
+**Read first:** spec 01 (all), spec 02 (all), spec 03 §2 (queue names), spec 08 §6 (plans), §3.1
+(preferences).
+
+**Goal text** (paste after `/goal `):
+
+```
+Complete milestone M0 "Foundations" exactly as specified in docs/PLAN.md §5, following docs/specs/01-architecture.md and docs/specs/02-data-model.md. Start by reading PLAN.md §0–§5 and those specs, then create one task per row of the M0 task table and implement them in dependency order, using subagents for tasks in different lanes whose dependencies are met. Commit each task separately as "<task-id>: <summary>". Constraints: do not change locked decisions in PLAN.md §2; log any spec deviation in docs/DECISIONS.md and update the spec in the same commit; no live third-party calls in tests; do not implement later milestones beyond the stubs M0 asks for. The goal is met only when the transcript shows (1) a final "M0 report" in the format of PLAN.md §0.4 listing M0-T1…M0-T8 each with ✓, commit hash and evidence, and every M0 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, and (3) `git status --short` printing nothing. Or stop after 120 turns and print the report with the unfinished items.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M0-T1 | Monorepo scaffold and tooling | — | A | 01 §1–2, §5–6 |
+| M0-T2 | `packages/shared` | T1 | A | 01 §3, §5; 08 §3.1, §6 |
+| M0-T3 | Infra: compose files, Postgres init, Caddy skeleton | T1 | B | 01 §4, §8; 02 §1; 11 §2 |
+| M0-T4 | `packages/db`: schema, migrations, RLS, functions, `withTenant` | T2, T3 | A | 02 all |
+| M0-T5 | `packages/testing`: test DB helper, factories, fixture server | T1 | C | 01 §5–6 |
+| M0-T6 | Seed and settings mechanism | T4 | A | 02 §2; 05 §2 (mechanism only) |
+| M0-T7 | App skeletons (api, worker, web, eval) and `pipeline.ts` stubs | T2 | B | 01 §2, §4; 03 §1–2; 08 §10 |
+| M0-T8 | CI workflow and `CLAUDE.md` | T1 | C | 01 §7, §10 |
+
+**Done when** (per task):
+
+- **T1:**
+  - `pnpm i` succeeds.
+  - Every app and package from spec 01 §2 exists with `package.json`, `tsconfig.json`, `src/index.ts`
+    and one placeholder test.
+  - Strict TS flags are set.
+  - The ESLint boundary rules are configured, and a test asserts that a forbidden import (e.g.
+    `packages/ranker` → `packages/db`) is reported.
+  - `docs/` contains this plan.
+- **T2:**
+  - The config loader covers **every** variable in spec 01 §3, with defaults and zod validation.
+  - Tests: missing `DATABASE_URL` fails; `FETCH_ALLOW_PRIVATE=true` with `NODE_ENV=production` fails.
+  - Logger factory, `AppError` with codes (spec 08 §1), UUID v7 and bigint-string helpers, an
+    injectable clock, `plans.ts`, and the `UserPreferences` schema with defaults (unit-tested).
+  - `normalizeText` (spec 03 §6.1) lives here, because both `feeds` and `ranker` use it. It has tests
+    with Slovak diacritics.
+- **T3:**
+  - `infra/compose.dev.yml`: postgres, and libretranslate under the `translate` profile.
+  - `infra/compose.test.yml`.
+  - `infra/postgres/init.sql` creates the extensions and the three roles.
+  - `docker compose -f infra/compose.test.yml up -d` works, and a `psql` check lists the `citext`,
+    `pg_trgm` and `pgcrypto` extensions and the roles.
+- **T4:**
+  - Drizzle schema plus SQL migrations reproduce spec 02 §2–§6 exactly, including indexes, checks,
+    grants, RLS policies, and `refresh_feed_cards` / `refresh_feed_subscribers`.
+  - `pnpm db:migrate` works on an empty DB.
+  - `withTenant(db, userId, fn)` and the branded `TenantTx` type exist.
+  - Integration tests:
+    - for **every** per-user table: no `app.user_id` → 0 rows; user A cannot select, insert, update
+      or delete B's rows
+    - the refresh functions produce the expected rows for a seeded scenario
+- **T5:**
+  - A test DB helper: migrate once, truncate between tests.
+  - Factories for user, feed, article, card, subscription.
+  - A local HTTP fixture server helper (serves files and scripted redirects/status codes), used by T4
+    or a smoke test.
+- **T6:**
+  - `pnpm db:seed` runs idempotently.
+  - It inserts default `settings` rows (budget, language modes, card text mode, question_sets.active
+    placeholder).
+  - It provides hooks that M2 fills (topics, question sets, library).
+  - Running it twice changes nothing (tested).
+- **T7:**
+  - `apps/api` `buildServer()` with `/api/v1/healthz` and `/readyz` (inject tests).
+  - `apps/worker`:
+    - boots pg-boss
+    - registers handlers from a table-driven map with a **stub for every queue** in spec 03 §2 (each
+      stub logs and completes)
+    - `pipeline.ts` has the `after(stage, …)` function with the stage order of spec 03 §1
+  - `apps/web`: a Vite + React + TanStack Router + Tailwind + i18next shell rendering a localized
+    "FeedIt" page.
+  - `apps/eval`: a commander CLI with `--help`.
+  - `pnpm dev` starts api, worker and web (logs shown).
+- **T8:**
+  - `.github/workflows/ci.yml` per spec 01 §7 (without Playwright).
+  - `CLAUDE.md` with the exact text of spec 01 §10.
+  - The CI commands run locally and succeed (output shown).
+
+**Milestone done when:** all tasks are done; the full check passes; `pnpm dev` serves `GET /api/v1/readyz → 200`;
+the RLS test covers all tables in spec 02 §4.
 
 ---
 
-## 7. Risks and open questions
+## 6. M1: Ingestion core
 
-### 7.1 Vendor/model risk
+**Outcome:** subscribed feeds are fetched safely on an adaptive schedule, and articles are stored
+once, deduplicated across feeds, with extracted text and detected language. The pipeline stops after
+`extract` until M2 adds later stages.
 
-Jev is new and single-vendor. The mitigations are the `DecisionEngine` abstraction, the LLM fallback, pinned
-versions, stored raw answers, and the fact that no user data is locked into the vendor (cards are plain text).
+**Read first:** spec 03 (all), spec 02 §3, spec 01 §5.
 
-### 7.2 Language (important for Slovak/Czech feeds)
+**Goal text:**
 
-TypeSafe states that English is the primary training language and other languages are lower-accuracy. The
-options, to be decided by the eval (§6), not upfront:
+```
+Complete milestone M1 "Ingestion core" exactly as specified in docs/PLAN.md §6, following docs/specs/03-ingestion.md, docs/specs/02-data-model.md §3 and the conventions in docs/specs/01-architecture.md. Read PLAN.md §0, §2, §6 and the referenced specs first, create one task per row of the M1 task table, and implement them in dependency order, running tasks from different lanes in parallel with subagents when their dependencies are met. Commit each task as "<task-id>: <summary>". Constraints: locked decisions in PLAN.md §2 are not changed; spec deviations go to docs/DECISIONS.md with the spec updated in the same commit; tests use local fixtures only (no internet); do not implement M2+ stages beyond calling the existing pipeline stubs. The goal is met only when the transcript shows (1) a final "M1 report" in the format of PLAN.md §0.4 listing M1-T1…M1-T10 each with ✓, commit hash and evidence, and every M1 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, including the M1 end-to-end ingestion test by name, and (3) `git status --short` printing nothing. Or stop after 200 turns and print the report with the unfinished items.
+```
 
-- **(a)** Send native text and rely on it. Measure on the golden set first (§6), which is deliberately
-  balanced across EN/SK/CZ.
-- **(b)** Keep the questions and card text in English but the state in the native language. The model then
-  handles cross-lingual matching. It is often better than fully native prompts, but that needs to be
-  measured.
-- **(c)** Translate the title + excerpt (+ body lead) to English before Call A/B, and store the translation
-  (`article_translations`). Translation happens once per article and is shared by all tenants. On the
-  CPU-only box the primary path is a **dedicated MT model** (OPUS-MT / LibreTranslate, free and fast on
-  CPU). **Ollama Cloud GLM** is the fallback for failures and weak translations. Backends and numbers are
-  in §4.6.
+**Tasks**
 
-- **(d)** Fine-tune the open-weights **Laya-multilingual** model (Apache 2.0, mmBERT-base) on EN/SK/CZ
-  data labelled by a teacher, and route SK/CZ articles to it for the fixed enrichment questions. Laya is
-  near random zero-shot, so it can't replace Jev for free-form interest cards without further work. The
-  full analysis is in [`laya-multilingual.md`](./laya-multilingual.md).
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M1-T1 | `safeFetch` (SSRF guard, redirects, limits, charset decoding) | — | A | 03 §4 |
+| M1-T2 | `canonicalizeUrl`, `url_key`, tracking-param list | — | B | 03 §5 |
+| M1-T3 | `parseFeed`, `normalizeItem`, sanitizing, `title_norm`, `content_hash`, feed fixtures | — | B | 03 §6, §12 |
+| M1-T4 | `nextSchedule` adaptive interval, with simulations | — | C | 03 §9 |
+| M1-T5 | `detectLanguage` | — | C | 03 §8.3 |
+| M1-T6 | Extraction: skip list, robots, Readability, body lead, canonical detection, politeness limiter | T1 | A | 03 §8 |
+| M1-T7 | Feed discovery and OPML parse/export | T1, T3 | A | 03 §10–11 |
+| M1-T8 | Worker handlers: `feed.schedule`, `feed.fetch` (ingest §7, redirects/merge), `article.extract` (alias/merge) | T1–T6 | D | 03 §1–3, §7–9 |
+| M1-T9 | End-to-end ingestion integration test | T8 | D | 03 all |
+| M1-T10 | Dev CLI: `feeds:add`, `feeds:fetch-now`, `feeds:show` | T8 | D | 03 §10 |
 
-The recommendation is to prototype (a) and (b) on the golden set in week 1, with Laya zero-shot as a
-baseline. Adopt (c) if both underperform, and start (d) in parallel only if SK/CZ accuracy stays
-clearly below EN.
+**Done when:**
 
-### 7.3 Adversarial or promotional content
+- **T1:**
+  - Tests cover every blocked IPv4/IPv6 range, a redirect from a public URL into `127.0.0.1` (blocked),
+    a > 5 hop chain, a disallowed port, the decompressed-size cap, and a timeout.
+  - A windows-1250 feed and a `<meta charset>` page decode correctly.
+  - Returns the result union and never throws for network or HTTP errors.
+- **T2:** ≥ 40 table-driven cases pass (IDN, repeated params, fragments/hash-bang, tracking params, AMP
+  unchanged, linkless `urn:feedit` keys).
+- **T3:**
+  - Every fixture in spec 03 §12 parses to the expected `NormalizedItem`s (snapshots).
+  - The lenient XML retry fixes the unescaped-`&` fixture.
+  - Sanitizer tests pass: scripts stripped, links rewritten, pixels removed.
+- **T4:**
+  - Unit tests cover every branch of spec 03 §9.
+  - The 60-day simulations for the four archetypes assert interval bounds: a busy feed stays
+    ≤ 30 min, a daily blog ≤ 12 h, a weekly podcast reaches ≥ 24 h, and a broken feed is quarantined
+    and then recovers.
+- **T5:** ≥ 30 labelled samples (10 each EN/SK/CZ) with ≥ 90 % accuracy; the Slovak/Czech tie-break with
+  a hint is tested; short text uses the hint.
+- **T6:**
+  - HTML fixtures: normal article, paywall teaser, AMP with `rel=canonical`, windows-1250 meta, list
+    page (→ `no_content`).
+  - Each produces the expected status, `body_lead` (≤ 1,500 chars, sentence-cut) and word count.
+  - robots disallow → `blocked`.
+  - A limiter test proves ≤ 2 concurrent requests and ≥ 1 s spacing per origin (fake timers).
+- **T7:**
+  - Discovery covers: a direct feed, HTML with `<link rel=alternate>` (one or several → candidates), a
+    fallback path probe, and not-a-feed.
+  - OPML import covers nested folders, duplicates and invalid lines; the export round-trips.
+- **T8:**
+  - Handlers implement spec 03 §7 (exact/guid/near-duplicate matching, stale marking, title-change
+    re-processing) and §9 feed updates, including the permanent-redirect merge.
+  - `article.extract` performs the redirect/`rel=canonical` alias and merge, then calls
+    `pipeline.after('extract')`.
+- **T9:** a single named test, `ingestion.e2e.test.ts`, uses the local fixture server: 3 feeds (RSS,
+  Atom, JSON Feed) where 2 share an article, plus article pages, and asserts:
+  - the articles are unique and `feed_items` link both feeds
+  - bodies are extracted and `lang` is set
+  - feed stats and `next_fetch_at` are updated
+  - a Google-News-style redirect merges into the existing article
+  - stale items are not extracted
+- **T10:** the CLI commands work against the dev DB (output shown on a fixture feed).
 
-Article text can argue for its own classification. The mitigations:
+**Milestone done when:** all tasks are done, the full check passes, and coverage of `packages/feeds`
+is ≥ 80 % (shown).
 
-- Jev only sees data in state
-- post-rules never *hide* on a single low-confidence answer
-- promotional content is explicitly modelled
+---
 
-### 7.4 Cost at scale
+## 7. M2: Decision engine and classification
 
-Cost scales with articles × distinct cards per feed, not with users. §5 of `jev-questions.md` has the
-numbers, which are cents to single dollars per day for thousands of users. Personal example forks are the
-one place where cost grows with each user, so cap them.
+**Outcome:**
+- Articles are enriched (Call A) and matched against interest cards (Call B) through a budgeted,
+  breaker-protected engine router, with optional translation.
+- Story clustering runs.
+- The card lifecycle, library seed and ranker bootstrap (card score + BM25) exist.
+- Everything is tested against recorded fixtures, with no live calls.
 
-### 7.5 Privacy
+**Read first:** spec 04 (all), spec 05 (all), spec 07 (all), spec 06 §4.1 and §9, spec 02 §3.1.
 
-Card texts and ratings are personal data. The article content sent to Jev is public. Only card text and
-example titles leave our system. Vercel AI Gateway supports zero data retention, and TypeSafe offers ZDR on
-enterprise plans.
+**Goal text:**
 
-### 7.6 Decisions (taken 2026-09-24)
+```
+Complete milestone M2 "Decision engine and classification" exactly as specified in docs/PLAN.md §7, following docs/specs/04-decision-engine.md, 05-classification.md, 07-translation.md, and 06-ranking-learning.md §4.1 and §9, with the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §7 and those specs first, create one task per row of the M2 task table, and implement them in dependency order, using subagents for independent lanes. Commit each task as "<task-id>: <summary>". Constraints: Jev is called only through its documented HTTP API from packages/engine; no live calls to TypeSafe, Ollama or LibreTranslate in tests (use recorded fixtures and fake servers); locked decisions in PLAN.md §2 unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M2 report" in the format of PLAN.md §0.4 listing M2-T1…M2-T11 each with ✓, commit hash and evidence, and every M2 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, including the named tests classification.e2e.test.ts and engine-breaker.int.test.ts, and (3) `git status --short` printing nothing. Or stop after 220 turns and print the report with the unfinished items.
+```
 
-| # | Question | Decision | Consequence in this plan |
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M2-T1 | Engine types and answer normalization | — | A | 04 §1–2 |
+| M2-T2 | `TypeSafeEngine` HTTP client, status handling, fixtures | T1 | A | 04 §3, §10 |
+| M2-T3 | `EngineRouter`: retries, priority semaphore, rate limiter, breaker, spend guard, logging, `usage_daily` | T2 | A | 04 §4–7 |
+| M2-T4 | `LlmFallbackEngine` (Ollama Cloud), off by default | T1 | B | 04 §8 |
+| M2-T5 | `packages/questions`: canonical JSON/hash, builders, taxonomy, `enrich-v1`, `cluster-v1`, `suggest-v1`, card and label builders, packing, `flattenFacets` | — | C | 05 §2–6 |
+| M2-T6 | Card library seed (≥ 150 cards) plus seeding of topics, question sets and library | T5 | C | 05 §8, §2 |
+| M2-T7 | `packages/translate`: LibreTranslate and Ollama translators, `assessTranslation`, best-row selection | — | B | 07 |
+| M2-T8 | Card lifecycle repository (create/adopt/fork/edit/strength/scope/delete, `feed_cards` refresh, backfill enqueue) | T5 | C | 05 §5.1, §5.3 |
+| M2-T9 | Worker handlers: `article.translate`, `article.enrich`, `article.match`, `card.backfill`, `article.cluster`, `house.rescore-degraded` | T3, T5, T7, T8 | D | 05 §3–6; 07 §3; 04 §5 |
+| M2-T10 | Ranker bootstrap: `cardScore` and BM25 in `packages/ranker` | T5 | E | 06 §4.1, §9 |
+| M2-T11 | Integration tests: classification end-to-end, breaker, budget, degraded path | T9 | D | 04 §10; 05 §11 |
+
+**Done when:**
+
+- **T1:** normalization tests cover probabilities not summing to 1 (renormalize inside tolerance,
+  reject outside), missing or mistyped keys, score recomputation, and entropy confidence.
+- **T2:**
+  - Fixture-based tests for 200 (all three answer types), 401, 422 and 429 (with `Retry-After`).
+  - The request body matches spec 04 §3 exactly (snapshot).
+  - Cost = input tokens × price.
+- **T3:**
+  - Fake-timer tests of the retry schedule.
+  - Breaker transitions (closed → open → half-open → closed), with the doubling open duration.
+  - Auth mode.
+  - Spend guard including the 10 % interactive allowance.
+  - Rate-limiter waits.
+  - One `engine_calls` row per logical call.
+  - Upserts into `usage_daily` (integration).
+- **T4:** schema generation tests for noul/choice/score; post-processing normalizes; malformed JSON
+  fixture → `error`; only used when enabled, interactive and under the daily cap (router test).
+- **T5:**
+  - Hash stability across key order.
+  - `ENRICH_V1` passes the TypeSafe limits (a test).
+  - Taxonomy integrity (20 L1, unique ids, parents exist).
+  - Card/label question snapshots.
+  - Packing with 500 synthetic cards respects both token limits and the count limit.
+  - `flattenFacets` snapshot.
+  - The cluster fold truth table.
+- **T6:**
+  - ≥ 150 library cards, ≥ 5 per L1 (except `other`), ≥ 15 SK/CZ-specific, including the 10 examples
+    of spec 05 §8.
+  - A validation test enforces the authoring rules (length, no "not" in `interest`, topic ids exist).
+  - `pnpm db:seed` inserts them idempotently.
+- **T7:** fake LibreTranslate server (ok/weak/fail/timeout); `assessTranslation` truth table; tier
+  escalation and daily cap; best-row selection.
+- **T8:** repository integration tests for every lifecycle action in spec 05 §5.1, including fork
+  privacy (another user never receives a fork), `feed_cards` refreshed in the same transaction, and
+  backfill queue rows (priorities 2/6, the cap of 500).
+- **T9:**
+  - Handlers implement spec 05 §5.5 exactly (claim with `SKIP LOCKED`, skip answered, prefilter,
+    L2 questions, packing, upserts, attempts).
+  - Degraded enrich sets `pipeline_state='degraded'`.
+  - `pipeline.after` wiring runs extract → (translate) → enrich → cluster + match.
+  - `house.rescore-degraded` re-enqueues degraded and `llm`-answered articles when the breaker is
+    closed.
+- **T10:** unit tests for the strength weights, scope and missing answers; BM25 ordering on a
+  hand-made corpus; `P = 1 − exp(−s/3)`.
+- **T11:**
+  - `classification.e2e.test.ts`: a seeded article, 3 cards and 1 label, with a fake TypeSafe server
+    → `article_facets`, `card_answers`, `article_topics_l2`, and `pipeline_state='matched'`.
+  - `engine-breaker.int.test.ts`: 30 % 503s → breaker opens → `circuit_open` → recovery closes it.
+  - A budget-exceeded test.
+  - A backfill test that drains in ≤ 2 calls.
+
+**Milestone done when:** all tasks are done, the full check passes, and coverage of `packages/engine`,
+`packages/questions` and `packages/ranker` is ≥ 80 % (shown).
+
+---
+
+## 8. M3a: Evaluation tooling and golden-set collection
+
+**Outcome:**
+- `apps/eval` can ingest a real EN/SK/CZ sample, serve the blind rating and facet-labelling pages to
+  raters, run all experiments, compute every metric, and generate the G1 report and `config/g1.json`.
+- This is proven end-to-end on **synthetic** data.
+- The real sample is ingested and the rater URLs are ready. The humans then rate.
+
+**Read first:** spec 10 (all), spec 02 §7, spec 06 §4 and §9, spec 05 §3, spec 07.
+
+**Goal text:**
+
+```
+Complete milestone M3a "Evaluation tooling and golden-set collection" exactly as specified in docs/PLAN.md §8, following docs/specs/10-evaluation.md and the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §8 and the referenced specs first, create one task per row of the M3a task table, and implement them in dependency order, using subagents for independent lanes. Commit each task as "<task-id>: <summary>". Constraints: no Jev/Ollama calls are made in this milestone (experiments are exercised with the fixture engine and synthetic raters only); the real feed sample may be fetched from the internet by the ingest-sample command; locked decisions unchanged; deviations logged in docs/DECISIONS.md. The goal is met only when the transcript shows (1) a final "M3a report" in the format of PLAN.md §0.4 listing M3a-T1…M3a-T9 each with ✓, commit hash and evidence, and every M3a "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, (3) the synthetic dry-run report path and its decision table printed, and (4) `git status --short` printing nothing. Or stop after 180 turns and print the report with the unfinished items.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M3a-T1 | `eval` schema migration and the eval system user | — | A | 02 §7 |
+| M3a-T2 | CLI skeleton, `feeds-golden.txt` (≈ 60 feeds, EN/SK/CZ), `ingest-sample`, stratified sampling | T1 | A | 10 §2.1 |
+| M3a-T3 | Rating server: rater add/token, card-writing step, feed picking, blind rating UI | T1 | B | 10 §2.2, §2.4 |
+| M3a-T4 | Facet labelling page | T3 | B | 10 §2.3 |
+| M3a-T5 | Metrics library | — | C | 10 §4 |
+| M3a-T6 | Experiment runner (cache, cost estimate and confirmation), experiments B0, B1, E1–E4 (E5 stub) | T1 | D | 10 §3 |
+| M3a-T7 | Report generator, decision rules, `config/g1.json`, `apply-g1` | T5, T6 | C | 10 §1, §5 |
+| M3a-T8 | Synthetic dry run: simulated raters + fixture engine → full report | T3–T7 | D | 10 all |
+| M3a-T9 | Real sample ingested and rater onboarding kit | T2, T3 | A | 10 §2 |
+
+**Done when:**
+
+- **T1:** the migration applies; the eval user exists; the worker runs with `EVAL_INGEST_ONLY=true` and
+  stops after extract (test).
+- **T2:**
+  - `feeds-golden.txt` has ≈ 20 feeds per language and the category mix of spec 10 §2.1.
+  - `ingest-sample --dry-run` lists the feeds and their reachability.
+  - Sampling produces up to 500/500/500 stratified article ids (integration test on fixture data).
+- **T3:**
+  - Rating flow integration tests: card-writing gate (can't rate before ≥ 5 cards), feed picking
+    (≥ 10), blind page (no model fields in the HTML), keyboard handlers, rating persistence and change.
+  - Token cookie auth.
+  - The pages work at a 375 px width (Playwright screenshot or DOM test).
+- **T4:** the labelling page stores all six fields; a second labeller's overlap subset is selected
+  deterministically.
+- **T5:** AUC matches known Mann–Whitney values including ties; bootstrap CI determinism with a seed;
+  P@k; ECE; macro-F1; Spearman; Cohen's κ; isotonic regression. All unit-tested.
+- **T6:**
+  - Each experiment is a config object.
+  - Engine calls go through `EngineRouter` with a JSON cache keyed by `sha256(model+state+questions)`.
+  - A cost estimate is printed and confirmation required above $1.
+  - `eval.runs` / `eval.run_answers` are written.
+  - Re-running uses the cache, shown by a test with a counting fake engine.
+- **T7:**
+  - The report renders every table of spec 10 §4 and one reliability SVG per language.
+  - The decision rules of §5 are implemented as pure functions with unit tests for pass/fail branches.
+  - `config/g1.json` validates against a zod schema.
+  - `apply-g1` writes the `settings` rows.
+- **T8:**
+  - `eval dry-run` generates 4 synthetic raters whose ratings follow a hidden per-rater interest
+    model, and a fixture engine returning noisy but informative answers.
+  - It runs every experiment, produces `reports/DRYRUN-<date>.md` and a `g1.json`, and prints the
+    decision table.
+  - A test asserts that E1 beats B0 on the synthetic data.
+- **T9:**
+  - `ingest-sample` ran on the real feed list (the command output shows per-language article counts).
+  - `docs/eval/RATERS.md` explains the rating task in English and Slovak.
+  - `eval rater add` printed working URLs for the owner (the raters themselves are added by the owner).
+
+**Milestone done when:** all tasks are done, the full check passes, the dry-run report exists, and the
+real sample has ≥ 300 articles per language (or the report explains a shortfall).
+
+### 8.1 Human step (between M3a and M3b, about 1–2 weeks, in parallel with M4–M6)
+
+1. Start the rating server (`pnpm --filter eval cli serve-rating`) on a reachable host, e.g. a small
+   temporary VPS or a tunnel.
+2. Add 3–5 raters (`eval rater add --name … --langs …`) and send them their URLs and `RATERS.md`.
+3. Each rater writes 5–10 interests, picks ≥ 10 feeds, and rates ≥ 250 articles.
+4. The owner labels facets for 100 articles per language (a second person labels 50 if possible).
+5. Check progress with `eval status`, which prints per-rater counts. Continue with M3b once every rater
+   has ≥ 250 ratings.
+
+---
+
+## 9. M3b: Run gate G1
+
+**Outcome:** the experiments run on the real golden set with live Jev, LibreTranslate and Ollama. The
+G1 report and `config/g1.json` are committed. Either the core bet passes and the settings are
+applied, or the build stops with a clear report for the owner.
+
+**Needs:** `TYPESAFE_API_KEY`, `OLLAMA_API_KEY`, LibreTranslate running (`--profile translate`), and
+network access.
+
+**Goal text:**
+
+```
+Complete milestone M3b "Run gate G1" as specified in docs/PLAN.md §9 and docs/specs/10-evaluation.md §3–§5. Read those sections first and create one task per row of the M3b task table. Live calls to TypeSafe Jev, Ollama Cloud and the local LibreTranslate are allowed in this milestone; keep total spend under $10 (print the estimate before each experiment and the actual cost after). Constraints: do not change the decision rules or thresholds of spec 10 §5 to get a different outcome; do not change locked decisions; commit the report and config as "M3b-T<n>: <summary>". The goal is met only when the transcript shows (1) the printed G1 decision table from the committed report apps/eval/reports/G1-<date>.md with every rule's inputs and result, (2) either "CORE BET: PASS" with config/g1.json committed and `eval apply-g1` output showing the settings written, or "CORE BET: FAIL" with the failure summary of spec 10 §5 rule 1 printed for the owner, (3) the total actual spend printed, and (4) `git status --short` printing nothing. Or stop after 80 turns and print what is missing.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Specs |
 |---|---|---|---|
-| 1 | Stack | **TypeScript monorepo** | Layout in §4.1 |
-| 2 | Single-user first or multi-tenant? | **Multi-tenant from day one** | §4.5 covers isolation, quotas, fairness, cost attribution and the SSRF-safe fetcher |
-| 3 | Generative LLM use | **Allowed only as the fallback decision engine and for translation** | `LlmFallbackEngine` + `translate` stage. No LLM card authoring (§3.3), no summaries, and no LLM as a direct labelling teacher for Laya (see `laya-multilingual.md` §3) |
-| 4 | Migration from FeedIt.sk | **None. Everything is trained or fine-tuned from scratch** | New golden set built in Phase 0 (§6). No account import. The old code stays only as a design reference |
+| M3b-T1 | Preflight: `eval status` shows ≥ 250 ratings for every rater and the facet labels present; keys and LibreTranslate healthy; cost estimate printed | ratings | 10 §2–3 |
+| M3b-T2 | Run B0, B1, E1, E2, E3, E3b, E4 (E5 only if Laya is installed) | T1 | 10 §3 |
+| M3b-T3 | Generate the report, apply the decision rules, write `config/g1.json`, commit | T2 | 10 §1, §4–5 |
+| M3b-T4 | On PASS: `apply-g1` to dev settings; update `DAILY_BUDGET_USD` guidance in `docs/DECISIONS.md`. On FAIL: write `docs/G1-FAIL.md` with the rule 1 details and the 20 worst-ranked liked articles | T3 | 10 §5 |
 
-| 5 | Hosting | **Self-hosted, minimal spend, no GPU** | One 8 vCPU / 16–32 GB box (§4.6). No local bulk LLM. Laya only through ONNX on CPU, fine-tuned on free Kaggle GPUs |
-| 6 | Signups at launch | **Invite-only** | Invites + waitlist in §4.5, which doubles as cost control |
-| 7 | LLM provider | **Free CPU translation models first; Ollama Cloud GLM for everything else LLM-related; no Claude** (too expensive for the quality needed) | Translation tier 1 is OPUS-MT / LibreTranslate on the box. Tier 2 and `LlmFallbackEngine` use Ollama Cloud (`glm-5.3-flash`, with `glm-5.3` for hard cases). Phase 0 compares them by their effect on classification accuracy (§4.6) |
-
----
-
-## 8. Roadmap
-
-**Phase 0: Spike (1 week).** No UI; the goal is to prove the core bet.
-- Minimal ingestion script (no pipeline yet) over a real EN/SK/CZ feed mix, and the bare-bones rating page in `apps/eval`.
-- Build `golden-v1` (§6): 3–5 raters write cards, then rate; hand-label the Call A questions.
-- Script: Call A + Call B for those articles. Compute AUC vs. ratings and compare with the chronological and keyword baselines.
-- Test the language options (a)/(b)/(c) on Slovak/Czech items, with Laya-multilingual zero-shot as a baseline (§7.2). For (c), compare OPUS-MT/LibreTranslate against Ollama Cloud GLM *by their effect on classification* (§4.6). Measure latency, CPU time and $ on the target box size.
-- **Exit criterion:** card-based ranking clearly beats the keyword baseline for every rater, with zero training, and a language option exists where SK/CZ is within about 5 AUC points of EN.
-- Phase 0 now takes about **2 weeks** rather than 1, because the golden set has to be built.
-
-**Phase 1: Ingestion core (2–3 weeks).**
-- Monorepo, Postgres schema, pg-boss.
-- Port DreamCatcher fetch + adaptive interval + extraction (with Readability).
-- Canonical-URL + hash dedup. OPML import. Tests using real-world broken feeds (reuse FeedIt's hard cases).
-
-**Phase 2: Jev enrichment + matching + basic reader (3–4 weeks).**
-- The `DecisionEngine` package with a TypeSafe impl, retries, circuit breaker and call logging.
-- Call A and Call B with global card dedup. The interest card library (≈150 cards).
-- A PWA with feeds, lanes, swipe/keyboard rating with reason chips, "Why this?", mutes and boosts.
-- Passwordless auth, tenant-scoped API and the quotas from §4.5.
-- `DegradedEngine`, the spend guard and the invite flow.
-- The `translate` stage (an OPUS-MT / LibreTranslate container, with an Ollama Cloud GLM fallback), if Phase 0 selected translation. `LlmFallbackEngine` on Ollama Cloud is optional.
-
-**Phase 3: Personal learning (2 weeks).**
-- Per-user logistic model + calibration, and the implicit signals (dwell, return prompt).
-- Maybe-lane active learning, and library card suggestions from unexplained likes.
-
-**Phase 4: Clusters, labels, polish (2–3 weeks).**
-- Story clustering with Jev verification, fold UI, story mutes.
-- Labels as Nouls with suggestions.
-- Archive/retention jobs, and the eval dashboard (online metrics, replay on version change).
-
-**Phase 5: Optional extras.**
-- Fine-tuned Laya-multilingual for SK/CZ enrichment, if Phase 0 showed a language gap (`laya-multilingual.md`).
-- RAG "ask my archive" using DreamCatcher's hybrid search.
-- Native wrappers, premium plans (fetch interval, feed count, card count). Summaries only if the LLM policy (§7.6) is widened.
+**Milestone done when:** the report is committed and the goal evidence is printed. **If G1 fails, do
+not proceed to M6–M8 until the owner decides.**
 
 ---
 
-## 9. Sources
+## 10. M4: HTTP API
 
-- This repo (FeedIt.sk prototype): `cron/links-trainer.php`, `functions/functions-score-global.php`,
-  `functions/functions-training.php`, `functions/functions-content.php`, `cron/tiers-training-check.php`,
-  `cron/auto-archive.php`, `todo.txt`.
-- DreamCatcher: `PLAN.md`, `infrastructure/postgre/init/sql_init.sql`, `workers/*`, `gpt.txt`, `ui/index.html`.
-- [elvisun/newsjack](https://github.com/elvisun/newsjack): `apps/cli/cmd/newsjack/coarse_filter.go`,
-  `coarse_filter_questions.json`, `demos/news-desk-dealer/src/engine/*`, `docs/2026-09-18-jev-coarse-filter-plan.md`.
-- [fhshaik/typesafe-mario](https://github.com/fhshaik/typesafe-mario): `src/typesafe_mario/policy.py`, `state.py`, `runner.py`.
-- TypeSafe docs: [index](https://docs.typesafe.ai/llms.txt), [State](https://docs.typesafe.ai/concepts/state.md),
-  [Advanced structure](https://docs.typesafe.ai/primitives/advanced.md), [Models & limits](https://docs.typesafe.ai/models.md),
-  [Jev 1.13 jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13.md), [Confidence](https://docs.typesafe.ai/confidence.md),
-  [Speculative fan-out](https://docs.typesafe.ai/patterns/fan-out.md), [Composite scoring](https://docs.typesafe.ai/patterns/composite-scoring.md),
-  [Autoresearch feature discovery](https://docs.typesafe.ai/cookbooks/autoresearch_feature_discovery.md),
-  [Introducing System One models](https://typesafe.ai/blog/introducing-system-one-models-and-jev),
-  [Jev on OpenRouter](https://openrouter.ai/docs/guides/community/jev), [jevai.net](https://jevai.net/) (third-party overview site).
+**Outcome:** the complete `/api/v1` of spec 08:
+- auth with invites
+- tenancy with RLS per request
+- subscriptions with discovery and OPML
+- cards, library and labels
+- reading and feedback
+- rules
+- admin
+- quotas, rate limits, CSRF and OpenAPI
+
+**Read first:** spec 08 (all), spec 02 §4–5, spec 05 §5.1, spec 06 §6–7 (the explain and lane fields
+it returns), spec 03 §10–11.
+
+**Goal text:**
+
+```
+Complete milestone M4 "HTTP API" exactly as specified in docs/PLAN.md §10 and docs/specs/08-api.md, using the existing packages (db, questions, feeds, ranker types) and the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §10 and the referenced specs first, create one task per row of the M4 task table, and implement them in dependency order, using subagents for independent lanes. Commit each task as "<task-id>: <summary>". Constraints: every per-user query runs through withTenant/TenantTx under RLS; no live third-party calls in tests (emails use MAIL_TRANSPORT=log); locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M4 report" in the format of PLAN.md §0.4 listing M4-T1…M4-T11 each with ✓, commit hash and evidence, and every M4 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, including the named test api-rls-isolation.int.test.ts, and (3) `git status --short` printing nothing. Or stop after 220 turns and print the report with the unfinished items.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M4-T1 | Plugins: errors, tenant, session auth, CSRF, rate limit, zod provider, swagger | — | A | 08 §1, §11 |
+| M4-T2 | Auth, email (templates en/sk, `MAIL_TRANSPORT`), invites, waitlist, `ADMIN_EMAILS` | T1 | A | 08 §2 |
+| M4-T3 | Me, preferences, sessions, export, delete/restore | T1 | B | 08 §3 |
+| M4-T4 | Subscriptions: discovery, OPML, quotas, `min_interval_s`, refresh functions, backfill enqueue | T1 | B | 08 §4, §6; 03 §10–11 |
+| M4-T5 | Cards, library, suggestions, labels, topics (using the M2 lifecycle repository) | T1 | C | 08 §7; 05 §5.1 |
+| M4-T6 | `GET /articles` (lanes, folding, sorts, cursor), counts, details, `GET /articles/calibration` | T1 | D | 08 §5.1–5.2; 06 §10 |
+| M4-T7 | Article actions and `feedback_events`; learn and rank triggers through the `enqueueRank`/`enqueueLearn` service | T6 | D | 08 §5.3 |
+| M4-T8 | Rules endpoints | T1 | C | 08 §8; 06 §3 |
+| M4-T9 | Admin endpoints, `ops-event`, `/metrics`, test-only `/dev/last-email` | T1 | E | 08 §9–10 |
+| M4-T10 | Plans and quotas enforcement across endpoints | T4, T5, T8 | B | 08 §6 |
+| M4-T11 | RLS isolation suite, CSRF test, OpenAPI snapshot | T2–T10 | E | 08 §12 |
+
+**Done when:**
+
+- **T1:** error mapping table tests; tenant plugin sets `app.user_id` per request (integration);
+  unauthenticated → 401; a missing `X-FeedIt-Client` on a mutation → 403; rate-limit headers present.
+- **T2:**
+  - Every row of the `request-code` decision table is tested.
+  - Code TTL and the attempt limit.
+  - Signup consumes the invite.
+  - The admin role comes from `ADMIN_EMAILS`.
+  - Cookie attributes; session sliding and revocation.
+  - The waitlist upsert.
+- **T3:** the preferences deep-merge is validated; export contains every section; delete → login
+  within 7 days restores.
+- **T4:**
+  - Discovery with candidates.
+  - OPML import report and export round-trip.
+  - The quota errors carry details.
+  - Subscribe triggers `refresh_*` and a backfill job (asserted in the pg-boss table).
+- **T5:** every card endpoint maps to the lifecycle actions (an id change on edit is returned); library
+  localization (sk); suggestions dismiss.
+- **T6:**
+  - Lanes and statuses filter correctly.
+  - Cluster folding picks the highest-p member.
+  - Each sort order is stable under cursor pagination (a property test over 200 seeded items).
+  - The counts endpoint agrees with the list totals.
+- **T7:**
+  - Every action is tested, including un-rate, hide, bulk rate, prompt answer, and mute-story
+    creating a cluster when missing.
+  - The 10th explicit label enqueues `user.learn`.
+  - `feedback_events` rows written.
+- **T8:** value validation per kind; creating or deleting a rule enqueues `user.rank {full:true}`.
+- **T9:** admin-only (403 for users); settings allow-list with zod per key; breaker reset; promote needs
+  ≥ 3 holders; the `ops-event` token check.
+- **T10:** each limit has one test at the boundary (max OK, max+1 → `QUOTA_EXCEEDED`).
+- **T11:**
+  - `api-rls-isolation.int.test.ts` calls **every** GET endpoint as user A with user B's data seeded
+    and asserts no leakage, including shared cards with B's private fork.
+  - The OpenAPI snapshot is committed.
+
+**Milestone done when:** all tasks are done, the full check passes, and the OpenAPI document lists
+every endpoint of spec 08 (a count is printed).
+
+---
+
+## 11. M5: Ranking and lanes
+
+**Outcome:** each user's articles get lanes, tiers, rules, demotions, label suggestions and `explain`
+through the `user.rank` handler, triggered by matching and by user actions. Weak translations
+escalate.
+
+**Read first:** spec 06 §1–7, §9–11; spec 05 §3.4; spec 07 §3.
+
+**Goal text:**
+
+```
+Complete milestone M5 "Ranking and lanes" exactly as specified in docs/PLAN.md §11 and docs/specs/06-ranking-learning.md §1–§7 and §9–§11, with the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §11 and the referenced specs first, create one task per row of the M5 task table, and implement them in dependency order, using subagents for independent lanes. Commit each task as "<task-id>: <summary>". Constraints: packages/ranker stays pure (no I/O; enforced by the boundary lint); no live third-party calls; locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M5 report" in the format of PLAN.md §0.4 listing M5-T1…M5-T6 each with ✓, commit hash and evidence, and every M5 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, including the named test ranking.e2e.test.ts, and (3) `git status --short` printing nothing. Or stop after 150 turns and print the report with the unfinished items.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M5-T1 | `RankerConfig`, settings override loader, `RANKER_VERSION` | — | A | 06 §11 |
+| M5-T2 | `rankArticle`: rules, card score, never/must/boost, demotions, lanes/tiers, story rule, label suggestions, `Explain` | T1 | A | 06 §1–6 |
+| M5-T3 | Property tests and truth tables | T2 | B | 06 §12 |
+| M5-T4 | `user.rank` handler: context loading, dirty set, batch loads, upserts; `enqueueRank` service used by the API and match | T2 | C | 06 §7 |
+| M5-T5 | Weak-translation escalation and `house.expire-rules` | T4 | C | 06 §7; 07 §3; 11 §6 |
+| M5-T6 | `ranking.e2e.test.ts`: fetch → enrich → match → rank with fixture engines for two users | T4 | C | 06 all |
+
+**Done when:**
+
+- **T1:** defaults exactly as spec 06 §11; settings overrides validated (invalid JSON → defaults + a
+  warning).
+- **T2:** every rule code in spec 06 §3.2 is produced by at least one test; `Explain` snapshots for the
+  cards, degraded and none sources.
+- **T3:** fast-check monotonicity; lane and tier boundary tables; demotion activation tri-state.
+- **T4:**
+  - The dirty-set SQL covers all four conditions (a test for each).
+  - `full` re-ranks the window.
+  - Reader-state columns are never modified (asserted).
+  - A second run with nothing dirty writes 0 rows.
+- **T5:** a `maybe` item with a weak tier-1 translation enqueues `article.translate {forceTier2:true}`
+  once; expired rules are removed and trigger a rank.
+- **T6:** two users with different cards on the same feeds get different lanes as expected; a `never`
+  card hides; a mute hides; a degraded article ends in `maybe` with source `degraded`.
+
+**Milestone done when:** all tasks are done, the full check passes, and coverage of `packages/ranker`
+is ≥ 80 %.
+
+---
+
+## 12. M6: Web app (PWA)
+
+**Outcome:** the full reader experience of spec 09: login and onboarding; lanes with swipe and
+keyboard training; "Why this?"; the feeds, interests, labels, rules and settings screens; admin; PWA
+offline; E2E smoke tests in CI.
+
+**Read first:** spec 09 (all), spec 08 (the DTOs), spec 06 §6.2 (`Explain`), spec 06 §10.
+
+**Goal text:**
+
+```
+Complete milestone M6 "Web app" exactly as specified in docs/PLAN.md §12 and docs/specs/09-web-app.md, using the API DTOs from packages/shared and the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §12 and the referenced specs first, create one task per row of the M6 task table, and implement them in dependency order, using subagents for independent lanes. Commit each task as "<task-id>: <summary>". Constraints: all server state via TanStack Query with optimistic updates as specified; English and Slovak strings for every screen; no live third-party calls (E2E uses the fixture engine and a local fixture feed server); locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M6 report" in the format of PLAN.md §0.4 listing M6-T1…M6-T9 each with ✓, commit hash and evidence, and every M6 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int && pnpm --filter web e2e` run after the last commit, ending with exit code 0, listing the six smoke scenarios of spec 09 §9 as passed, and (3) `git status --short` printing nothing. Or stop after 250 turns and print the report with the unfinished items.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M6-T1 | App shell: API client, router, i18n en/sk, theme, layout, auth guard, login/join/waitlist | — | A | 09 §1–2 |
+| M6-T2 | Reader: lanes, counts, list items, tier slider, sorts, mark-all-read, Simple mode, clusters, optimistic updates, undo | T1 | A | 09 §3.1–3.3 |
+| M6-T3 | Swipe gestures, reason bar, keyboard shortcuts and overlay | T2 | B | 09 §3.3–3.4 |
+| M6-T4 | "Why this?" drawer and its actions; the "Did you like it?" prompt | T2 | B | 09 §3.5–3.6 |
+| M6-T5 | Onboarding wizard (feeds, bundles, interests, calibration round) | T2 | C | 09 §4 |
+| M6-T6 | Feeds manager, Interests (cards, library, suggestions, editor), Labels, Rules, Settings | T1 | C | 09 §5–7 |
+| M6-T7 | Admin UI | T1 | D | 09 §8 |
+| M6-T8 | PWA: manifest, service worker, offline list cache, background sync; accessibility pass | T2 | D | 09 §1 |
+| M6-T9 | Playwright smoke suite in CI | T2–T6 | E | 09 §9 |
+
+**Done when:**
+
+- **T1:** login with a code works against the dev API; `/join?code=` flows to signup; every string is
+  in `en.json` and `sk.json` (a test checks key parity).
+- **T2:** component tests for the list item (all states); optimistic rating with a simulated server
+  error rolls back and shows the toast; the tier slider persists to preferences.
+- **T3:** swipe thresholds (15 % feedback, 35 % commit) are tested with synthetic pointer events; every
+  shortcut in the spec 09 §3.4 table has a test.
+- **T4:** the drawer renders all `Explain` variants (snapshots); "Not really about this" calls the
+  examples endpoint and shows the fork confirmation; the prompt appears after `dwell` returns
+  `prompt:true`.
+- **T5:** the wizard enforces ≥ 1 feed; bundles load; the calibration step polls the counts and
+  continues on ≥ 10 items or after 60 s (fake timers).
+- **T6:** the card editor shows the authoring hints and enforces limits; OPML import shows the report;
+  settings edit every preference field.
+- **T7:** admin routes are hidden for non-admins; settings JSON editors validate before saving.
+- **T8:** Lighthouse PWA installability passes (`pnpm --filter web lighthouse` output); offline shows
+  cached items; axe-core finds no serious or critical violations on the reader, the Why-this drawer and
+  onboarding.
+- **T9:** the six scenarios of spec 09 §9 pass in CI (a Playwright job is added to `ci.yml`).
+
+**Milestone done when:** all tasks are done and the full check, including E2E, passes.
+
+---
+
+## 13. M7: Personal learning and suggestions
+
+**Outcome:** per-user logistic models trained on Jev features and feedback, calibrated and
+auto-activated when they beat the card baseline, with explained contributions; card suggestions from
+unexplained likes; learning curves verified on the golden set.
+
+**Read first:** spec 06 §8, §10; spec 05 §7; spec 10 §3.
+
+**Goal text:**
+
+```
+Complete milestone M7 "Personal learning and suggestions" exactly as specified in docs/PLAN.md §13, docs/specs/06-ranking-learning.md §8 and §10, and docs/specs/05-classification.md §7, with the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §13 and the referenced specs first, create one task per row of the M7 task table, and implement them in dependency order, using subagents for independent lanes. Commit each task as "<task-id>: <summary>". Constraints: training code in packages/ranker stays pure; no live third-party calls in tests; the learning-curve check uses cached golden-set answers only (no new API spend); locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M7 report" in the format of PLAN.md §0.4 listing M7-T1…M7-T7 each with ✓, commit hash and evidence, and every M7 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, and (3) the learning-curve table from M7-T7 printed, and (4) `git status --short` printing nothing. Or stop after 150 turns and print the report with the unfinished items.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M7-T1 | `FEATURE_SPEC_V1` feature builder and sha | — | A | 06 §8.1 |
+| M7-T2 | Label extraction from `user_article` and `feedback_events` | — | B | 06 §8.2 |
+| M7-T3 | `trainUserModel`: IRLS, L2, CV, Platt, activation, contributions | T1 | A | 06 §8.3 |
+| M7-T4 | `user.learn` handler, version retention, triggers (every 10th label, nightly) | T2, T3 | C | 06 §8.4; 11 §6 |
+| M7-T5 | Model scoring in `rankArticle` plus `Explain.model`; the LLM-answer exclusion rule | T3 | A | 06 §2, §8.1 |
+| M7-T6 | `user.suggest` handler and nightly scheduling | — | B | 05 §7 |
+| M7-T7 | Learning-curve check on golden-v1 (cached answers) | T3 | D | 06 §8.3; 10 §3 |
+
+**Done when:**
+
+- **T1:** a feature vector snapshot for a seeded item; the sha changes when the spec changes (test).
+- **T2:** the signal table of spec 06 §8.2 is implemented, and "the latest explicit signal wins" is
+  tested.
+- **T3:**
+  - On synthetic data the model recovers the weight signs and reaches AUC ≥ 0.9.
+  - Platt scaling lowers ECE on over-confident scores.
+  - The activation rule is tested on each branch.
+  - Contributions pick the top 3 by |value|.
+- **T4:** the 10th label enqueues learn; activation enqueues `user.rank {full}` and `user.suggest`;
+  only 3 versions are kept.
+- **T5:** `scoreSource='model'` when active; demotions are skipped; never/must/rules still apply;
+  `llm`-answered items are scored via cards.
+- **T6:** the suggestion flow works end-to-end with a fixture engine; dismissed cards are excluded for
+  90 days.
+- **T7:** `eval learning-curve` simulates each rater's ratings arriving in order: train on the first n
+  (n = 10, 20, 30, 50, 100), evaluate on the rest, and print per-rater AUC of model vs cards-only. The
+  table is printed and saved to `apps/eval/reports/`. If the model does not beat cards-only at n = 50
+  for most raters, `docs/DECISIONS.md` gets an entry proposing a threshold change. Thresholds are not
+  changed silently.
+
+**Milestone done when:** all tasks are done, the full check passes, and the learning-curve table is
+printed.
+
+---
+
+## 14. M8: Operations and launch readiness
+
+**Outcome:** the production stack runs on the target box with all housekeeping jobs, backups (with a
+tested restore), alerts, the security checklist and the launch checklist completed, ready for the
+invite-only beta.
+
+**Read first:** spec 11 (all), spec 04 §6–7, spec 10 §7.
+
+**Goal text:**
+
+```
+Complete milestone M8 "Operations and launch readiness" exactly as specified in docs/PLAN.md §14 and docs/specs/11-operations.md, with the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §14 and the referenced specs first, create one task per row of the M8 task table, and implement them in dependency order, using subagents for independent lanes. Commit each task as "<task-id>: <summary>". Constraints: no secrets committed (only .env.example); locked decisions unchanged (single self-hosted box, no GPU); deviations logged in docs/DECISIONS.md with the spec updated; tasks that need the real host (M8-T8, M8-T9) may be completed against a local production-like compose stack if no host access is available, and the report must say which. The goal is met only when the transcript shows (1) a final "M8 report" in the format of PLAN.md §0.4 listing M8-T1…M8-T9 each with ✓, commit hash and evidence, and every M8 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int && pnpm --filter web e2e` run after the last commit, ending with exit code 0, (3) the launch checklist of spec 11 §9 printed with each item's status, and (4) `git status --short` printing nothing. Or stop after 180 turns and print the report with the unfinished items.
+```
+
+**Tasks**
+
+| ID | Task | Needs | Lane | Specs |
+|---|---|---|---|---|
+| M8-T1 | Production `compose.yml`, Dockerfiles, Caddyfile with security headers, `deploy.sh` | — | A | 11 §2–3, §7 |
+| M8-T2 | Housekeeping jobs (all of spec 11 §6 not yet implemented) with idempotency tests | — | B | 11 §5–6 |
+| M8-T3 | Alerts (`house.alerts`, email de-duplication), `ops-event` integration | T2 | B | 11 §6.1 |
+| M8-T4 | Online metrics job (`house.metrics`) and admin display | T2 | C | 10 §7 |
+| M8-T5 | Backup and restore-test scripts plus a documented cron | T1 | A | 11 §4 |
+| M8-T6 | Security checklist verification (headers, CSP, SSRF suite, sanitization, `pnpm audit`, RLS suite) | T1 | C | 11 §7 |
+| M8-T7 | Privacy page, starter bundles verified, SMTP deliverability notes | — | D | 09 §4; 11 §9 |
+| M8-T8 | Load sanity test (20 users × 50 feeds × 10 cards, 1 h) on the box or a local production-like stack | T1–T4 | D | 11 §9 |
+| M8-T9 | Launch checklist run and `docs/RUNBOOK.md` (deploy, rollback, restore, breaker reset, budget raise, invite batch, model upgrade) | all | A | 11 §3, §8–9 |
+
+**Done when:**
+
+- **T1:** `docker compose -f infra/compose.yml config` validates; images build; `deploy.sh`'s smoke
+  step checks `/readyz`; a header check (curl) shows every header of spec 11 §7.
+- **T2:** each job in the spec 11 §6 table exists, is scheduled, and has an idempotency test (run
+  twice → the same result) and a retention test at the day boundaries.
+- **T3:** each alert rule fires in a test and is de-duplicated for 6 h; a resolved condition re-arms it.
+- **T4:** the metrics JSON is stored per day; the admin overview shows the like-rate per lane.
+- **T5:** `backup.sh` and `restore-test.sh` run successfully against the local stack (output shown);
+  the retention pruning logic is tested with fake dates.
+- **T6:** a checklist file `docs/SECURITY-CHECK.md` with each item, how it was verified, and the result;
+  `pnpm audit --prod` has no high or critical issues.
+- **T7:** `/privacy` exists in en/sk; every starter-bundle feed fetches, with the report shown.
+- **T8:** a report with CPU, memory, p95 `GET /articles` latency and queue depths meets the spec 11 §9
+  targets (or deviations are logged).
+- **T9:** `RUNBOOK.md` covers every procedure named; the launch checklist is printed with statuses.
+  Items needing the owner (DNS, SMTP provider, invites) are marked "owner".
+
+**Milestone done when:** all tasks are done, the full check passes, and the launch checklist has no
+unchecked items except those marked "owner".
+
+---
+
+## 15. M9: Optional extensions (after launch; each item can become its own goal)
+
+| Item | Trigger | Where specified |
+|---|---|---|
+| **Laya engine** for SK/CZ enrichment | G1 set `laya_track_recommended = true`, or Jev availability or cost becomes a problem | spec 04 §9; [`laya-multilingual.md`](./laya-multilingual.md) (fine-tuning happens on free Kaggle GPUs, outside the server) |
+| **Image proxy** for feed images (privacy, HTTPS) | after launch | FeedIt todo; spec 11 §7 note |
+| **Opted-in anonymized feedback** to grow the golden set | after launch | spec 10 §7 |
+| **Search over my archive** (Postgres FTS; later hybrid search as in DreamCatcher) | user demand | background §2.2 |
+| **Open signup and plans** | when costs and moderation are understood | spec 08 §2, §6 |
+
+---
+
+## 16. Change log
+
+| Date | Change |
+|---|---|
+| 2026-09-24 | Plan restructured into goal-ready milestones and binding specs; decisions 1–8 locked |
