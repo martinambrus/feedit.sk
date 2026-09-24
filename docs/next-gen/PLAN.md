@@ -6,7 +6,8 @@
 > The plan is meant to move into its own repository later.
 >
 > Companion document: [`jev-questions.md`](./jev-questions.md) holds the concrete Jev question sets,
-> request shapes and cost math.
+> request shapes and cost math. [`laya-multilingual.md`](./laya-multilingual.md) evaluates Laya, the
+> open-weights Jev alternative, for EN + SK + CZ fine-tuning and self-hosting.
 
 ---
 
@@ -518,6 +519,7 @@ interface DecisionEngine {
   - `TypeSafeEngine`: the SDK, direct API.
   - `GatewayEngine`: the same model via Vercel AI Gateway (`typesafe-ai/jev`) or OpenRouter (`typesafe/jev-1.13`). Useful for zero data retention and as a failover path.
   - `LlmFallbackEngine`: turns Choice/Score/Noul into a strict JSON schema for any structured-output LLM. Newsjack has this adapter. It is slower and more expensive, but it keeps the product alive.
+  - `LayaEngine`: the open-weights Laya model, self-hosted through the Jev-compatible ONNX port `receptron/laya`. It needs fine-tuning before it is useful; it is a candidate for SK/CZ enrichment. See [`laya-multilingual.md`](./laya-multilingual.md).
 - **Operational rules copied from newsjack:**
   - a concurrency pool
   - 4 attempts with exponential backoff on 429/5xx, honouring `retry-after`
@@ -622,8 +624,14 @@ options, to be decided by the eval (§6), not upfront:
   A/B, and store the translation. This adds cost and latency on non-English articles only, and gives the
   best expected accuracy.
 
-The recommendation is to prototype (a) and (b) on the golden set in week 1 and adopt (c) only if both
-underperform.
+- **(d)** Fine-tune the open-weights **Laya-multilingual** model (Apache 2.0, mmBERT-base) on EN/SK/CZ
+  data labelled by a teacher, and route SK/CZ articles to it for the fixed enrichment questions. Laya is
+  near random zero-shot, so it can't replace Jev for free-form interest cards without further work. The
+  full analysis is in [`laya-multilingual.md`](./laya-multilingual.md).
+
+The recommendation is to prototype (a) and (b) on the golden set in week 1, with Laya zero-shot as a
+baseline. Adopt (c) if both underperform, and start (d) in parallel only if SK/CZ accuracy stays
+clearly below EN.
 
 ### 7.3 Adversarial or promotional content
 
@@ -661,7 +669,7 @@ enterprise plans.
 **Phase 0: Spike (1 week).** No UI; the goal is to prove the core bet.
 - Export the old FeedIt ratings. Write 5–10 interest cards for the author's own feeds.
 - Script: Call A + Call B for those articles. Compute AUC vs. ratings and compare with the old `score_conformed`.
-- Test the language options (a)/(b) on Slovak/Czech items. Measure latency and $.
+- Test the language options (a)/(b)/(c) on Slovak/Czech items, with Laya-multilingual zero-shot as a baseline (§7.2). Measure latency and $.
 - **Exit criterion:** card-based ranking ≥ the old engine's ranking on held-out ratings, with zero training.
 
 **Phase 1: Ingestion core (2–3 weeks).**
