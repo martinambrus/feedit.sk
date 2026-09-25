@@ -8,6 +8,8 @@
 > **Review note (2026-09-25):** provider benchmarks, prices, limits and community-model claims below
 > are dated research inputs, not measured FeedIt results. The specs require capability preflight,
 > workload-based cost measurement and held-out evaluation. Owner decisions are tracked in PLAN §17.
+> The owner's follow-up makes inference opt-in per feed, bookmarks durable full-content snapshots,
+> library upgrades opt-in and labels neutral; those decisions supersede earlier hypotheses below.
 
 ## 1. The idea in one page
 
@@ -24,39 +26,34 @@ engine by hand:
 The next generation replaces the hand-built scoring with **TypeSafe's Jev**, a "System One" decision
 model. You send Jev a *state* (the article) and a set of typed *questions* (Choice / Score / Noul). It
 returns calibrated probabilities plus a confidence value in about 70–500 ms. It costs $0.042 per million input
-tokens, and output is free. It cannot generate text, so it cannot hallucinate free-form answers. It is the
-"smart if-statement" this product always needed.
+tokens, and output is free. It returns typed decisions rather than free-form text; those decisions
+can still be wrong and need held-out measurement and recoverable user controls.
 
 The design in one picture:
 
-```
-            ┌───────────── once per article (shared by ALL users) ─────────────┐
- feed ─►  fetch ─► normalize/dedup ─► extract ─► ENRICH (Jev call A)          │
-            │                                     "what is this article?"    │
-            └──────────────────────────────────────────────────────────────────┘
-                                                   │  topic probs, content type,
-                                                   │  depth, clickbait, promo, …
-            ┌──── once per article × *distinct interest cards* on that feed ───┐
-            │  MATCH (Jev call B): "does it satisfy interest card X?" (Nouls)  │
-            └──────────────────────────────────────────────────────────────────┘
-                                                   │
-            ┌──────────────── per user, in code, microseconds ─────────────────┐
-            │  RANK: rules (mutes/boosts) + interest match + tiny learned model │
-            │  → calibrated "P(you'll like it)" → tiers / Maybe lane / hidden   │
-            └──────────────────────────────────────────────────────────────────┘
-                                                   │
-                     user feedback (👍/👎 + one-tap *reason*) ──► updates the tiny model,
-                     proposes new interest cards, feeds the eval set
+```mermaid
+flowchart TD
+  F["Public feed ingestion"] --> G{"Eligible reader demand?"}
+  G -->|"Off / not selected"| R["Ordinary reading; no inference"]
+  G -->|"Selected training article"| A["Enrich eligible article once"]
+  G -->|"Active feed: new arrival"| A
+  A --> B["Match demanded distinct cards"]
+  B --> P["Per-reader ranking and explanation"]
+  P --> T["Explicit or enabled implicit feedback"]
+  T --> L["Compatible personal learning"]
+  R --> S["Bookmark content snapshot"]
+  P --> S
 ```
 
 Five ideas carry most of the design:
 
 1. **Interest cards instead of word weights.** A user describes what they want in plain language
    ("new EV battery chemistry, not stock-price news"). The system also offers cards from a shared
-   library. Jev evaluates every new article against every card. There is nothing to train before the
-   first useful result, which removes FeedIt's "train 200 articles first" wall.
-2. **Understand each article once, for everyone.** The per-article enrichment call is shared across
-   tenants. DreamCatcher's global article store already works this way, so reuse it.
+   library. Jev evaluates only selected training articles or active-feed arrivals against applicable
+   cards. Cards can produce useful first results without fitting a personal model, but never silently
+   turn inference on for an untrained subscription.
+2. **Reuse eligible article analysis.** When at least one reader requests it, per-article enrichment
+   can be shared across eligible tenants; an off subscription creates no such demand. DreamCatcher's global article store already works this way, so reuse it.
 3. **The model's calibration replaces hand balancing.** Jev's probabilities are trained to be calibrated.
    Tiers become probability buckets instead of hand-tuned percent thresholds. When per-user learning
    is needed, a tiny logistic model learns the weights, so nobody has to tune them.

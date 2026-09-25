@@ -100,10 +100,11 @@ ALTER DEFAULT PRIVILEGES FOR ROLE feedit_owner REVOKE EXECUTE ON FUNCTIONS FROM 
 
 **Explicit SELECT allowlist for `feedit_app`:** `users`, `settings`, `login_codes`, `sessions`,
 `invites`, `waitlist`, `origin_fetch_state`, `feeds`, `story_clusters`, `articles`, `feed_items`, `article_aliases`,
-`article_bodies`, `article_translations`, `question_sets`, `article_facets`, `topics`, `interest_cards`,
-`card_answers`, `article_topics_l2`, `usage_daily`, and the tables in §4. Add grants only after the
+`article_bodies`, `article_snapshots`, `article_translations`, `question_sets`, `article_facets`, `topics`, `interest_cards`,
+`card_answers`, `article_topics_l2`, `library_card_versions`, `usage_daily`, and the tables in §4. Add grants only after the
 corresponding table and its required RLS policies exist, in the same migration transaction. The API
-has no direct read/write access to `engine_calls`, `engine_reservations`, `match_queue` or `feed_cards`;
+has no direct read/write access to `provider_credentials`, `engine_calls`, `engine_reservations`,
+`match_queue` or `feed_cards`;
 admin summaries use the approved SQL functions/aggregates. No sensitive prompt text goes in logs.
 
 Grant `USAGE` on identity sequences only for tables the API may insert into below; new worker-only
@@ -121,12 +122,15 @@ sequences have no default API grant.
 | `feeds` | `INSERT`; `UPDATE (min_interval_s, fetch_options, status, consecutive_errors, first_error_at, quarantined_until, quarantine_count, next_fetch_at, subscriber_count, updated_at)` | subscribe, admin reset |
 | `story_clusters` | `INSERT, UPDATE` | mute-story creates a cluster |
 | `articles` | `UPDATE (story_cluster_id)` | mute-story |
-| `interest_cards` | `INSERT`; `UPDATE (retired_at, title, topic_ids, i18n, slug, visibility)` | card create/reuse (un-retire), admin library and promotion (`shared` → `public`). **Never** the text or examples: cards are immutable (spec 05 §5.1) |
+| `interest_cards` | `INSERT`; `UPDATE (retired_at, title, topic_ids, i18n, slug)` | card create/reuse (un-retire), admin library and promotion (`shared` → `public`). **Never** the text or examples: cards are immutable (spec 05 §5.1) |
 | `feedback_events` | `INSERT` | reader actions (append-only; rows disappear only through `ON DELETE CASCADE` when the worker purges a user) |
-| `subscriptions`, `user_cards`, `user_labels`, `user_rules`, `api_mutations` | `INSERT, UPDATE, DELETE` | RLS applies; idempotency records are repository-internal |
+| `subscriptions`, `user_feed_preferences`, `user_cards`, `user_labels`, `user_rules`, `api_mutations` | `INSERT, UPDATE, DELETE` | RLS applies; idempotency records are repository-internal |
 | `user_article` | `INSERT (user_id, article_id, opened_at, read_at, rating, reason, rated_at, dwell_ms, bookmarked_at, archived_at, label_ids, feedback_prompted_at, state_version)`; `UPDATE` on those reader-state columns except the primary key, plus `label_suggestions` | rating/read/bookmark actions; ranking columns are worker-only |
 | `card_suggestions` | `UPDATE (dismissed_at)` | dismiss suggestion |
 | `user_models` | no writes | worker alone trains and activates models |
+| `bookmark_snapshot_pins` | `INSERT` only | vetted bookmark/undo repository pins original snapshot through the ten-minute undo deadline |
+| `analysis_requests` | `INSERT (id, user_id, feed_id, article_id, article_revision, inference_version, input_snapshot, input_sha)` only | exact selected-article manual authorization; validated immutable snapshot, worker owns completion |
+| `card_publication_requests`, `provider_credentials`, `article_snapshots`, `library_card_versions` | no direct writes | narrow consent/admin/bookmark functions below; worker maintains lifecycle |
 | `job_outbox` | `INSERT` only | durable job intent; requester RLS (§5), no API relay privileges |
 | `drizzle.__drizzle_migrations` | `SELECT` (with `USAGE ON SCHEMA drizzle`) | `/readyz` |
 
@@ -256,6 +260,53 @@ CREATE TABLE waitlist (
   invite_code  text NULL REFERENCES invites(code) ON DELETE SET NULL
 );
 ```
+
+
+### 2.1 Provider credentials (encrypted at rest)
+
+```sql
+CREATE TABLE provider_credentials (
+  provider              text PRIMARY KEY CHECK (provider IN ('typesafe','ollama')),
+  revision              bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),
+  enabled               boolean NOT NULL DEFAULT false,
+  active_version        bigint NULL CHECK (active_version > 0),
+  active_envelope       jsonb NULL,
+  candidate_version     bigint NULL CHECK (candidate_version > 0),
+  candidate_envelope    jsonb NULL,
+  candidate_status      text NULL CHECK (candidate_status IN ('pending','validating','valid','invalid')),
+  candidate_validation  jsonb NOT NULL DEFAULT '{}', -- allowlisted non-secret health/capability metadata
+  validation_token      uuid NULL,
+  validation_until      timestamptz NULL,
+  updated_at            timestamptz NOT NULL DEFAULT now(),
+  updated_by            uuid NULL REFERENCES users(id) ON DELETE SET NULL,
+  activated_at          timestamptz NULL,
+  validated_at          timestamptz NULL,
+  last_error_code       text NULL,
+  CHECK ((active_version IS NULL) = (active_envelope IS NULL)),
+  CHECK ((candidate_version IS NULL) = (candidate_envelope IS NULL)),
+  CHECK ((candidate_version IS NULL) = (candidate_status IS NULL)),
+  CHECK ((validation_token IS NULL) = (validation_until IS NULL)),
+  CHECK (coalesce(candidate_status = 'validating', false) = (validation_token IS NOT NULL)),
+  CHECK (NOT enabled OR active_version IS NOT NULL),
+  CHECK (active_version IS NULL OR active_version <= revision),
+  CHECK (candidate_version IS NULL OR candidate_version <= revision)
+);
+```
+
+One row represents the service operator's provider account; personal Jev/Ollama accounts are allowed.
+It is not an end-user BYOK feature. Envelope format and key rotation are binding in specs 01/04: a
+random per-secret data key encrypts the credential using AES-256-GCM; an externally configured master
+key wraps that data key. Versioned envelope JSON contains key ID, nonce, tag, ciphertext and wrapped-key
+nonce/tag/ciphertext, never plaintext; authenticated data binds provider, secret version, envelope
+version and purpose. Master keys exist only in deployment secrets, never SQL/settings/backups beside
+the encrypted database. Validate envelope shape and byte lengths before storage.
+
+The API uses narrow admin functions (§6), not SELECT access to encrypted credentials. Stage a candidate
+with optimistic `revision`, retain the working active version, explicitly request validation via a
+worker job carrying only provider/candidateVersion, then activate that exact validated candidate under CAS. A failed/stale validation
+cannot replace the active secret. `enabled=false` is a durable disabled state, never a request to fall
+back silently to an environment credential. Worker leases and decrypted caches bind provider+version;
+rotation/disable invalidates caches, with no credentials in responses, errors, logs or queue payloads.
 
 
 **Settings key registry.** Every key has a zod schema in `packages/shared/src/settings.ts`. Readers
@@ -403,12 +454,43 @@ CREATE TABLE article_bodies (
   resolved_url       text NULL,
   status             text NOT NULL CHECK (status IN ('ok','skipped','failed','blocked','too_large','not_html')),
   http_status        int NULL,
-  body_text          text NULL,                    -- ≤ 100,000 chars; purged after 30 days (spec 11)
+  body_text          text NULL,                    -- available extracted source, not model-truncated
+  body_html          text NULL,                    -- sanitized available source; no scripts/unsafe embeds
+  completeness       text NOT NULL DEFAULT 'partial' CHECK (completeness IN ('complete','partial')),
+  completeness_reason text NULL,                   -- e.g. excerpt_only/paywall/truncated/extraction_failed
   body_lead          text NULL,                    -- ≤ 1,500 chars; kept
   extractor_version  text NOT NULL,
   error              text NULL,
-  extracted_at       timestamptz NOT NULL DEFAULT now()
+  extracted_at       timestamptz NOT NULL DEFAULT now(),
+  CHECK (coalesce(octet_length(body_text), 0) + coalesce(octet_length(body_html), 0) <= 10485760)
 );
+
+
+CREATE TABLE article_snapshots (                   -- immutable bookmark archive, not inference input
+  id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  article_id         bigint NOT NULL REFERENCES articles(id) ON DELETE RESTRICT,
+  source_revision    bigint NOT NULL CHECK (source_revision > 0),
+  captured_at        timestamptz NOT NULL DEFAULT now(),
+  source_url         text NULL,
+  title              text NOT NULL,
+  author             text NULL,                   -- snapshot metadata, never read from later live article
+  published_at       timestamptz NULL,
+  body_text          text NOT NULL DEFAULT '',
+  body_html          text NULL,
+  content_sha256     text NOT NULL,                -- canonical exact stored title/author/date/source/text/HTML
+  completeness       text NOT NULL CHECK (completeness IN ('complete','partial')),
+  completeness_reason text NULL,
+  source             text NOT NULL CHECK (source IN ('feed','page')),
+  extractor_version  text NOT NULL,
+  cold_at            timestamptz NULL,             -- cold lifecycle marker after 30 days; never a TTL
+  unreferenced_at    timestamptz NULL,             -- set on final bookmark/pin release; clear on attach
+  CHECK (coalesce(octet_length(body_text), 0) + coalesce(octet_length(body_html), 0) <= 10485760),
+  UNIQUE (article_id, source_revision, content_sha256)
+);
+ALTER TABLE article_snapshots ALTER COLUMN body_text SET STORAGE EXTENDED;
+ALTER TABLE article_snapshots ALTER COLUMN body_html SET STORAGE EXTENDED;
+ALTER TABLE article_snapshots ALTER COLUMN body_text SET COMPRESSION pglz;
+ALTER TABLE article_snapshots ALTER COLUMN body_html SET COMPRESSION pglz;
 
 CREATE TABLE article_translations (
   article_id   bigint NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
@@ -461,12 +543,13 @@ CREATE INDEX engine_reservations_day_idx ON engine_reservations (day, status);
 CREATE TABLE engine_calls (
   id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   engine          text NOT NULL CHECK (engine IN ('typesafe','llm','laya','libretranslate')),
-  kind            text NOT NULL CHECK (kind IN ('enrich','match','cluster','suggest','translate','eval')),
+  kind            text NOT NULL CHECK (kind IN ('enrich','match','cluster','suggest','translate','credential_probe','eval')),
   model           text NULL,
   article_id      bigint NULL REFERENCES articles(id) ON DELETE SET NULL,
   question_set_id bigint NULL REFERENCES question_sets(id) ON DELETE RESTRICT,
   reservation_id  uuid NULL UNIQUE REFERENCES engine_reservations(id) ON DELETE SET NULL,
   logical_request_id uuid NOT NULL,
+  credential_version bigint NULL CHECK (credential_version > 0),
   article_revision bigint NULL CHECK (article_revision > 0),
   state_sha256    text NULL,
   card_ids        bigint[] NULL,
@@ -526,13 +609,25 @@ CREATE TABLE interest_cards (
   origin          text NOT NULL CHECK (origin IN ('library','user','fork')),
   visibility      text NOT NULL CHECK (visibility IN ('public','shared','private')),
   parent_card_id  bigint NULL REFERENCES interest_cards(id) ON DELETE SET NULL,
-  owner_user_id   uuid NULL REFERENCES users(id) ON DELETE CASCADE,  -- set for private forks only
+  owner_user_id   uuid NULL REFERENCES users(id) ON DELETE CASCADE,  -- access owner, private forks only
+  creator_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL, -- original author; never a holder count
   i18n            jsonb NOT NULL DEFAULT '{}',    -- {"sk": {"title": "…", "interest": "…"}} for library cards
   created_at      timestamptz NOT NULL DEFAULT now(),
   retired_at      timestamptz NULL,
   CHECK ((visibility = 'private') = (owner_user_id IS NOT NULL))
 );
 CREATE INDEX interest_cards_topics_idx ON interest_cards USING gin (topic_ids);
+
+
+CREATE TABLE library_card_versions (
+  library_slug      text NOT NULL,
+  version           int NOT NULL CHECK (version > 0),
+  card_id           bigint NOT NULL UNIQUE REFERENCES interest_cards(id) ON DELETE RESTRICT,
+  previous_card_id  bigint NULL REFERENCES interest_cards(id) ON DELETE RESTRICT,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (library_slug, version),
+  CHECK (previous_card_id IS NULL OR previous_card_id <> card_id)
+);
 
 CREATE TABLE card_answers (                       -- Call B answers
   article_id        bigint NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
@@ -701,6 +796,118 @@ may be replaced; they are not an unlimited historical archive. Question-set defi
   alternate GUIDs that arrive with the same URL do not replace that stable identifier.
 
 
+
+### 3.4 Inference authorization is separate from ingestion
+
+Every new subscription is `off`. Fetching/parsing/extracting for reading or bookmark capture remains
+allowed; article translation, enrichment, matching and model-based clustering need a live inference
+authorization even when the provider is free/local. In particular, a global article's existing enriched
+state is not permission to expand inference for every subscribed reader.
+
+- `off`: no automated inference. An explicit selected-article training action creates immutable
+  `analysis_requests` and may move the subscription to `training` in the same authorized transaction.
+- `training`: only the exact manually selected articles can trigger inference; no feed-wide backfill,
+  neighboring article expansion, subscription scan or ordinary label/bookmark action creates demand.
+- `active`: automated inference is allowed when `feed_items.first_seen_at` for that exact carrier
+  is **at/after** this subscription's
+  `inference_activated_at`, with the current `inference_version`. Enabling does not silently analyze
+  history. Existing older articles can still be explicitly selected for manual analysis.
+
+Mode changes lock the subscription, check the client's expected version, increment
+`inference_version`, set `inference_activated_at` to the activation transaction time only when entering
+active (null when leaving), invalidate old authorization and refresh affected `feed_cards`. Reapplying
+the same mode is an idempotent no-op. Q11 still decides automatic graduation; until then only explicit
+user enablement activates automatic inference, and ordinary ratings never silently do it.
+
+`feed_cards` materializes cards/labels of **active subscriptions only**. It is a candidate demand cache,
+not an authorization proof: a worker must recheck live user/subscription, article carrier+activation
+cutoff and scope before each external attempt and before publishing user effects. Manual analysis
+uses the specific `analysis_requests.id` instead, never broadening the feed union. Coalesced shared
+calls retain all contributing live authorizations; removing one reader's demand cannot cancel another
+reader's authorized work. If all demand disappears, stop new attempts; already billed work is audited.
+
+Selected-article request creation verifies the article belongs to the specified live subscription,
+locks/reads the exact source and input manifest, stores the pre-feedback snapshot and hash, then writes
+an `analysis.process {analysisRequestId}` outbox intent in the same transaction. The worker
+claims pending or expired-running requests in a short transaction, records a fresh lease token/expiry,
+and completes/renews/retries/cancels only with that token. Clear the lease when leaving `running`.
+Crash recovery reuses the immutable input and never silently creates a fresh grant. Store bounded
+sanitized `last_error_code`, retry due time and attempt accounting; no DB transaction spans inference. A request contains no provider secret. Its
+snapshot freezes article/card/question/model context independently of later feedback. Completion saves
+`result_snapshot`/`result_sha`; if the live article changed, these historical features may still serve
+that recorded training event, but cannot overwrite current shared caches. A changed subscription
+version, deletion or cancellation revokes further attempts. Feedback references the request ID rather
+than treating unavailable features as zero or mixing future context into an old rating.
+
+### 3.5 Permanent bookmark archives and image preferences
+
+`article_snapshots` stores the exact available readable text and sanitized HTML, with provenance and a
+checksum; source safety limits still apply and paywalls/truncation/extraction errors are explicitly
+partial. It does not mirror images/media while Q14 is open. Model input length limits apply only to
+model views, never destructively shorten archived source content. Snapshot content/provenance is
+immutable; only lifecycle fields `cold_at`/`unreferenced_at` and a vetted article-merge FK relocation may
+change in place. A corrected or more complete capture is another row.
+
+Bookmarking atomically binds a snapshot of any body already present **before** a concurrent source
+edit or body purge can replace it. A vetted helper (§6) copies trusted stored content; ordinary API
+callers cannot submit archive HTML or arbitrary snapshot IDs. Missing/partial content schedules capture
+without inference. Completion compares `bookmark_capture_generation`, current bookmark presence and
+requested capture revision; stale unbookmark/rebookmark jobs cannot reattach old content. Preserve a
+complete saved snapshot if a later fetch fails or returns less content. An intentional replacement
+must explicitly create/bind a new snapshot rather than mutate the old payload.
+
+Snapshots and the owning article survive unsubscribe, source deletion/404, normal body/article TTLs
+and feed errors while any bookmark or valid undo pin refers to them. `bookmark_snapshot_pins` stores
+FK-backed references through the ten-minute undo deadline; exact undo restores the original binding,
+not a new fetch. Garbage collection checks both bookmark references and unexpired pins under locks;
+delete expired pins first, then snapshots unreferenced for at least seven days, and only then eligible
+articles. Set/clear `unreferenced_at` under the same lock when final references detach/new references
+attach; the seven-day GC delay is never a bookmark expiry. Hard
+account deletion releases that user's references; another user's saved copy remains.
+
+TOAST provides transparent lossless compression of larger text values from first write. `pglz` above
+works on PostgreSQL 16; `lz4` is an optional deployment-tested substitution only when compiled support
+exists. After 30 days set `cold_at` and remove redundant hot body storage only after verifying the
+archive binding/checksum. This is a storage lifecycle change, not an expiry or a promise that tiny or
+incompressible strings shrink. Restore testing includes saved text/HTML and checksums.
+
+`user_feed_preferences.image_policy` is tenant data independent of subscription lifetime. Its
+`inherit|allow|block` value remains available for saved items after unsubscribe, via
+`bookmark_origin_feed_id`; all reader/card/expanded/saved rendering consults spec 08/09's effective
+policy before any image URL is fetched. A feed identity merge remaps these preferences and bookmark
+origins in the merge transaction; conflicting settings preserve `block` until the user chooses
+otherwise. No inference mode switch changes an image preference.
+
+### 3.6 Authorship, publication consent and opt-in library versions
+
+Internal reuse of a shared card is allowed and does not publish it in the public library.
+`creator_user_id` records the original author independently of private access ownership and current
+holders; deduplication/re-adoption never changes it. User/fork inserts derive it from the authenticated
+creator. A user's erasure clears it rather than assigning authorship to a later holder.
+
+Public promotion of a user-created shared card requires `card_publication_requests` for that creator,
+who must be active (`last_active_at` within the preceding seven days) and not soft-deleted.
+Missing or ambiguous original-author provenance remains unpublished; do not elect an arbitrary holder. Approval
+binds exact card text hash and proposed publication metadata hash/version. Only that creator can
+approve/decline; an administrator may request publication but cannot impersonate consent. Recheck
+creator identity/activity, approval, expiry if set, hashes and version at promotion in one transaction.
+Metadata changes invalidate old consent; request version advances and approval is requested again.
+Inactive/deleted authors and no response stay shared while Q12 is unresolved; no timeout implies
+consent. Seeded library content is a separate reviewed publication source, not a way to relabel a
+user-created row to bypass its author.
+
+`library_card_versions` is an immutable semantic chain for a stable library slug; enforce consecutive
+versions and predecessor belonging to the same slug in the repository/constraint trigger. A semantic
+change creates a new card and version. Only the newest version may own `interest_cards.slug` as a
+lookup alias; older held cards retain their identity and text. No seed/admin update may repoint
+`user_cards`/`user_labels` automatically. The holder explicitly applies a new version or requests a
+private fork/adaptation, preserving scopes, strengths and examples as specified in spec 05. Concurrent
+apply uses the expected current holding and user revision. Display-only metadata corrections follow
+the limited policy in spec 05, never smuggling semantic changes into existing model identities.
+Labels remain neutral organization metadata: their existence/assignment cannot itself create a
+positive/negative ranking or training label, or enable inference for an untrained subscription.
+
+
 ---
 
 ## 4. Per-user tables (RLS enforced)
@@ -716,10 +923,73 @@ CREATE TABLE subscriptions (
   folder            text NULL,
   allow_duplicates  boolean NOT NULL DEFAULT false,  -- false = fold story clusters (spec 08 §5.1)
   hidden            boolean NOT NULL DEFAULT false,  -- hide feed from sidebar, keep ranking
+  inference_mode    text NOT NULL DEFAULT 'off' CHECK (inference_mode IN ('off','training','active')),
+  inference_version bigint NOT NULL DEFAULT 0 CHECK (inference_version >= 0),
+  inference_activated_at timestamptz NULL,
   created_at        timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (user_id, feed_id)
+  PRIMARY KEY (user_id, feed_id),
+  CHECK ((inference_mode = 'active') = (inference_activated_at IS NOT NULL))
 );
 CREATE INDEX subscriptions_feed_idx ON subscriptions (feed_id);
+
+
+CREATE TABLE user_feed_preferences (
+  user_id      uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  feed_id      bigint NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+  image_policy text NOT NULL DEFAULT 'inherit' CHECK (image_policy IN ('inherit','allow','block')),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, feed_id)
+);
+
+CREATE TABLE analysis_requests (                  -- explicit selected-article training demand
+  id                  uuid PRIMARY KEY,          -- server-generated, receipt binds client idempotency key
+  user_id             uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  feed_id             bigint NOT NULL,
+  article_id          bigint NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  article_revision    bigint NOT NULL CHECK (article_revision > 0),
+  inference_version   bigint NOT NULL CHECK (inference_version >= 0),
+  input_snapshot      jsonb NOT NULL,             -- immutable pre-feedback article/card/question context
+  input_sha           text NOT NULL,
+  result_snapshot     jsonb NULL,                 -- features/answers of frozen input, never future feedback
+  result_sha          text NULL,
+  status              text NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','running','complete','failed','cancelled')),
+  lease_token         uuid NULL,
+  lease_until         timestamptz NULL,
+  attempts            int NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at     timestamptz NOT NULL DEFAULT now(),
+  last_error_code     text NULL,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  completed_at        timestamptz NULL,
+  FOREIGN KEY (user_id, feed_id) REFERENCES subscriptions(user_id, feed_id) ON DELETE CASCADE,
+  CHECK ((result_snapshot IS NULL) = (result_sha IS NULL)),
+  CHECK (status <> 'complete' OR result_snapshot IS NOT NULL),
+  CHECK ((lease_token IS NULL) = (lease_until IS NULL)),
+  CHECK ((status = 'running') = (lease_token IS NOT NULL)),
+  CHECK ((status IN ('complete','failed','cancelled')) = (completed_at IS NOT NULL))
+);
+CREATE INDEX analysis_requests_pending_idx ON analysis_requests (next_attempt_at, created_at)
+  WHERE status IN ('pending','running');
+CREATE INDEX analysis_requests_user_article_idx ON analysis_requests (user_id, article_id, created_at DESC);
+
+CREATE TABLE card_publication_requests (           -- original author's exact-version publication consent
+  id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id             uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  card_id             bigint NOT NULL REFERENCES interest_cards(id) ON DELETE CASCADE,
+  requested_by        uuid NULL REFERENCES users(id) ON DELETE SET NULL,
+  status              text NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','approved','rejected','expired','promoted')),
+  card_text_hash      text NOT NULL,
+  publication_payload jsonb NOT NULL,             -- exact proposed slug/title/topics/i18n/version metadata
+  publication_sha    text NOT NULL,
+  version             bigint NOT NULL DEFAULT 1 CHECK (version > 0),
+  requested_at        timestamptz NOT NULL DEFAULT now(),
+  expires_at          timestamptz NULL,            -- no response deadline assumed while Q12 is open
+  responded_at        timestamptz NULL,
+  CHECK (expires_at IS NULL OR expires_at > requested_at)
+);
+CREATE UNIQUE INDEX card_publication_pending_idx ON card_publication_requests (card_id)
+  WHERE status IN ('pending','approved');
 
 CREATE TABLE user_cards (
   user_id        uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -780,9 +1050,18 @@ CREATE TABLE user_article (
   rated_at           timestamptz NULL,
   dwell_ms           int NULL CHECK (dwell_ms >= 0),
   bookmarked_at      timestamptz NULL,
+  bookmark_snapshot_id bigint NULL REFERENCES article_snapshots(id) ON DELETE RESTRICT,
+  bookmark_origin_feed_id bigint NULL REFERENCES feeds(id) ON DELETE SET NULL,
+  bookmark_capture_generation bigint NOT NULL DEFAULT 0 CHECK (bookmark_capture_generation >= 0),
+  bookmark_capture_status text NULL CHECK (bookmark_capture_status IN ('pending','saved','partial','failed')),
+  bookmark_capture_error_code text NULL,
   archived_at        timestamptz NULL,
   label_ids          bigint[] NOT NULL DEFAULT '{}',
   feedback_prompted_at timestamptz NULL,
+  CHECK ((bookmarked_at IS NULL) = (bookmark_capture_status IS NULL)),
+  CHECK (bookmarked_at IS NOT NULL OR
+    (bookmark_snapshot_id IS NULL AND bookmark_capture_status IS NULL AND bookmark_origin_feed_id IS NULL)),
+  CHECK (bookmark_capture_status NOT IN ('saved','partial') OR bookmark_snapshot_id IS NOT NULL),
   CHECK ((rating IS NULL) = (rated_at IS NULL)),
   CHECK (reason IS NULL OR (rating IS NOT NULL AND rating = -1)),
   PRIMARY KEY (user_id, article_id)
@@ -798,7 +1077,7 @@ CREATE TABLE feedback_events (                    -- append-only training log
   article_id  bigint NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
   kind        text NOT NULL CHECK (kind IN ('rate','unrate','open','read','unread','dwell','prompt_answer',
                                             'bookmark','unbookmark','label','unlabel','mark_read','hide','unhide','undo')),
-  value       jsonb NOT NULL DEFAULT '{}',
+  value       jsonb NOT NULL DEFAULT '{}',        -- spec 06 §8: server-derived consent/origin + eligible feature snapshot
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX feedback_events_user_idx ON feedback_events (user_id, created_at DESC);
@@ -835,6 +1114,17 @@ CREATE TABLE api_mutations (                      -- idempotency/undo; spec 08
   CHECK (expires_at >= created_at + interval '7 days')
 );
 CREATE INDEX api_mutations_expiry_idx ON api_mutations (expires_at);
+
+
+CREATE TABLE bookmark_snapshot_pins (               -- exact undo roots; no JSON-only GC references
+  user_id      uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  mutation_id  uuid NOT NULL,
+  snapshot_id  bigint NOT NULL REFERENCES article_snapshots(id) ON DELETE RESTRICT,
+  expires_at   timestamptz NOT NULL,
+  PRIMARY KEY (user_id, mutation_id, snapshot_id),
+  FOREIGN KEY (user_id, mutation_id) REFERENCES api_mutations(user_id, id) ON DELETE CASCADE
+);
+CREATE INDEX bookmark_snapshot_pins_expiry_idx ON bookmark_snapshot_pins (expires_at);
 
 CREATE TABLE card_suggestions (
   user_id       uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -874,7 +1164,7 @@ CREATE POLICY t_tenant ON t
   their owner, including on admin card-list routes. `feed_cards` and `match_queue` stay worker-only.
 
 
-### 5.1 Private cards and durable intents
+### 5.1 Private cards, saved snapshots and durable intents
 
 ```sql
 ALTER TABLE interest_cards ENABLE ROW LEVEL SECURITY;
@@ -884,8 +1174,10 @@ CREATE POLICY interest_cards_read ON interest_cards FOR SELECT TO feedit_app
          owner_user_id = nullif(current_setting('app.user_id', true), '')::uuid);
 CREATE POLICY interest_cards_create ON interest_cards FOR INSERT TO feedit_app
   WITH CHECK (nullif(current_setting('app.user_id', true), '') IS NOT NULL AND
-    ((visibility = 'shared' AND origin = 'user' AND owner_user_id IS NULL) OR
+    ((visibility = 'shared' AND origin = 'user' AND owner_user_id IS NULL
+      AND creator_user_id = nullif(current_setting('app.user_id', true), '')::uuid) OR
      (visibility = 'private' AND origin = 'fork' AND
+      creator_user_id = nullif(current_setting('app.user_id', true), '')::uuid AND
       owner_user_id = nullif(current_setting('app.user_id', true), '')::uuid) OR
      (visibility = 'public' AND origin = 'library' AND EXISTS
        (SELECT 1 FROM users WHERE id = nullif(current_setting('app.user_id', true), '')::uuid
@@ -900,6 +1192,19 @@ ALTER TABLE card_answers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE card_answers FORCE ROW LEVEL SECURITY;
 CREATE POLICY card_answers_read ON card_answers FOR SELECT TO feedit_app
   USING (EXISTS (SELECT 1 FROM interest_cards c WHERE c.id = card_id));
+
+ALTER TABLE article_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE article_snapshots FORCE ROW LEVEL SECURITY;
+CREATE POLICY article_snapshots_saved_read ON article_snapshots FOR SELECT TO feedit_app
+  USING (EXISTS (
+      SELECT 1 FROM user_article ua WHERE ua.bookmark_snapshot_id = article_snapshots.id
+        AND ua.bookmarked_at IS NOT NULL
+        AND ua.user_id = nullif(current_setting('app.user_id', true), '')::uuid
+    ) OR EXISTS (
+      SELECT 1 FROM bookmark_snapshot_pins p WHERE p.snapshot_id = article_snapshots.id
+        AND p.expires_at > now()
+        AND p.user_id = nullif(current_setting('app.user_id', true), '')::uuid
+    ));
 
 ALTER TABLE job_outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE job_outbox FORCE ROW LEVEL SECURITY;
@@ -922,12 +1227,16 @@ alone does not satisfy these requirements.
 | Invariant | Database enforcement and repository behavior |
 |---|---|
 | Card holdings cannot attach another tenant's private card | BEFORE INSERT/UPDATE trigger on `user_cards`, `user_labels`, `card_suggestions`: the referenced card exists, is public/shared or owned by `NEW.user_id`, and has kind `interest`, `label`, `interest` respectively. Check actual card ownership even for worker writes; raise generic constraint failure without private values |
-| Immutable card identity | BEFORE UPDATE on `interest_cards`: reject changes to `kind`, `text_hash`, `lang`, ownership or base `body` text/examples. `interest_en`/`not_for_en` may each change only from absent/null to a validated translation, once. Label `title` cannot change because it is hashed. Private forks cannot be promoted. Shared→public metadata promotion requires admin; non-admin API writes can only un-retire an otherwise identical accessible row. Worker/owner metadata maintenance does not bypass identity invariants |
+| Immutable card identity | BEFORE UPDATE on `interest_cards`: reject changes to `kind`, `text_hash`, `lang`, creator identity, ownership or base `body` text/examples. Creator FK clearing during verified account erasure is the sole authorship exception. `interest_en`/`not_for_en` permit initial validated pair fill, or an explicit authorized/audited full-pair retranslation/reset that updates the card-input fingerprint and invalidates only admitted dependent answers (specs 05/07). Partial or silent overwrites are forbidden. Label `title` cannot change because it is hashed. Private forks cannot be promoted. Shared→public metadata promotion requires the exact approved author consent plus admin; non-admin API writes can only un-retire an otherwise identical accessible row. Worker/owner metadata maintenance does not bypass identity invariants |
 | Label assignment integrity | DEFERRABLE INITIALLY DEFERRED constraint triggers on changed `user_article.label_ids`/`label_suggestions` and `user_labels` removals/repointing validate the **final row state**: distinct non-null IDs, each present in that user's `user_labels`, and suggestions exclude assigned labels. Label deletion removes its IDs from both arrays in the same transaction; fork replacement uses deduplicated arrays. Serialize label changes and assignments on the owning user row |
 | Scope owns a subscription | Composite FK on `(user_id, scope_feed_id)` removes a scoped holding when that subscription is deleted; it never silently widens it to every feed. Capture affected cards/feeds before deletion for cache refresh and outbox work |
 | Topic references | Taxonomy seeding validates each level-2 parent is level 1 and every `interest_cards.topic_ids` entry exists. BEFORE INSERT/UPDATE trigger enforces this on admin/runtime card changes; seeded taxonomy IDs are never deleted while used by arrays or model definitions |
 | Reader state and feedback agree | Lock the current `user_article` row (or conflict-safe insert), apply patch, increment `state_version`, append event and idempotency receipt, and write outbox intents in one transaction. Workers update only ranking-cache columns. Reject rating reasons unless the rating is -1 |
 | One active personal model | Lock the `users` row before allocating a model version or switching `active`; deactivate old and activate new in one transaction. Partial unique index rejects dual activation; stale training input revision cannot activate a model |
+| Inference gate generation | Subscription BEFORE UPDATE validates mode/timestamp/version transition. Manual request BEFORE INSERT checks active tenant, live subscription/version, actual feed carrier and frozen input hash; its input snapshot/hash is immutable after insert. Vetted feed/article identity merges may relocate only operational FKs while preserving recorded source identity in the snapshot; cancel and clear leases for pending/running old-identity requests. Completed manual results are worker-only. No label action or shared card adoption may bypass this gate |
+| Bookmark binding | Snapshot BEFORE UPDATE rejects payload/provenance edits; lifecycle/approved merge changes only. Binding helper checks snapshot article identity and completeness, increments capture generation, and maintains `unreferenced_at` plus undo pins under locks. Ordinary API writes cannot choose snapshot IDs or saved status |
+| Original-author publication | Consent creation derives `user_id` from the card's immutable creator. Response/promote functions use request version and card/publication hashes; PUBLIC visibility updates fail unless the approved consent transaction or reviewed initial-library seed permits them |
+| Library revision chain | Validate predecessor slug/version and immutable `library_card_versions` mapping. Semantic updates cannot re-point holdings except explicit recipient acceptance. Never mutate immutable label title |
 | Retention and account erasure | Gather user feed IDs and private card IDs, delete/rewrite personal derived references and receipts, clear arrays, then delete the account, refresh feeds and commit. Deferred card FKs allow the user's cascading holds/forks to disappear in either FK execution order; another user's hold of a private fork is impossible. Revoke live sessions at soft deletion |
 
 A tenant GUC is a trusted server context, not cryptographic authentication. RLS protects against missing
@@ -940,7 +1249,7 @@ All values are bound parameters and no user can execute SQL or select the server
 ## 6. SQL functions (SECURITY DEFINER, owned by the BYPASSRLS `feedit_owner`)
 
 ```sql
--- Recompute feed_cards for the given feeds: cards and labels held by any (non-deleted) subscriber,
+-- Recompute feed_cards for the given feeds: cards and labels of active-inference, non-deleted subscribers,
 -- respecting card scope.
 CREATE FUNCTION refresh_feed_cards(p_feed_ids bigint[]) RETURNS void
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
@@ -958,7 +1267,7 @@ BEGIN
     SELECT user_id, card_id, NULL::bigint FROM user_labels
   ) x ON x.user_id = s.user_id AND (x.scope_feed_id IS NULL OR x.scope_feed_id = s.feed_id)
   JOIN interest_cards c ON c.id = x.card_id AND c.retired_at IS NULL
-  WHERE s.feed_id = ANY(p_feed_ids)
+  WHERE s.feed_id = ANY(p_feed_ids) AND s.inference_mode = 'active'
   GROUP BY s.feed_id, x.card_id;
 END;
 $$;
@@ -1022,7 +1331,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public, pg_te
   holding AS (
     SELECT DISTINCT s.user_id, fc.feed_id, fc.card_id, fc.holders
     FROM feed_cards fc
-    JOIN subscriptions s ON s.feed_id = fc.feed_id
+    JOIN subscriptions s ON s.feed_id = fc.feed_id AND s.inference_mode = 'active'
     JOIN users u ON u.id = s.user_id AND u.deleted_at IS NULL
     JOIN (SELECT user_id, card_id, scope_feed_id FROM user_cards
           UNION ALL SELECT user_id, card_id, NULL::bigint FROM user_labels) x
@@ -1050,6 +1359,48 @@ until a card exists. Validate the status/attempt/latency and a bounded error-cod
 raw text. Insert at most once per logical request/engine/attempt and increment zero-cost usage in the same
 transaction. The API may use this only for its free tier-1 card translation (spec 07); paid reservation
 and settlement remain worker-only. Record metadata, never translated private text, in audit rows.
+
+**Bookmark archive functions (M0/M4).** `capture_bookmark_snapshot(p_article_id bigint,
+p_origin_feed_id bigint)` and `clear_bookmark_snapshot(p_article_id bigint)` run as SECURITY DEFINER,
+with PUBLIC execute revoked and API execute explicitly granted. Each derives the authenticated active
+tenant, verifies article access (current subscribed carrier or owned bookmark), and acquires the
+owning user/article/reader rows in the documented lock order. Capture copies only stored trusted
+current source into a checksummed snapshot, sets/retains `bookmarked_at`, advances capture generation,
+binds any available content and writes capture intent when absent/partial. Clear advances generation,
+clears binding/status/origin/bookmarked_at, and records final-reference lifecycle state. No helper
+increments reader `state_version` or appends feedback on its own: the enclosing idempotent action
+transaction does so exactly once. Snapshot completion is worker-only and generation-fenced.
+`restore_bookmark_snapshot(p_article_id bigint, p_mutation_id uuid)` accepts no caller-supplied snapshot
+ID: it verifies the caller's unexpired undo receipt/pin and expected reader version, restores its exact
+snapshot/origin, and advances generation to invalidate old capture jobs. Pins survive through the undo
+deadline; restoration never relies on a refetch. Tests exercise these helpers as the real API role.
+
+**Credential admin functions (M0/M4).** Supply `admin_provider_credentials_metadata()`,
+`admin_stage_provider_credential(p_provider text, p_expected_revision bigint, p_envelope jsonb)`,
+`admin_activate_provider_credential(p_provider text, p_expected_revision bigint,
+p_candidate_version bigint)` and `admin_set_provider_enabled(p_provider text,
+p_expected_revision bigint, p_enabled boolean)`. Every function enforces `admin_context_allowed()`
+and an active session for request attribution, validates arguments, and locks the provider row.
+Metadata returns only version/status/timestamps/sanitized health, never envelopes. Staging stores an
+already encrypted envelope for the exact next revision without making a provider call or queueing a validation probe. A separate
+`admin_validate_provider_credential(p_provider text, p_candidate_version bigint,
+p_expected_revision bigint)` transaction enqueues `provider.validate {provider,candidateVersion}`
+only after the administrator explicitly requests Validate. Activation requires the same valid candidate, current revision/configuration fingerprint and a
+validation result no older than 24 hours; disable
+preserves a tombstone. Worker validation CAS includes candidate version and lease token. Keyring
+cryptography is application-side, not a PostgreSQL decryption function. No generic SQL setter or
+ciphertext SELECT privilege is granted to the API role.
+
+**Publication consent functions (M0/M4).** Supply admin-only request/list/promote functions and
+`respond_card_publication(p_request_id bigint, p_expected_version bigint, p_approve boolean)` for the
+authenticated original author. Request derives the author from the card and checks the seven-day
+activity window, stores exact hashes, and exposes the proposed metadata for informed consent. Response
+checks caller ownership and pending state under lock, records approved/rejected and bumps version.
+Promotion rechecks author identity/activity, request status/version and exact hashes, then marks
+promoted and updates public visibility in one transaction. Expiry, altered content/metadata or missing
+consent returns a conflict; no response stays pending/shared. Admin listing goes through the function
+rather than bypassing tenant RLS on the request table. Library semantic update helpers write the next
+immutable revision but never migrate other readers' holdings.
 
 **Callers:**
 - **The refresh functions** are called by the API **in the same transaction** as the change that
@@ -1081,6 +1432,7 @@ changes, proving both materialized feed caches equal a fresh source-table aggreg
 ```sql
 CREATE SCHEMA eval;
 CREATE TABLE eval.raters (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL,
+  participant_key uuid NOT NULL, context_name text NULL, -- same human keeps one key across topic personas
   token_hash text NOT NULL UNIQUE, langs text[] NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE eval.rater_cards (rater_id bigint REFERENCES eval.raters(id) ON DELETE CASCADE,
   card_id bigint REFERENCES interest_cards(id) ON DELETE RESTRICT,
@@ -1151,6 +1503,26 @@ parity. A generated migration is not complete until these pass with actual role 
 7. Eval retries cannot duplicate answers (including rows with NULL card IDs); protected eval
    articles/cards/feeds survive retention and merge attempts, and frozen snapshots do not change when
    live source articles are edited.
+
+
+8. A new/off feed can fetch and display while producing zero translation/enrich/match/cluster calls.
+   A selected request authorizes exactly its frozen article/context; active enablement admits only new
+   carrier arrivals. Mode changes, unsubscribe, shared multi-user demand and process crashes cannot
+   expand authorization. Completed frozen training features never overwrite newer live caches.
+9. Bookmark full/partial source capture survives source edits, 404, unsubscribe, 30-day compression,
+   restoration and account isolation. Rebookmark/old-worker races, pinned exact undo and last-reference
+   GC preserve the correct text/HTML/author/date and reject guessed snapshot IDs. Blocked feed images
+   cause zero image requests in every saved/list/detail surface.
+10. Ciphertext-only credential storage passes real API-role privilege tests; metadata/errors/outbox
+    contain no secret. Saving a candidate makes no provider request, explicit validation is bounded,
+    stale validation/activation cannot overwrite a newer version, disable cannot revive an env key,
+    and restore with the matching external keyring decrypts while the database alone cannot.
+11. Shared adoption does not become public publication or transfer authorship. Inactive/missing creator,
+    no answer, altered publication hashes and stale approval versions cannot promote a card. A valid
+    exact consent can; new library semantics leave old holdings/examples unchanged until opt-in.
+    Assigning labels does not change ranking/training polarity or inference eligibility.
+12. Multiple evaluation personas belonging to one `participant_key` remain one human for independent
+    participant counts; pilot and wider-beta gate reports distinguish those measures.
 
 Implementation references: PostgreSQL 16 [row security](https://www.postgresql.org/docs/16/ddl-rowsecurity.html),
 [constraints](https://www.postgresql.org/docs/16/ddl-constraints.html),

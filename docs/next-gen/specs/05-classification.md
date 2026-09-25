@@ -1,13 +1,15 @@
 # Spec 05: Classification: question sets, interest cards, matching, clustering
 
-Status: **binding**. **Intent:** understand each article once for everyone (Call A). Then ask one
-absolute yes/no question per *distinct* interest card on the article's feeds (Call B), packing as many
+Status: **binding**. **Intent:** understand each article with authorized inference demand once for
+every eligible reader (Call A). Then ask one absolute yes/no question per *distinct authorized*
+interest card for that article (Call B), packing as many
 questions as possible into each authorized batch, because Jev bills per input token and reads the
 state once per call. Keep normalized current answers and versioned evaluation snapshots so ranking
 can change without new calls; production caches are not an unlimited answer-history archive.
 
 Code: `packages/questions` (pure: question sets, builders, taxonomy, set hashing, packing, library seed data),
-and `apps/worker/src/handlers/article-{enrich,match,cluster}.ts`, `card-backfill.ts`, `user-suggest.ts`.
+and `apps/worker/src/handlers/article-{enrich,match,cluster}.ts`, `analysis-process.ts`,
+`card-backfill.ts`, `user-suggest.ts`.
 
 ---
 
@@ -15,10 +17,71 @@ and `apps/worker/src/handlers/article-{enrich,match,cluster}.ts`, `card-backfill
 
 | Call | When | State | Questions | Stored in |
 |---|---|---|---|---|
-| **A: enrich** | once per non-stale article (and again if its title changes) | the article (§3.1) | fixed set `enrich-v1` (§3.3) | `article_facets` |
-| **B: match** | once per article per batch of pending cards | the article (smaller) | one Noul per card/label (§5.2), plus L2 topic Choices (§4) | `card_answers`, `article_topics_l2` |
-| **cluster** | after enrich, only if candidates exist | new article + ≤ 5 candidates | fixed set `cluster-v1` (§6) | `articles.story_cluster_id` |
-| **suggest** | after learning, at most daily per user | ≤ 5 liked articles | one Choice over library cards (§7) | `card_suggestions` |
+| **A: enrich** | once per demanded non-stale article revision; off feeds alone never trigger it | the article (§3.1) | fixed set `enrich-v1` (§3.3) | `article_facets` |
+| **B: match** | once per demanded article per batch of authorized pending cards | the article (smaller) | one Noul per card/label (§5.2), plus L2 topic Choices (§4) | `card_answers`, `article_topics_l2` |
+| **cluster** | after demanded enrich, only if authorized candidates exist | new article + ≤ 5 candidates | fixed set `cluster-v1` (§6) | `articles.story_cluster_id` |
+| **suggest** | after authorized learning, at most daily per user; no automatic calls for off-only users | ≤ 5 liked articles | one Choice over library cards (§7) | `card_suggestions` |
+
+### 1.1 Inference admission (binding; user decision Q1)
+
+RSS fetching, parsing and safe extraction continue for ordinary reading. Provider inference is
+separately authorized **per user subscription**, never by the global feed alone:
+
+| `subscriptions.inference_mode` | Authorized articles for that user/feed |
+|---|---|
+| `off` (default) | None. Do not translate, enrich, match, cluster, suggest or classify automatically on this user's behalf |
+| `training` | Only article ids/revisions explicitly selected through `POST /subscriptions/:feedId/analyze`; process slowly on the bulk queue |
+| `active` | New feed items whose `feed_items.first_seen_at ≥ inference_activated_at`, plus explicitly selected historical articles |
+
+`active` is enabled explicitly for now; a feedback count/model activation does **not** graduate a
+feed automatically. The automatic graduation criterion remains PLAN §17 Q11. Activation never sweeps
+an existing backlog. Historical analysis/backfill needs an explicit bounded user request, represented
+by exact `analysis_requests` rows; adding a card, changing scope or subscribing cannot create that
+permission. Mode changes increment `inference_version` and rerank the affected user's items.
+
+**Single admission predicate:** an article/card pair has demand iff at least one non-deleted current
+holder has a carrying subscription that is active for that article's arrival, or a current selected
+`analysis_requests` authorization in training/active mode, and the held card's scope includes that
+same feed. Check the requested frozen article revision and subscription inference version; using a
+request result to rank a current article additionally requires the same current article revision. Off cancels that user's
+pending/running selections and disables classification use; returning to training requires selection
+again. A mode/version change invalidates leases/commits for obsolete user demand, not another user's
+still-authorized shared work. An explicit current completed selection permits use of its answers;
+new content requires current authorization rather than silently analyzing a later revision.
+
+Compute the union of authorized **article/card** pairs, not user×article calls. Enrichment, L2 and
+translation are shared prerequisites for at least one admitted pair; cache-compatible existing
+answers cost no new call. An active subscriber may already have paid for the same article/card;
+a later authorized trainee reuses it, without revealing anyone's interests or ratings. Off users do
+not become automatically classified just because a shared cache happens to exist.
+
+Every producer **and** worker execution rechecks admission before reserving spend or calling a
+provider, including translation, L2-only, clustering, set/model upgrades, recovery and suggestions.
+No demand → no inference call, no provider retry, no new backfill. Preserve valid shared caches for
+other authorized users. For a request already on the wire, record its actual cost, but do not apply
+its result to a user who revoked demand. Global manual-reader rules still work without inference.
+
+**Selected training before slow inference:** capture immutable `analysis_requests.input_snapshot`
+and `input_sha` before applying an attached first rating. Include article text/revision, effective
+card/question/state/translation manifests, source timestamps and the user's feature context; never
+include the rating in a model question. A feedback event may reference that request. Deferred work
+may derive its feature vector from those frozen inputs after the rating arrives (spec 06 §8.2), so
+the first rating is useful without future-card/content leakage. Never replace the snapshot with
+current text/cards during retry; cancellation/reselection creates a new request. Features from an
+identical current cache are reusable with the same exact provenance. Training requests do not turn
+on continuous inference for their feed.
+
+`analysis.process {analysisRequestId}` owns selected-request work (spec 03). On completion write normalized
+facets/card answers/features to immutable `result_snapshot` with `result_sha`, linked to `input_sha`.
+A later live article edit does not invalidate the authorized historical training result: it stays
+request-specific. Populate shared current caches only if the live revision and all input manifests
+still match. Mode-version mismatch, cancellation or subscription deletion prevents publishing the
+request result. Automatic article workers below must never substitute a newer shared input for the
+manual frozen path. This distinction also applies to translation/clustering prerequisites. The result
+includes all normalized model inputs/features and their provenance required by spec 06; never write
+historical answers into newer `article_facets`/`card_answers`. Completion records debounced `user.learn`
+when a surviving rating references this request, plus a rank intent for still-current eligible content,
+in the same outbox transaction. This makes an inaugural rating learnable when slow processing finishes.
 
 ---
 
@@ -50,7 +113,8 @@ and `apps/worker/src/handlers/article-{enrich,match,cluster}.ts`, `card-backfill
   - It sets `settings['question_sets.active'][kind]` **only when that kind is absent**.
 - **Switching sets:** `settings['question_sets.active']` names the active set per kind. Switching
   `enrich` to a new set (`PATCH /admin/settings`) enqueues `house.reenrich {since: now − 7 days}`,
-  which re-enqueues `article.enrich` for those articles in batches, within the budget. A match-set,
+  which re-enqueues `article.enrich` only for those articles still admitted by §1.1, in batches within
+  the budget. A match-set,
   card-text-mode or model-pin change similarly queues bounded rematching and full reranks. Old
   incompatible answers cannot satisfy current cache lookups while replacement is pending. Store
   exact set/model/input provenance with golden runs; changing a set does not mutate frozen runs.
@@ -215,7 +279,9 @@ questions[`t2_${l1}`] = choice(
 ```
 
 The answers are stored in `article_topics_l2`. If an article has no cards to match, a match call is
-still made for the L2 questions **only if** the article's feeds have at least one subscriber.
+made for missing L2 questions **only if** current authorized active-arrival or exact selected-training
+demand remains under §1.1. A subscriber alone, an off feed or an unselected training article is
+insufficient; reuse compatible cached L2 answers without a call.
 Use deterministic branch ordering (probability descending, then id). Each selected branch is checked
 separately for a current answer; one cached L2 row must not suppress the other missing branch. Zero
 selected branches is a completed empty result, not a reason for endless retries. L2-only work follows
@@ -295,24 +361,30 @@ returns **effects** `{ refreshFeedIds: string[], backfill?: {cardIds, feedIds?},
 - Shared means reusable classification text, **not** public discovery: only public library rows and
   a user's own held/shared or owned/private rows are exposed through the API. Keep owner identities,
   holdings and examples private. Cross-tenant FK/kind rules are enforced in DB writes too. Never
-  promote a private fork or move its examples to a public row. Broader text-sharing/publication
-  consent remains an owner decision (PLAN §17, Q2); public promotion stays disabled until resolved.
+  promote a private fork or move its examples to a public row. Text sharing/reuse
+  is authorized, but library publication follows the explicit creator-consent procedure (§8.1).
+  `creator_user_id` records the immutable original creator when a new shared row is first inserted;
+  it is separate from private `owner_user_id`. Reusing a text hash, adopting or renaming a card never
+  transfers authorship. Deleted/unknown creators do not grant presumed publication permission.
 
 | Action | Effect |
 |---|---|
-| **Create** (text only; API `POST /cards`) | Compute `text_hash`. Reuse a `public`/`shared` card with that hash (un-retire it if retired), or insert `origin='user', visibility='shared', title`. Insert `user_cards` (strength, scope; `title_override` = the given title if it differs from the card's). Effects: refresh, backfill, rank full |
+| **Create** (text only; API `POST /cards`) | Compute `text_hash`. Reuse a `public`/`shared` card with that hash (un-retire it if retired), or insert `origin='user', visibility='shared', creator_user_id=me, title`. Insert `user_cards` (strength, scope; `title_override` = the given title if it differs from the card's). Effects: refresh, admitted-demand backfill only (§1.1), rank full |
 | **Adopt** a library card | Insert `user_cards`. Same effects |
 | **Make a card from an article** (`POST /cards/from-article`) | Create or reuse the shared text-only card for `{interest, not_for}`, then **fork** it with the article title in `examples_yes`. The user holds the fork |
 | **Add or remove an example** (interest card) | Build the new body: the current examples ± this one, newest 5 per side. Create or reuse the private fork with that body (hash includes the owner). Re-point the user's `user_cards` row to it (keep strength, scope, `title_override`). The previous fork, if any, is left for `house.retire-cards` |
 | **Edit text** (`PATCH /cards/:id` with `interest`/`not_for`) | As Create for the new text (a user with examples gets a fork of the new text carrying the same examples). Re-point `user_cards`. The old card keeps its answers for other holders |
 | **Rename** (`PATCH /cards/:id {title}`) | Set `user_cards.title_override`. No card change, no model calls |
 | **Change strength** | Update `user_cards.strength`. Effect: rank full. No model calls |
-| **Change scope** | Validate the new feed subscription, update scope, refresh the union of old/new feeds, backfill articles in newly included feeds (including feed A → feed B), rank full |
+| **Change scope** | Validate the new feed subscription, update scope, refresh the union of old/new feeds, backfill already-authorized articles in newly included feeds (including feed A → feed B); do not authorize historical/off-feed work, rank full |
 | **Delete** | Delete the `user_cards` row. Effects: refresh, rank full. Card rows are never deleted by the API; `house.retire-cards` retires unheld non-library cards (spec 11 §6) |
 | **Create a label** (`POST /labels`) | As Create with `kind='label'` (the hash includes the title). Insert `user_labels (card_id, name = title, color)` |
-| **Assign or unassign a label on an article** | **Does not touch cards.** It only updates `user_article.label_ids`/`label_suggestions` and records `label`/`unlabel` (spec 08 §5.3) |
+| **Assign or unassign a label on an article** | **Does not touch cards.** It only updates `user_article.label_ids`/`label_suggestions` and records `label`/`unlabel`; labels are neutral organization and never personal-interest training evidence (spec 08 §5.3) |
 | **Add or remove a label example** (`POST /labels/:id/examples`) | Fork the label (as for interest cards). Re-point `user_labels`. In the same transaction, `UPDATE user_article SET label_ids = array_replace(label_ids, old, new), label_suggestions = array_replace(label_suggestions, old, new) WHERE user_id = me`. Effects: refresh, backfill, `labelIdChange` |
 | **Rename or redefine a label** (`PATCH /labels/:id`) | A new label card by hash, re-pointed with the same `array_replace` |
+
+Explicit card authoring may still use the free tier-1 text translator; that user-requested card
+operation does not authorize article inference for any off/training feed.
 
 **`CARD_TEXT_MODE = 'english'`** (a setting, decided at gate G1). The **API service** handles
 translation, before the repository inserts a new card:
@@ -373,19 +445,26 @@ export function labelQuestion(card: CardRow, mode: CardTextMode): NoulQuestion {
 
 - `refresh_feed_cards(feed_ids)` (spec 02 §6) runs in the same transaction as any change to
   subscriptions, `user_cards`, `user_labels` or scope.
-- The set of cards to ask for an article is the union of `feed_cards` over the article's `feed_items`.
-- New articles get `match_queue` rows for that union right after enrich (priority 5). Matching and
+- `feed_cards` is the automatic **active-subscription** candidate cache, not permission by itself.
+  Intersect it with article arrival after each holder's activation and scope; add exact selected
+  training/active requests separately. Off/training subscriptions do not populate automatic demand.
+- The set of cards to ask for an article is the union remaining after §1.1 admission, including its
+  authorized selected-request cards. Never use an unfiltered feed-level union for paid work.
+- New admitted articles get `match_queue` rows for that union right after enrich (priority 5). Matching and
   L2-only job intents are committed through the outbox. A newly discovered `feed_items` association
-  on an existing article also queues newly applicable cards and reranks affected subscribers.
+  on an existing article queues newly applicable **authorized** cards and reranks affected subscribers;
+  a new carrier does not authorize off subscribers or an old pre-activation feed item.
 - Queue/cache membership is recomputed on execution. A queued pair with no active holders on any
-  current carrying feed is discarded, and a changed/deleted private card is never sent after its
+  current authorized carrying feed/request is discarded, and a changed/deleted private card is never sent after its
   owner no longer authorizes that use.
 
 ### 5.4 Backfill (`card.backfill {userId, cardIds, feedIds?, snapshotAt?, cursor?, processedCount?}`)
 
 1. On the first page fix `snapshotAt=now`, `processedCount=0`; carry both through continuation
    payloads (spec 03 §2). Revalidate that the user exists, still holds each card/label and subscribes
-   to the feeds. Intersect `feedIds` with subscriptions and each interest card's scope.
+   to the feeds. Intersect `feedIds` with subscriptions, §1.1 admission and each interest card's scope.
+   Card-maintenance backfill can refresh admitted active arrivals/current selected requests only;
+   an explicit historical backfill must first materialize bounded `analysis_requests` for selected ids.
 2. Select articles by eligible feed membership time in
    `[snapshotAt − plan.backfill_days, snapshotAt]`
    (default 7 days), not the possibly old globally deduplicated article timestamp. Include usable enriched/
@@ -405,17 +484,24 @@ export function labelQuestion(card: CardRow, mode: CardTextMode): NoulQuestion {
    arbitrary winner. Never reset a live current lease just because another user requested the pair.
 5. Durably enqueue singleton `article.match` for each affected article and any backfill continuation.
 
-A new subscription backfills all the user's applicable interest **and label** cards for that feed.
+A new subscription is `off` and creates **no inference backfill**. An active feed's admitted new
+arrivals include the user's applicable interest **and label** cards. Adding a card can reuse/backfill
+that existing admitted set; it does not expand historical authorization.
 Subscription cancellation/removing a card during a backfill is harmless because each page revalidates.
 
 ### 5.5 Match handler (`article.match {articleId}`)
+
+This is the **current shared article** worker. Selected frozen requests use `analysis.process`
+(§1.1); share pure builders/router/cache code, not a mutable article-only job identity. A cache fill
+from that request can satisfy this worker only when every current input fingerprint matches.
 
 1. **Snapshot and lease, no transaction across HTTP.** In a short transaction select up to 400
    current due rows (`attempts < 5`, `next_attempt_at ≤ now`, lease absent/expired), ordered by
    priority, queue time and card id, using `FOR UPDATE SKIP LOCKED`. Stamp a fresh `lease_token`,
    `lease_until` and `article_revision`, then commit. Lease duration must cover the router deadline;
    renew or stop if ownership is lost. The article worker also serializes L2-only scheduling.
-2. Drop retired/unheld/out-of-scope pairs. Delete already-satisfied rows only when a current answer
+2. Drop retired/unheld/out-of-scope or no-longer-admitted pairs; recheck inference mode/version and
+   selected request authorization from §1.1 before every outgoing pack. Delete already-satisfied rows only when a current answer
    matches **all** §2 fingerprints and an approved primary engine/model. LLM/prefilter answers are
    provisional and cannot suppress recovery. Read the active configuration once for this job snapshot.
 3. **Prefilter (optional, disabled until G1 validates recall).** With more than
@@ -433,7 +519,7 @@ Subscription cancellation/removing a card during a backfill is harmless because 
    a row has priority ≤3. Set `userId` only for one owner's private or single-requester work; shared
    and L2 costs remain platform costs. A private-only pack never carries another user's examples.
 6. **On ok**, in a short transaction compare current article revision, active set/mode/model policy,
-   concrete input fingerprints and lease token. If any changed, discard outputs and durably enqueue
+   concrete input fingerprints, current inference demand/version and lease token. If any changed, discard outputs and durably enqueue
    current work; its already incurred cost is still logged. Otherwise upsert only the returned pack's
    answers and L2 rows with full provenance, rebuild compatible features, and delete only the rows
    leased and answered by this pack. A newer/primary answer cannot be overwritten by an older or
@@ -442,6 +528,8 @@ Subscription cancellation/removing a card during a backfill is harmless because 
    lease, record `last_error`, set `next_attempt_at` (next UTC budget day, known retry time, or the
    10-minute recovery interval). Do not increment failure attempts or immediately re-enqueue a hot
    loop. Deferred service unavailability is visible to ranking, so readers get a useful Maybe fallback.
+   **On `no_demand`:** cancel/drop only the now-unauthorized request/pair quietly, without a provider
+   retry or charging a failed inference. Preserve other current holders' demand.
    **On actual retry exhaustion:** increment attempts once for that logical pack, schedule exponential
    job delay (1, 2, 4, 8 minutes), and retain rows at `attempts=5` as exhausted/unavailable. Permanent
    invalid requests are exhausted immediately and alert with redacted diagnostics. No unknown work
@@ -455,8 +543,9 @@ Subscription cancellation/removing a card during a backfill is harmless because 
    completes; retrying an enqueue that was suppressed by the current singleton is mandatory. Future
    due/exhausted rows are recovered by the scheduler, not busy-polled by the current handler.
 
-**Reader-specific coverage contract (spec 06):** consider only the user's currently held, scoped,
-positive cards. A valid non-prefilter current answer is `answered`; missing work scheduled normally
+**Reader-specific coverage contract (spec 06):** first check §1.1 inference eligibility; off/nonselected
+items are unclassified, never degraded merely because analysis was not requested. For admitted
+articles consider only the user's currently held positive cards scoped to an authorized carrying feed. A valid non-prefilter current answer is `answered`; missing work scheduled normally
 is `pending`; no-key/budget/breaker/exhausted or prefiltered work is `unavailable`. Labels/never-cards
 have independent coverage. Missing is never numerically equivalent to negative. Retain valid high
 positive evidence; incomplete low positive evidence cannot send an item to Everything else. With no
@@ -476,11 +565,12 @@ In one transaction:
    selected translation or extracted body is installed with the new revision atomically so it is
    not immediately lost. The invalidation routine accepts the new derivative and next-stage intent;
    it does not delete the very input that triggered the update.
-2. Upsert the **distinct** applicable feed-card union into `match_queue`, replacing the revision and
+2. Upsert the **distinct admitted** article/card union (§1.1), never resurrecting cancelled selections, into `match_queue`, replacing the revision and
    clearing old leases/attempts. Old in-flight jobs cannot commit because §5.5 compares revisions.
 3. Set `pipeline_state='ingested'` when extraction is needed or `'translated'` when enrichment is
    next; clear stale operational error fields and invalidate stale clustering membership.
-4. Record prerequisite extract/enrich and affected-user rerank intents in `job_outbox`. Matching
+4. Record prerequisite extract and, only for admitted demand, enrich intents, plus affected-user
+   rerank intents in `job_outbox`. Matching
    waits for current facets; it must not race ahead merely because queue rows already exist.
 
 All producers use this one invalidation contract. Content equality/fingerprints avoid resetting on
@@ -489,6 +579,10 @@ identical fetches. Workers cannot resurrect deleted users/cards/articles during 
 ---
 
 ## 6. Story clustering (`article.cluster {articleId}`)
+
+Require current article-level demand (§1.1) before candidate/model work. Only compare candidates
+that already have compatible authorized classification; do not expand paid inference into unrelated
+off feeds merely to create cluster context.
 
 1. **Candidates** (SQL):
 
@@ -554,7 +648,10 @@ attempts still consume this 24h opportunity. Renew the lease for the bounded log
 candidates or a budget deferral before sending releases the lease without consuming the opportunity.
 Expired leases recover after a crash; queue throttling alone does not replace this durable claim.
 
-1. **Unexplained likes:** articles the user rated +1 (or bookmarked) in the last 30 days where the max
+1. Recheck that the user has active inference or explicitly selected training demand. An off-only
+   user receives no suggestion call. Candidate source articles must be currently authorized for that
+   user under §1.1; a historical rating alone is not inference permission.
+   **Unexplained likes:** articles the user rated +1 (or bookmarked) in the last 30 days where the max
    `p` over the user's applicable positive cards is <0.3, using complete current primary-engine
    answers. Do not treat missing/prefilter/fallback or never-card answers as unexplained likes. With
    zero positive cards, onboarding supplies suggestions instead. Stop if fewer than 3 eligible items.
@@ -581,21 +678,36 @@ Expired leases recover after a crash; queue throttling alone does not replace th
 - **`pnpm db:seed`** (`apps/worker/src/seed.ts`, running as `feedit_worker`) upserts by `slug` into
   `interest_cards` (`origin='library', visibility='public'`, `i18n.sk` from the `*_sk` fields):
   - **Unchanged text** (same `text_hash`): update `title`, `topic_ids`, `i18n` in place.
-  - **Changed text:**
-    - insert or reuse a new card with the new hash (handle the unique hash conflict)
-    - move the `slug` to it (set the old row's `slug = NULL` first)
-    - retire the old row
-    - re-point holders preserving strength, scope and display override. If a user holds both rows
-      with identical settings, coalesce idempotently; differing settings are a migration conflict.
-      Abort that seed-entry transaction and report it for resolution instead of deleting preferences
-    - call `refresh_feed_cards` for the affected feeds
-    - durably enqueue `card.backfill` and full rerank for each affected user through the outbox
-    - keep private forks immutable and attached to their historical parent; do not rewrite examples
-  - Each seed entry and its holder migration is transactional. A second seed run is a no-op.
-    **Initial seeding is enabled; runtime semantic upgrades remain blocked pending PLAN §17 Q9**
-    (automatic migration versus opt-in upgrades). The migration procedure above is used only under
-    the approved policy; no deployment silently changes holders' interest meaning. Display-only
-    corrections are permitted; collision handling never discards different strength/scope settings.
+  - **Changed semantic text:** create/reuse a new immutable public library version, move the
+    discovery `slug` to it transactionally, and append
+    `library_card_versions(library_slug,version,card_id,previous_card_id,created_at)` with monotonic
+    version and the old card as `previous_card_id`. Library discovery shows the current version;
+    older versions remain accessible to their holders and through exact update lineage.
+    Keep the old card readable/answer-valid and held by existing users. Do **not** retire a held old
+    version, re-point `user_cards`, rematch its holders, or change their model context automatically.
+    A reused non-public shared hash must first complete creator consent (§8.1), so seed cannot bypass
+    publication controls; hold that entry with a report rather than silently promote it.
+  - Each seed entry/version-link transaction is idempotent. Cosmetic title/i18n/topic corrections are
+    permitted in place only when they do not alter classification semantics; question/example/text
+    changes always create a version. Private forks retain their historical immutable parent.
+  - **User-controlled updates (Q9 resolved):** `GET /library/updates` returns exact old/new ids and
+    semantic text/example differences for held old versions (and related private forks), without
+    applying them. `POST /library/:id/updates/:newId/apply {expectedCurrentCardId}` verifies the
+    advertised old→new lineage and current unforked holding inside one transaction:
+    - explicitly switch only that holder to the proposed new card, preserving strength, scope and
+      display override. If already holding the target with identical settings, coalesce idempotently;
+      differing settings return a conflict and preserve all existing choices.
+    - old private/custom forks remain unchanged. "Customize instead" opens the existing explicit
+      card editor with the proposed semantic diff for review; normal immutable edit/example-fork
+      rules apply to the user's submitted text/examples. Do not auto-merge upstream wording into a
+      fork or silently drop/copy its private examples. Applying a shared update to a private current
+      holding returns a conflict until the user explicitly edits it or removes/adopts a chosen card.
+    - on accepted change: refresh active-demand membership, invalidate that user's compatible model
+      context, enqueue admitted-demand backfill and full rerank via the outbox. Other holders, their
+      scores and their selected old version remain unchanged.
+    - ignoring an update means keeping the existing version indefinitely while held; no timeout,
+      deployment or background seed interprets silence as acceptance. A later library update is a
+      new explicit old→new offer, not permission to skip the user's choice.
 - **Size:** ≥ 150 cards in total and ≥ 5 per L1 (except `other`), including ≥ 15 cards specific to
   Slovakia/Czechia (e.g. Slovak domestic politics, Czech tech scene, Tatras hiking, Slovak football
   league).
@@ -624,31 +736,61 @@ Expired leases recover after a crash; queue throttling alone does not replace th
 | `space-launches` | Space launches | Rocket launches, spacecraft missions and launch-industry news | Astrology; sci-fi films | `science.space` |
 | `personal-finance-eu` | Personal finance (EU) | Saving, investing and pensions for individuals in the EU, especially Slovakia and Czechia | Corporate earnings | `business.personal_finance` |
 
+### 8.1 Public promotion of a user-created shared card (Q2)
+
+Sharing/reuse is allowed; inclusion in the discoverable public library requires separate affirmative
+consent from `interest_cards.creator_user_id`, for the **exact immutable card id/text hash and proposed
+publication metadata**. Holder count (≥3 for candidate discovery) is useful curation evidence, never
+a consent substitute. Private forks/examples cannot be promoted or copied into public text.
+
+1. Admin records a `card_publication_requests` row through
+   `POST /admin/library/promotion-requests`. Resolve the original creator from stored provenance;
+   do not choose a current holder, latest editor, hash adopter or the admin as substitute creator.
+2. If the original creator has `last_active_at ≥ now−7 days`, expose the request to that creator via
+   `GET /cards/publication-requests`; their `respond` action records approve/decline against the exact
+   request version. Seven days defines **recent activity**, not an automatic response deadline.
+3. `POST /admin/library/promote {requestId,expectedVersion}` locks the request/card, verifies an
+   affirmative current creator response and unchanged immutable/publication payload, then changes
+   visibility to public and records the audit event. Rejection or changed metadata cannot pass.
+4. No response, inactive/deleted/unknown creator, conflicting provenance, or withdrawn consent keeps
+   the card shared and unlisted. PLAN §17 Q12 must decide any future inactive/no-response policy;
+   there is no timeout-to-consent fallback. Do not send actual requests as part of implementing this
+   plan; these are future in-app workflows.
+
+A concurrent first insert decides creator once; hash reuse never changes it. Seed-authored library
+cards are curated public inputs with recorded seed provenance, but collisions with user-created
+shared cards still follow this procedure. Audit records distinguish author consent, admin publication
+and later semantic version proposals.
+
 ---
 
 ## 9. Cost math (the reference for budgets)
 
-Assumptions:
-- Call A ≈ 2.0k input tokens (state ≈ 700, questions ≈ 1.3k).
-- Card question ≈ 250 tokens.
-- Call B state ≈ 600 tokens.
-- L2 questions ≈ 300 tokens.
-- $0.042 per 1M input tokens.
+Forecast **authorized unique work**, not all fetched articles or a full call for every subscriber.
+For each day let A be distinct article revisions admitted by §1.1 needing shared enrichment, and C_a
+be distinct authorized unanswered card ids for article a. Off feeds contribute zero provider demand;
+training contributes selected requests only; active feeds contribute new arrivals since activation.
+Explicit historical selections/backfills are a separate bounded input. Existing compatible cache
+answers reduce A/C_a before estimating spend. Multiple users of the same article/card share one call;
+private owner partitions still require separate packs.
 
-| Scenario | Articles/day (non-stale) | Distinct cards per feed (avg) | Call A tokens | Call B tokens | $/day |
-|---|---|---|---|---|---|
-| Invite-only beta: 20 users, 400 feeds | 5,000 | 10 | 10M | 5,000 × (600 + 300 + 2,500) = 17M | **≈ $1.1** |
-| 100 users, 1,500 feeds | 20,000 | 20 | 40M | 20,000 × (900 + 5,000) = 118M | **≈ $6.6** |
-| 5,000 users, 15,000 feeds | 150,000 | 40 | 300M | 150,000 × (900 + 10,000) = 1.64B | **≈ $81** |
+Illustrative token assumptions (verify at G1): Call A 2,000 input tokens, Call B state 600,
+card question 250, selected L2 questions about 300. For each actual pack include its repeated state,
+questions and serialization overhead. At the verified Jev rate of $0.042/M input tokens:
 
-Clustering adds ≈ 1.5k tokens for about 30 % of articles, and suggestions are negligible.
+`estimated Jev cost = 0.042 × (2000*A + Σ actual-pack input tokens + clustering/suggestion tokens) / 1e6`.
 
-These are illustrative token estimates at the verified Jev rate, not capacity guarantees. Distinct
-cards means the union for each article across carrying feeds, including labels, private forks and
-separate privacy batches. Backfills, retries, reclassification, translation, fallback output tokens and
-provider minimums are additional. The $2/day default is an initial cap; verify workload p95 at G1 and
-monitor paused backlog age before increasing invites or budget. Clustering and suggestions can be
-disabled independently under budget pressure without losing core match work.
+Example: a 20-user beta may fetch 5,000 articles/day, but if only 1,000 revisions have active or
+selected demand and each needs ten shared cards in one pack, A=1,000 and Call B≈3.4M tokens; A+B≈5.4M
+input tokens, ≈$0.227/day before optional/extra costs. This is a demand-mix example, **not** a promise
+that 20% of feeds will be active. If all 5,000 need the same work, the comparable base is ≈$1.134/day.
+Record both the expected activation mix and an all-active upper scenario in G1.
+
+Slow training requests use `priority:'bulk'` and the same budget/deferred recovery; they cannot
+silently borrow automatic feed authorization. Include translation, fallback output, private packs,
+retries/reclassification, explicitly requested history, and provider minimums separately. Suggestion
+cost scales with eligible users, not all registered users. The daily cap and queue-age alert constrain
+spend; track pending training age separately so "slow" never means lost work.
 
 ---
 
@@ -694,4 +836,14 @@ per-kind engine precedence/calibration policy; it is not automatically interchan
 - LLM-only card recovery with a Jev-enriched article; current cache invalidated by card-text-mode change
 - private-batch isolation, cross-tenant card ids rejected and label rename keeps semantic identity
 - L2-only, zero selected branches and one cached/one missing branch; joint probability feature values
-- seed migration rollback on conflicting holder settings and cluster delivery twice leaves size unchanged
+- a semantic seed update offers an immutable version without migrating any holder; explicit replace
+  preserves settings, conflicting target holdings roll back, and private forks remain unchanged
+  unless their owner explicitly submits a reviewed edit
+- creator provenance survives hash reuse; consent is exact-version, another holder cannot approve,
+  and inactive/no-response/deleted creator keeps publication on hold
+- off-only ingestion makes zero inference calls even when shared answers exist; training analyzes
+  only selected ids; active admits new arrivals since activation without historical auto-backfill
+- request cancellation/mode-version races revoke that user without breaking other active demand;
+  two authorized users reuse one article/card answer and no gratuitous per-user provider calls occur
+- first rating with slow analysis uses frozen pre-feedback inputs; retries never read later cards/text
+- cluster delivery twice leaves size unchanged

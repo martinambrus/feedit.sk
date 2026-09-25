@@ -89,8 +89,9 @@ A possible later plan is a **hybrid**, conditional on evaluation:
 | Cost | | $0.042/M tokens, about $0.29/day for one user | $0 plus hardware | $0 plus hardware plus labelling effort |
 | Operations | | early access, dynamic rate limits | self-hosted, no vendor risk, data stays local | as base, plus retraining |
 
-**The core tension.** The main idea of the plan is "ask instead of train": interest cards work on day one
-with no labelled data. Laya reverses that. It is "a fast base to specialise, not a zero-shot decision
+**The core tension.** Interest cards can answer a selected article with no personal training data.
+The owner's feed mode still gates all inference: an untrained/off subscription invokes neither Jev nor
+Laya, and switching engines never bypasses that gate. Laya reverses that. It is "a fast base to specialise, not a zero-shot decision
 engine", and the guidance is to "plan to fine-tune on a few thousand labelled examples". So Laya can't
 replace Jev in the *user-facing* flexible part unless we make it generalize to new card texts through
 training.

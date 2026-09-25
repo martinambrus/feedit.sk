@@ -3,7 +3,8 @@
 Status: **binding**. **Intent:** turn stored model answers into a per-user probability of "you'll like
 this", put each article into a lane, and always be able to say why. Card/BM25 scores are
 heuristic confidence scores, not calibrated probabilities; only an evaluated personal model may
-claim calibration. Only a confident "no" may hide anything. Personal learning *refines* the card-based score. It never gates the first useful result.
+claim calibration. Only a confident "no" may hide anything. Personal learning *refines* the card-based score. Off feeds remain useful as chronological RSS
+reading; inference begins only for selected training articles or explicitly active feeds (spec 05 §1.1).
 
 `packages/ranker` is **pure**: every function takes plain inputs and returns plain outputs. The worker
 handler `user.rank` does the I/O (§7). The same functions run inside `apps/eval`.
@@ -28,13 +29,16 @@ interface UserRankContext {
   reasonCounts90d: Record<Reason, number>;
   staleDislikes90d: number;        // dislikes (any reason) on items that were stale when rated (§5)
   model?: ActiveModel;                                                     // §8
-  subscriptions: { feedId: string; allowDuplicates: boolean }[];
+  subscriptions: { feedId: string; allowDuplicates: boolean; inferenceMode: 'off'|'training'|'active';
+                   inferenceVersion: string; inferenceActivatedAt?: Date }[];
   readClusterIds: Set<string>;                                             // clusters with a member read in the window
   bm25: Bm25Corpus;                                                        // document frequencies over the user's whole window (§9)
 }
 interface RankItem {
   articleId: string;
-  feedIds: string[];               // the article's feeds ∩ the user's subscriptions
+  feedIds: string[];               // all article carriers ∩ user's subscriptions (manual rules)
+  inferenceFeedIds: string[];      // only carriers authorized for this user/article revision (§2)
+  inferenceEligible: boolean;     // inferenceFeedIds is non-empty; not global cache availability
   domain: string; author: string | null;
   titleNorm: string; excerptNorm: string; translatedTitleNorm?: string; translatedExcerptNorm?: string;
   firstSeenAt: Date; publishedAt?: Date; contentRevision: string; wordCount: number | null; hasImage: boolean; lang: string;
@@ -62,9 +66,15 @@ that type, and the API and web client read it (§6.2).
 
 ## 2. Order of evaluation (normative)
 
+**Admission first:** derive `inferenceFeedIds` with spec 05 §1.1 from active arrival timestamps or
+exact selected analysis requests. A global cached answer, an old rating/bookmark, personal-model
+activation, or another user's active subscription grants no inference permission. Preserve plain
+reading and explicit manual hide/mute rules for off/nonselected items; return `new`, P/tier null,
+source `none`, no inferred label suggestions, with `inference_not_requested` in the explanation.
+
 Before evaluation, discard answers for a different content revision, state/question manifest or
 inactive card. Apply scope to **all** card operations (including never, must, explanations, BM25 and
-training): only cards whose `scopeFeedId` is absent or in `item.feedIds` are applicable. A `prefilter`
+training): only cards whose `scopeFeedId` is absent or in `item.inferenceFeedIds` are applicable. A `prefilter`
 result is a provisional non-match, not negative evidence; it does not count as an answered card.
 `matchCoverage` is derived from the applicable cards' work status (spec 05), never inferred solely
 from the global article pipeline state. With no applicable positive cards, return `new` after explicit
@@ -75,6 +85,8 @@ Lane order for "at most" and "at least": `hidden < everything < maybe < for_you`
 ```
 rankArticle(ctx, item, now):
   1. if a hide rule matches (§3.1)                   → RETURN 'hidden' (fire its code)
+  1b. if NOT item.inferenceEligible                  → RETURN 'new', P null, source 'none',
+                                                        fire 'inference_not_requested'
   2. if item.pipelineState == 'stale'                → RETURN lane 'new', P null, source 'none'
   3. if a never-card has p ≥ never.hide (§4.2)       → RETURN 'hidden' (fire never:<id>)
   4. base probability P:
@@ -132,7 +144,7 @@ has `expires_at = now + N days`, with N ∈ {1, 3, 7, 30}.
 
 `mute_keyword:<value>`, `mute_story`, `block_feed`, `block_domain`, `block_author`, `boost_feed`,
 `boost_domain`, `never:<cardId>`, `never_soft:<cardId>`, `must:<cardId>`, `demote:clickbait`,
-`demote:promotional`, `demote:shallow`, `demote:stale`, `degraded`, `llm_answer`, `seen_story`, `pending_cards`.
+`demote:promotional`, `demote:shallow`, `demote:stale`, `degraded`, `llm_answer`, `seen_story`, `pending_cards`, `inference_not_requested`.
 
 ---
 
@@ -224,8 +236,25 @@ Labels in `explain` use the English names; the web client localizes the topic id
 
 ### 6.3 Label suggestions
 
-For each of the user's labels with an answer `p ≥ 0.8` that is not already in `item.labelIds`, add the
+Only for inference-eligible items, for each of the user's labels with an answer `p ≥ 0.8` that is not already in `item.labelIds`, add the
 label to `labelSuggestions`. The UI shows them as tappable chips ("tap to keep", as in FeedIt).
+
+### 6.4 View-scoped inference projection (shared pure helper; API spec 08)
+
+`user_article` has one global score per user/article, derived from all that user's authorized carrying
+feeds. A direct feed/folder view must not import inference permission from another carrier outside
+that view. Example: the same article belongs to off feed A and active feed B; global/B may show a
+score, while A remains an unclassified chronological reader.
+
+Before folding, lane/tier filters and counts, intersect the row's authorized `inferenceFeedIds` with
+the view's permitted feed set. If none remain, recompute only the explicit local hide/mute rules and
+project `lane='new'`, `pLike/tier=null`, `scoreSource='none'`, no model/never-card/must-card result or
+inferred label suggestions; explain `inference_not_requested`. Preserve manual read/rating/bookmark/
+label state. Do not apply model-derived semantic story folding to this neutral projection. Global
+views with at least one eligible carrier use the cached global score; bookmark-only retained rows
+without a current authorized subscription are neutral too. Detail navigation carries `feedId`/view
+context so it does not unexpectedly reveal a different score. Counts and list pagination apply the
+same projection. This requires no provider work and never overwrites another view's global cache.
 
 ---
 
@@ -249,7 +278,8 @@ insertion goes through the transactional outbox (spec 03). Version numbers are s
 
 1. **Load `UserRankContext`**, including:
    - `readClusterIds`: clusters with any member read by the user in the window
-   - `bm25`: document frequencies over **all** window articles, not just the dirty ones (§9)
+   - `bm25`: document frequencies over **all inference-eligible** window articles, not just the dirty
+     ones (§9); off/nonselected items remain neutral without running a keyword fallback
 2. **Dirty set** (SQL, window `RankerConfig.windowDays` = 14; **5,000 is a batch size, not a total
    eligibility cap**). Iterate by stable `(first_seen_at, id)` keyset until every eligible item is
    considered; use one captured `now` for the run. Articles
@@ -295,10 +325,10 @@ insertion goes through the transactional outbox (spec 03). Version numbers are s
 | a read, mark-read, open, unread or undo affecting a cluster | yes (invalidate both addition and removal of seen evidence) |
 | card or label added/removed/strength/scope changed | yes |
 | rule created/deleted, or expired (hourly `house.expire-rules`) | yes |
-| preferences changed (`demote`, `implicitNegative`), feedback reason/count changed or aged out | yes |
+| preferences changed (`demote`, `implicitFeedback`, `implicitNegative`), feedback reason/count changed or aged out | yes |
 | `ranker.thresholds` changed | yes (users active in 7 days; the others lazily, as above) |
 | new active model | yes |
-| subscription added/removed/duplicate policy changed; article joins/leaves a carrier or cluster | yes |
+| subscription added/removed/duplicate policy/inference mode changed; selection admitted/cancelled; article joins/leaves a carrier or cluster | yes |
 | freshness/expiry deadline reached | no (due rows plus user-wide auto-demotion invalidation) |
 
 ---
@@ -315,11 +345,11 @@ insertion goes through the transactional outbox (spec 03). Version numbers are s
 | Freshness | one-hot `age.lt6h/lt24h/lt72h/older`: disjoint [0,6h), [6h,24h), [24h,72h), [72h,∞), using age at snapshot for training and now for scoring (§5) |
 | Language | one-hot `lang.en/sk/cs/other` |
 | Other | `has_image`, `cluster_log = ln(1 + clusterSize)` |
-| Source | `feed.h<k>`, one-hot with k = murmur3(feedId) mod 32, using the lowest id in `item.feedIds`. `author.h<k>`, one-hot with k = murmur3(`normalizeText(author)`) mod 16 (none if there is no author). murmur3 = **MurmurHash3 x86 32-bit, seed 0, over the UTF-8 bytes** of the decimal id string or the normalized author |
+| Source | `feed.h<k>`, one-hot with k = murmur3(feedId) mod 32, using the lowest numeric id in `item.inferenceFeedIds`. `author.h<k>`, one-hot with k = murmur3(`normalizeText(author)`) mod 16 (none if there is no author). murmur3 = **MurmurHash3 x86 32-bit, seed 0, over the UTF-8 bytes** of the decimal id string or the normalized author |
 
 `feature_spec_sha` hashes the canonical feature algorithm and ordered feature names. In addition,
 `metrics.context_sha` hashes the complete per-user input manifest: all interest card ids, strength
-and scope (including cards outside the first 30), feature spec, active
+and scope (including cards outside the first 30), both behavioral-consent flags, feature spec, active
 question/state/translation manifests, ranking config and model engine/version. Display-only card
 renames and ordinary subscription additions are excluded (source hash vocabulary is fixed). Store the manifest, scaler and dropped columns with the model. A mismatch
 immediately disables model scoring until a compatible model is trained; positional vectors must
@@ -330,33 +360,57 @@ manifest** are used. `prefilter` is unknown, not a probability. If any applicabl
 or facet came from `llm`, the item is left out of training and follows the cards path until compatible
 answers exist. Label-card engines do not affect interest-model eligibility. Laya/Jev feature families
 must not be mixed without a new evaluated feature spec. Facet unknowns need masks just like cards.
-Raw article/card text is not written into training event snapshots.
+Raw article/card text is not duplicated into feedback-event feature snapshots; selected analysis
+requests keep the bounded private frozen input required for reproducibility under the same RLS.
 
 ### 8.2 Labels and event-time snapshots
 
 There is **one current sample per user/article**, never one per event. Use the latest explicit state
 first; otherwise use the highest-priority surviving implicit signal below. Signals do not accumulate
-weights. Current undo/unbookmark/unlabel state removes the corresponding evidence.
+weights. Current undo/unbookmark state removes the corresponding interest evidence; label events never
+provide such evidence.
 
 | Signal (priority order) | y | weight |
 |---|---|---|
 | rating +1 / −1, including prompt answers | 1 / 0 | 1.0 |
 | bookmarked, not rated | 1 | 0.8 |
-| label assigned, not rated, **only when `model.labelAssignmentsPositive` is enabled after owner approval** | 1 | 0.8 |
-| opened with observed dwell ≥ 30 s, not rated | 1 | 0.3 |
-| observed complete open/return session with dwell < 5 s, not rated | 0 | 0.2 |
-| marked read without opening, not rated, and `prefs.implicitNegative` | 0 | 0.1 |
+| opened with observed dwell ≥ 30 s, not rated, event-time `implicitFeedback=true` | 1 | 0.3 |
+| observed complete open/return session with dwell < 5 s, not rated, event-time `implicitFeedback=true` | 0 | 0.2 |
+| explicit individual mark-read without opening, not rated, event-time `implicitFeedback=true` **and** `implicitNegative=true` | 0 | 0.1 |
 
-**Label meaning is an owner decision (PLAN §17 Q10).** Default `model.labelAssignmentsPositive=false`:
-label assignments are neutral organization and do not train interest. Keep fixtures for the previously
-proposed 0.8-positive behavior behind the explicit flag, but do not enable it in production until Q10
-is resolved. A label example still refines its own label classifier, not personal interest directly.
+**Behavioral consent:** `prefs.implicitFeedback` defaults to false and gates both positive and
+negative evidence derived from dwell/open/read behavior. An explicit thumbs-up/down, prompt answer
+or bookmark remains its separately declared signal; ordinary reader-state updates do not imply
+behavioral consent. At event creation store
+`learningConsent: {implicitFeedback: boolean, implicitNegative: boolean}` and
+`signalOrigin: 'explicit'|'expand'|'rating_side_effect'|'open_side_effect'|'bulk_mark_read'` in
+`feedback_events.value` (no new DB columns). Read the preferences inside the mutation transaction;
+an offline replay cannot claim historical opt-in from an untrusted client value.
+
+Without opt-in, `/dwell` stores no duration/event/features and produces no prompt. Read/open may
+still update their functional reader state and minimal mutation audit/undo data, but do not capture
+additional behavioral feature snapshots, schedule behavioral learning or reconstruct such features
+from private bookmark/analysis snapshots. Unknown/legacy event-time consent means false. Enabling
+consent later never retroactively makes pre-consent history eligible. Automatic mark-read from
+expand/open/rating and bulk mark-read are never stand-alone negative labels, even with both flags
+on; only a direct individual read action can supply that row of the table.
+
+Sample extraction requires event-time opt-in **and** current opt-in. Disabling it invalidates models
+that consumed behavioral samples and retrains from remaining eligible explicit/bookmark evidence;
+include both consent flags in the model context manifest. Reader convenience and explicit training
+continue to work when behavioral learning is off. This preference does not authorize feed inference.
+
+**Labels are neutral (Q10 resolved).** Assigning, removing or editing an organizational label never
+implies liking/disliking and never trains the personal-interest model. An explicit label example may
+refine that label's own classifier, without contributing a personal-interest training sample. There
+is no label-as-positive configuration switch. Only a separate explicit rating/bookmark or another
+listed signal can supply interest evidence for the same article.
 
 Un-rating suppresses all earlier implicit evidence for that article until a new positive/negative
 action occurs; it must not immediately turn an undone dislike into a bounce dislike. A missing return
 beacon is unknown dwell, not zero. Off-site dwell measures elapsed time away, not observed reading;
 keep its weak weight and show this limitation in the privacy/learning explanation. Bulk mark-read and
-archive operations are housekeeping, not dislike evidence unless explicitly opted in.
+archive operations are housekeeping, never stand-alone dislike evidence.
 
 **`feedback_events.value` v1:** every feedback mutation stores the signal payload and an immutable
 `before` snapshot `{lane,pLike,tier,scoreVersion,rankRevision,scoredAt}` from the ranking seen before
@@ -364,11 +418,29 @@ that action, plus `staleAtFeedback` (boolean or null). Learning-relevant actions
 `features: {specSha,contextSha,values,sourceManifest,snapshotAt}` when valid inputs exist. Build it
 before applying the action, under the same content revision as the displayed score. Features include
 known masks, all values needed for the cards-only baseline, and the story-group id at that time.
-If inputs are absent/stale, leave `features` null: retain the explicit rating but omit it from training
-until the user supplies a new compatible event. Never reconstruct historical training inputs from
-future enrichments, later card examples, larger future clusters or current article age. Undo refers to
+For selected slow training, capture or reference `analysisRequestId`, immutable `input_sha` and the
+pre-feedback input snapshot before committing the first rating (spec 05 §1.1). `features` may be null
+while analysis is pending; once complete, a separate immutable derived feature snapshot may be
+linked through `analysis_requests.result_snapshot/result_sha` by that request/input hash. Computing a feature later is allowed **only from the exact frozen
+pre-feedback article/card/question context**, never using the user's answer in model input. The
+rating time determines age/features; later cluster growth, changed examples/text/translations or a
+new question/model manifest cannot be substituted. Record processing time separately from snapshot
+time. A current cache with identical pinned inputs may satisfy the request without a new call.
+
+If inputs are absent/stale and no authorized frozen request exists, retain the rating but omit it
+from training until a new compatible event; do not infer permission from the rating alone. Saved
+bookmark actions may reference an older `snapshotId/contentRevision` (spec 08). Never borrow current
+features for that old content: use matching captured features/authorized frozen input or omit the
+sample. A changed rating supersedes its earlier label while keeping the exact source snapshot and
+chronology; it does not create duplicate evidence. Undo refers to
 its original receipt/events and restores the prior effective signal instead of producing a fresh
 training example. Events and snapshots remain private per-user data under RLS and account deletion.
+
+Feed training mode and personal model activation are separate. Selected training requests can
+supply explicit samples before any feed is active; a successful `user.learn` never changes
+`subscriptions.inference_mode`. Off/revoked demand prevents new provider work and score application;
+retained explicit feedback is private history, not permission to reclassify arbitrary feed items.
+Automatic graduation remains Q11; enable feed inference explicitly until it is decided.
 
 Only surviving samples with snapshot and feedback timestamps within the last **180 days** are used.
 The current `context_sha` must match; changing card definitions/strengths/scopes may therefore return
@@ -420,6 +492,8 @@ the user to cards-only ranking until enough compatible feedback exists.
 - Undo/unrate/deletion or a context change invalidates affected models immediately and enqueues learn
   even below ten. Changes to implicit evidence, preferences and 180-day retention also participate in
   the nightly trigger. No revoked evidence may remain silently active in a stored model.
+- A selected analysis request completing valid features for already-recorded feedback also enqueues
+  learning; the earlier pending rating must not be stranded below a stale training watermark.
 - `house.nightly-learn` enqueues users whose effective input manifest differs from the last attempt,
   including implicit-only changes and expiry; users with no changed inputs do not retrain.
 - Handler: under per-user serialization capture a committed feedback cutoff/context hash → build
@@ -443,7 +517,7 @@ baseline (spec 10).
   compare translated English documents to untranslated Slovak/Czech queries. Without a matching
   query translation, use the original document/query pair and report this in eval.
 - **Corpus statistics:** document frequencies over **all** articles in the user's rank window (14 days
-  of their subscriptions). They are computed once per `user.rank` run, so scores don't depend on how
+  of their authorized subscriptions/selections, using §1.1 admission from spec 05). They are computed once per `user.rank` run, so scores don't depend on how
   many items happen to be dirty. IDF uses +0.5 smoothing. `k1 = 1.2`, `b = 0.75`. The eval builds the
   corpus from the rater's assigned frozen articles (no rating information enters the corpus).
   Exact IDF is `ln(1 + (N-df+0.5)/(df+0.5))`; term contribution is
@@ -459,7 +533,13 @@ baseline (spec 10).
 ## 10. Active learning and feedback prompts
 
 - **Maybe lane order:** by `|P − 0.5|` ascending (most uncertain first), then newest first.
+- **Feed training selection:** before scores exist, let the user select up to 20 articles from the
+  chosen feed using chronological/source metadata only; confirm training mode and create exact
+  analysis requests. A rating may be recorded immediately against the frozen request input and
+  processed slowly. Never run hidden inference over the whole feed to choose those samples.
 - **Calibration round** (onboarding step, and a weekly "Tune your feed" card in the reader):
+  - eligible sources are active arrivals or already selected training articles only; retrieving a
+    calibration page does not authorize or pay for new articles
   - 10 unrated articles from `maybe`, at most 7 days old, at most 3 per feed
   - pick the most uncertain first
   - if `maybe` has fewer than 10, fill from `everything` with the highest P
@@ -469,7 +549,8 @@ baseline (spec 10).
     evaluation can separate deliberately uncertain examples from ordinary reading.
 - **"Did you like it?" prompt** (from FeedIt's todo list), shown when the reader returns to the app
   after opening an article:
-  - only if `dwell_ms ≥ 6,000`, the article is unrated, and `feedback_prompted_at` is null
+  - only if current `prefs.implicitFeedback=true`, the correlated dwell event was collected with
+    event-time consent, `dwell_ms ≥ 6,000`, the article is unrated, and `feedback_prompted_at` is null
   - whenever `POST /articles/:id/dwell` answers `prompt: true`, it also sets `feedback_prompted_at`, so
     an ignored prompt never returns
   - and either `lane = 'maybe'` or deterministic uniform hash(user, article, open-session) < f,
@@ -500,7 +581,7 @@ export const DEFAULT_RANKER_CONFIG = {
   labelSuggest: 0.8,
   windowDays: 14,
   model: { lambda: 1.0, minExplicit: 30, minEachClass: 5, minCvAuc: 0.60, maxBaselineDrop: 0.02,
-           retrainEvery: 10, historyDays: 180, keepVersions: 3, labelAssignmentsPositive: false },
+           retrainEvery: 10, historyDays: 180, keepVersions: 3 },
   bm25: { k1: 1.2, b: 0.75, scale: 3 },
 } as const;
 ```
@@ -538,5 +619,14 @@ The implementation derives all examples/tables above from these defaults, not du
 - clock-only freshness and 90-day auto-demotion changes become visible without new articles
 - partial/prefilter answers and scope-excluded never/must cards never produce false negative hides
 - fold-local scalers, story grouping, nested calibration, single-class folds and nonconvergence
-- event snapshot predates label; repeated dwell/rate/undo adds no duplicate sample; bulk 9→12 labels
+- event/request input snapshot predates rating; deferred features use that frozen input only;
+  repeated dwell/rate/undo adds no duplicate sample; bulk 9→12 explicit ratings
   schedules training; revoked evidence cannot survive in an active model
+- labels produce no interest training sample, even when the user has no explicit ratings
+- off/nonselected items stay neutral even with shared cached answers; active B cannot classify an
+  article in its off A view; projected counts/detail/folding agree without extra inference calls
+- explicit training does not activate the feed, and active mode does not infer old backlog
+- default-off behavioral consent stores no dwell telemetry/feature snapshot, gives no implicit
+  positive/negative sample, and is not bypassed by server mark-read or private retained snapshots
+- enabling consent does not train old events; disabling invalidates behavioral models; automatic
+  read side effects and bulk read never masquerade as individual explicit negative feedback

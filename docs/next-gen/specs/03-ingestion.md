@@ -2,7 +2,8 @@
 
 Status: **binding**. **Intent:** fetch every subscribed feed once for all users, politely and safely.
 Store each article once, however many feeds carry it. Hand clean, deduplicated, language-tagged text to
-the classification stages, and never let one broken feed or page stall the pipeline.
+classification only when an eligible user requests it. Preserve bookmarked content independently of
+publisher availability, and never let one broken feed or page stall the pipeline.
 
 Code lives in `packages/feeds` (pure logic and the safe HTTP client) and in `apps/worker/src/handlers`
 (I/O wiring).
@@ -15,23 +16,61 @@ Code lives in `packages/feeds` (pure logic and the safe HTTP client) and in `app
 feed.schedule (cron, every minute)
    └─► feed.fetch {feedId}                       fetch + parse + ingest in one handler
           └─► article.extract {articleId}        for each NEW article that is not stale
-                 └─► article.translate {id}      only if language_modes[lang] = 'translate' (spec 07 §1)
-                        └─► article.enrich {id}  Call A (spec 05)
-                               ├─► article.cluster {id}   story clustering (spec 05 §6)
-                               └─► article.match {id}     Call B for pending match_queue rows (spec 05 §5)
-                                      └─► user.rank {userId, reason}       (spec 06)
+                 └─► demand gate                stop here if no eligible user demand (§1.1)
+                        └─► article.translate {articleId}   only if required (spec 07 §1)
+                               └─► article.enrich {articleId}  Call A (spec 05)
+                                      ├─► article.cluster {articleId}   spec 05 §6
+                                      └─► article.match {articleId}     authorized match demand only
+                                             └─► user.rank {userId, reason}   spec 06
 ```
 
 `apps/worker/src/pipeline.ts` is the **only** place that decides the next stage. Each handler ends by
-calling `pipeline.after(<stage>, articleId, outcome)`.
+calling `pipeline.after(<stage>, articleId, outcome, tx)`. Bookmark capture is a separate local
+`article.capture-bookmark` path (§8.5); it does not enter the classification graph.
 
-**Degradation rules.** A terminal stage failure does not hide an otherwise readable article. Transient failures use the bounded retry policy first; the terminal handler advances the pipeline once:
+### 1.1 Per-user-feed inference demand
+
+Ingestion and model inference have different eligibility rules. All public subscribed feeds continue
+to fetch once globally, and local parsing/extraction/detection can run to support reading and saved
+content. Merely adding a feed, card, bookmark, label or opening an article never enables model calls.
+
+| `subscriptions.inference_mode` | Automatic article inference | Explicit training |
+|---|---|---|
+| `off` (default) | none | explicit `startTraining: true` consent with the selected-article request atomically changes this subscription to `training`; without consent the request is rejected, not silently enabled |
+| `training` | none, including newly arriving articles | only durable requests for the individual articles the user selected |
+| `active` | new feed-item associations first seen at/after `inference_activated_at`, within the supported age window | individually selected historical articles; a broader backfill requires a separate explicit request |
+
+Until Q11 defines automatic graduation, the user explicitly enables `active`; a certain number of
+ratings or a learned-model threshold cannot silently enable it. Mode changes increment the
+subscription's `inference_version`. Disabling, unsubscribe or account deletion invalidates its
+outstanding demand; job payloads alone never recreate authorization. A subscription in training does
+not cause all its feed articles to be queued. Local preference learning from already recorded user
+feedback is separate from paid article inference.
+
+`pipeline.after`, each provider-call boundary, backfill/recovery, clustering and translation retries
+all call the same `eligibleInferenceDemand(articleId, tx)` repository contract (spec 05). It joins
+current active accounts, subscriptions, mode/generation, activation time and explicit training/backfill
+requests. `feed_cards` is only the automatic **active-subscription** union; per-item training cards
+come from durable `analysis_requests` selected-article demand. Enqueue matching only for authorized card/article pairs.
+If no demand remains, the article stops at its available local stage, with no provider call and no
+“degraded” failure: inference was intentionally off. Reading/ranking uses the mode-specific rules of
+spec 06 and must not claim the article is awaiting inference that was never requested.
+
+If several users demand the same public article, extraction, translation, Call A and identical Call B
+inputs share caches and in-flight work by content revision/question set/model, not by user identity.
+One eligible user may cause a shared result to exist; that is not permission to create extra calls
+or activate subscriptions for others. Reuse safe shared results without duplicate provider requests,
+while keeping private card text and user demand out of other users' API responses. A queued job whose
+last requester opted out becomes a no-op; one still demanded by another user may finish and be reused.
+
+**Degradation rules.** A terminal stage failure does not hide a readable article. Transient failures
+use bounded retries first; the terminal handler advances once only while eligible demand remains:
 
 | Stage fails | Next stage runs with |
 |---|---|
 | extract | no body (`article_bodies.status = failed/skipped`); enrich uses title + excerpt |
 | translate (both tiers) | native text (`state_variant = 'native'`) |
-| enrich: engine unavailable (`budget`, `circuit_open`, `error`, `no_key`) | `pipeline_state = 'degraded'`; no match; `pipeline.after` enqueues `user.rank` for **all subscribers** of the article's feeds, which rank it with the BM25 fallback; `house.rescore-degraded` retries later (spec 04 §5) |
+| enrich: engine unavailable (`budget`, `circuit_open`, `error`, `no_key`) | `pipeline_state = 'degraded'`; no match; `pipeline.after` enqueues `user.rank` for **all subscribers** of the article's feeds, applying BM25 fallback only where their inference mode authorizes it (spec06); `house.rescore-degraded` retries later (spec 04 §5) |
 | enrich: `invalid_request` (a bug in a question set) | `pipeline_state = 'failed'`; ranked like degraded; an error log with the question-set sha; never retried automatically |
 | cluster | article stays unclustered |
 | match | the rows stay in `match_queue` with `attempts + 1`; ranking uses whatever answers exist; exhausted rows retained after 5 attempts rank like degraded; only relevant blocker recovery resets them (spec 05 §5.5) |
@@ -51,6 +90,8 @@ schema, `createQueue` options and typed enqueue helpers (`enqueueFetch`, `enqueu
 | `feed.schedule` | `{}` | cron `* * * * *` | 1 | none | `policy: 'standard'` |
 | `feed.fetch` | `{feedId, force?: boolean}` | schedule, subscribe API | 16 | 0 (failures are accounted for in the feed row) | `policy: 'stately'`, `singletonKey: feed:<id>` (at most one queued plus one running per feed), `expireInSeconds: 120` |
 | `article.extract` | `{articleId}` | fetch | 8 | 2, backoff 30 s | `stately`, key `extract:<id>` |
+| `analysis.process` | `{analysisRequestId: string}` | explicit selected-article training API, reconcile/retry | 4 (shares provider semaphore) | 1 queue retry; request/provider attempt ceilings still apply | `stately`, key `analysis:<requestId>`; immutable request snapshot, token-fenced publication (§2.2) |
+| `article.capture-bookmark` | `{articleId}` | bookmark action, explicit capture retry | 4 | 2, backoff 30 s | `stately`, key `capture-bookmark:<id>`; coalesced local capture, requester generations rechecked; never model inference |
 | `article.translate` | `{articleId, forceTier2?: boolean}` | extract, `user.rank` (spec 07 §3) | 4 | 1 | `stately`, key `translate:<id>` |
 | `article.enrich` | `{articleId, priority?: 'interactive'\|'bulk'}` | extract/translate, rescore, reenrich | 8 (shares the engine semaphore) | 1 | `stately`, key `enrich:<id>` |
 | `article.cluster` | `{articleId}` | enrich | 4 | 1 | `stately`, key `cluster:<id>` |
@@ -60,6 +101,7 @@ schema, `createQueue` options and typed enqueue helpers (`enqueueFetch`, `enqueu
 | `user.learn` | `{userId}` | API (ratings), `house.nightly-learn` | 2 | 1 | `sendDebounced(…, 60 s, key learn:<userId>)` |
 | `user.suggest` | `{userId}` | learn, `house.nightly-learn` | 1 | 1 | `sendThrottled(…, 86,400 s, key suggest:<userId>)`: at most daily |
 | `house.rescore-degraded`, `house.expire-rules`, `house.purge-auth`, `house.reconcile`, `house.archive`, `house.purge-articles`, `house.purge-bodies`, `house.purge-engine-calls`, `house.retire-cards`, `house.purge-users`, `house.nightly-learn`, `house.metrics`, `house.alerts` | `{}` | cron (spec 11 §6) | 1 | 1 | `policy: 'singleton'` (never two runs at once) |
+| `provider.validate` | `{provider: 'typesafe'\|'ollama', candidateVersion: string}` | explicit admin validation | 1 | 0 implicit retries | `stately`, key `provider-validate:<provider>:<candidateVersion>`; bounded synthetic credential probe under spec04 budget, no secret in payload |
 | `house.reenrich`, `house.translate-cards` | `{since?: iso}` | admin action (spec 05 §2, spec 07 §5) | 1 | 1 | `singleton` |
 
 **Rules:**
@@ -73,7 +115,7 @@ schema, `createQueue` options and typed enqueue helpers (`enqueueFetch`, `enqueu
 - Unimplemented milestone handlers remain unavailable and keep pending intents (`stage_unavailable`);
   never register a stub that logs and acknowledges real jobs.
 - A handler re-reads current authoritative rows; a deleted entity is a successful no-op. It checks
-  that users are active and feeds still subscribed before doing paid work. Never trust old job
+  active user demand (§1.1), not merely subscriber count, before every model call. Never trust old job
   payloads as authorization or as a copy of current article content.
 
 ### 2.1 Durable handoffs and stale work
@@ -98,8 +140,8 @@ then persists that timestamp, processed distinct-article count and last `(firstS
 in each continuation intent. Use the maximum eligible carrier `feed_items.first_seen_at` as an
 article's order key; the first-50 priority boost applies to the whole request, not each page.
 Use the distinct-article eligibility/order from spec 05; never restart from page one. Newer arrivals
-are covered by normal ingestion or a later backfill. Every continuation rechecks current card scope
-and active subscriptions. A pg-boss `null` send result is not proof that a
+are covered by normal ingestion or a later backfill. Every continuation rechecks current card scope,
+subscription generation and authorized demand; an off/training subscription is not a bulk-work grant. A pg-boss `null` send result is not proof that a
 required stronger payload was queued: retain the outbox intent until an equivalent job has been
 accepted or a handler has observed that revision. Bound attempts do not discard such intent.
 
@@ -111,12 +153,46 @@ already completed stage for the same revision is a no-op unless an explicit upgr
 Queue expiration must exceed the stage's bounded wall time plus shutdown margin; a feed fetch gets
 120 s, extraction 180 s, and model stages use their full provider timeout/retry bounds (spec 04).
 
-`house.reconcile` repairs missing stage work and eligible `match_queue` work in bounded batches from
-persisted state, so a worker crash, expired job or terminal queue failure cannot strand an article.
+`house.reconcile` repairs missing **still-authorized** stage work and eligible `match_queue` work,
+and pending bookmark captures, in bounded batches from persisted state, so a worker crash, expired job or terminal queue failure cannot strand an article.
 Permanent `invalid_request` failures are excluded until an admin fixes the question set. Tests crash
 at commit/send/ack boundaries and run duplicate handlers with two workers; one current result and
 all required downstream work must remain.
 
+
+### 2.2 Selected-article orchestration (`analysis.process`)
+
+The manual training API atomically creates `analysis_requests` with its immutable pre-feedback input
+manifest and an `analysis.process {analysisRequestId}` outbox intent. It must not replace this with a
+plain `article.enrich {articleId}` job that later reads different live article/card inputs. Automatic
+new-arrival work continues through the article pipeline; a manual request has its own result lifetime.
+
+The handler claims a due pending request, or reclaims an expired running lease, under a row lock;
+sets `status='running'`, a fresh lease token and bounded expiry; commits before external work. Recheck
+active user/subscription, `inference_version`, explicit request eligibility and frozen manifest/hash
+before every provider admission. Cancellation/revocation invalidates the token. Renew the lease while
+live; queue expiration exceeds the bounded end-to-end stages and cannot allow two current owners.
+
+Execute the frozen input's required translation/enrichment/matching stages under the declared
+question/card/model context (spec05), reusing exact snapshot-state cache results and shared in-flight
+work. Every network attempt still reserves budget. A shared compatible live answer may satisfy the
+request, but a newer incompatible article/card result cannot substitute for the frozen one. If the
+requested provider/context is unavailable, retain a bounded retriable/failed request with an honest
+reason; do not invent values or silently use a different snapshot.
+
+Publish `result_snapshot`, `result_sha`, completion time/status and downstream learning/rank intent
+in one transaction guarded by request ID, lease token, current mode/version and unmodified input hash.
+Article content may have advanced since selection: retain this result for the selected historical
+training event, without overwriting current article facets/translations/card answers with it. A
+result may also populate a shared **current** cache only when every current revision/state/context
+check matches. Training feedback/result association is defined in specs05/06.
+
+Transient failures release the lease and set `next_attempt_at` with bounded backoff; persistent
+invalid input becomes terminal and does not loop through reconciliation. An opt-out marks cancelled
+and cannot be changed to complete by a late worker; still-account for any upstream spend. Duplicate
+jobs after completion are no-ops. `house.reconcile` resumes due pending/expired running requests from
+their immutable snapshots without applying the automatic feed-arrival age cutoff. Request retention
+is spec11; no completed selection creates continuing authorization for sibling or future articles.
 
 ---
 
@@ -154,7 +230,7 @@ own robots policy; article redirects invoke the extraction policy callback befor
 
 **Intent:** a user-supplied URL must never reach internal services or hang a worker.
 
-**Public-feed boundary (beta default, owner decision Q3):** this shared article architecture accepts
+**Public-feed boundary (accepted owner decision Q3):** this shared article architecture accepts
 only public, unauthenticated feeds. Reject URL userinfo and known credential parameters (`token`,
 `access_token`, `api_key`, `auth`, `password`); warn that opaque subscription URLs can still contain
 secrets the service cannot recognize and require confirmation that the feed is public. Do not accept
@@ -302,7 +378,7 @@ because only `rel=canonical` fixes AMP), Google News wrappers and hash-bang URLs
 | `categories` | flattened strings, trimmed, deduplicated case-insensitively, max 16 entries of up to 64 chars each |
 | `excerpt_html` | RSS `content:encoded` / description, Atom content (respect `type=text/html/xhtml`) / summary, JSON Feed `content_html` or escaped `content_text` / summary. Never fetch Atom `content[src]`. Bound input first, then sanitize (§6.3); output ≤ 10,000 chars without cutting through markup |
 | `excerpt` | plain text of the excerpt HTML, whitespace-collapsed, max 2,000 chars |
-| `feed_body_text` | normalized plain text of full publisher content before display truncation, max 100,000 chars; optional extraction fallback, never unsanitized HTML |
+| `feed_body_text`, `feed_body_html` | full readable publisher text and sanitized HTML before excerpt/model truncation, within the 10 MiB combined extraction-output safety limit; preserve completeness/provenance for bookmark capture, never active HTML |
 | `image_url` | the first of: enclosure with `image/*` type → `media:content` (medium=image) → `media:thumbnail` → the first `<img src>` in the content. Resolved and must be http(s) |
 
 Each fetch processes at most **200 valid items**, newest first by `published_at` (unknown dates keep
@@ -353,8 +429,8 @@ For one fetch, in **one transaction per item**, so one bad item doesn't roll bac
      - If `content_hash` differs: update classification inputs and invoke the shared
        `resetArticleAnswers` contract once to increment `content_revision` and invalidate old
        body/translation/active facet and match derivatives (spec 05 §5.6), and record extraction work for the new revision.
-       Excerpt-only, category and author corrections also count. Preserve bookmarks, ratings and
-       explicit labels. A stale article stays stale unless an explicit reprocess requests otherwise.
+       Excerpt-only, category and author corrections also count. Preserve bookmarks, ratings,
+       explicit labels and their immutable saved snapshots; source updates never rewrite saved content. A stale article stays stale unless an explicit reprocess requests otherwise.
      - Multiple feeds may publish different summaries of one URL. The source is the earliest
        `feed_items.first_seen_at` (tie: feed ID); only that feed updates shared title/excerpt/author
        inputs. A later syndicated excerpt must not repeatedly invalidate the article. Extraction
@@ -372,18 +448,21 @@ For one fetch, in **one transaction per item**, so one bad item doesn't roll bac
    delete distinct articles. Store separate articles and let story clustering fold presentation.
 5. **Otherwise insert** the article:
    - `pipeline_state = 'stale'` if `published_at` is older than `INGEST_MAX_AGE_DAYS` (default 14).
-     Stored, visible, never enriched.
+     Stored and visible; automatic inference is skipped. An explicitly selected training request may
+     process a retained older article under spec 05's interactive demand contract.
    - Otherwise `'ingested'`, and the article is new.
-6. Insert `feed_items`. If a new/current source item supplies `feed_body_text`, store its text and
-   lead as the revisioned extraction fallback in `article_bodies` (`extractor_version = 'feed-v1'`,
-   status `ok`). Linkless items advance extraction without HTTP; linked items may replace this body
+6. Insert `feed_items`. If a new/current source item supplies publisher body content, store its full
+   readable text, sanitized HTML, completeness/provenance and bounded model lead as the revisioned
+   fallback in `article_bodies` (`extractor_version = 'feed-v1'`, status `ok`). Linkless items advance extraction without HTTP; linked items may replace this body
    only after successful page extraction. No early skip/error discards a valid feed body.
 
 **A feed newly carrying an already-processed article** applies to found articles in steps 2–3, and to the extract
 merge (§8.1 step 4) and feed merge (§9) whenever a `feed_items` row is **newly inserted** for an
 article whose `pipeline_state` is `enriched`, `matched` or `degraded`. In the same transaction:
-- `INSERT INTO match_queue (article_id, card_id, article_revision, priority) SELECT $article, card_id, $currentRevision, 5 FROM feed_cards WHERE feed_id = $feed ON CONFLICT DO NOTHING`
-- record an `article.match` outbox intent for the article (it skips current answers already present)
+- resolve eligible demand for this **new association**, including activation-time/generation
+  checks; `feed_cards` alone cannot authorize historical arrivals or disabled users
+- upsert `match_queue` only for that eligible card union, with `article_revision = $currentRevision`
+- record `article.match` work only when authorized pairs need current answers; reuse valid answers
 - enqueue an incremental `user.rank` for the feed's subscribers
 
 Otherwise readers who follow only this feed (typical for Google-News-style aggregators) would never
@@ -407,8 +486,9 @@ After all items:
 - Record subscriber rank intents for new associations including stale/failed articles, which need
   no paid pipeline stage to become readable.
 
-A new subscription's first fetch ingests up to 200 items. Only the non-stale ones (≤ 14 days) cost
-model calls.
+A new subscription's first fetch ingests up to 200 items. Its default `off` mode costs **zero
+article model calls**, even for recent items. Automatic active processing starts with newly arriving
+eligible feed items; training requests authorize only their selected article, not this initial batch.
 
 ---
 
@@ -454,13 +534,22 @@ fetching non-HTML media.
      `safeFetch`, robots or the fetch limits. Parse inertly: no scripts or automatic resource loads.
    - No result, or text shorter than 200 chars → status `failed` with error `no_content`.
 6. **Store:**
-   - `body_text` = Readability `textContent`, whitespace-normalized, max 100,000 chars.
+   - `body_text` = full Readability `textContent`, with readable paragraph boundaries retained.
+     `body_html` = the full sanitized readable article fragment, with §6.3 active-content/media rules.
+     Do not apply the excerpt's 10,000-character or model's lead limit to these archive source fields.
+   - Fetched/decompressed input remains capped at 5 MiB. Extracted text + HTML is capped at 10 MiB
+     total UTF-8 bytes with well-formed truncation; record partial/limit status rather than falsely
+     claiming a full capture. Preserve all readable content available within these safety limits.
+   - Store completeness and provenance: page versus feed content, whether output was truncated, and
+     known teaser/paywall/blocked/no-content reason. A short result or a successful HTTP 200 does not
+     prove access to the full publisher article. No model invents or reconstructs unavailable text.
    - `body_lead` = the first 1,500 chars, cut at the last sentence end (`. ! ? …`) after char 1,000 if
      there is one.
    - `word_count` = whitespace token count of `body_text`, or of the excerpt if there is no body.
 7. **Language detection** (§8.3). Set `articles.lang` and `lang_confidence`. A genuinely changed
    body/language uses `resetArticleAnswers` once, installing that new body at the incremented revision
-   and choosing enrichment/translation as the next stage (do not enqueue extraction recursively).
+   and checking current demand before choosing enrichment/translation as the next stage (do not
+   enqueue extraction recursively). No demand means successful local completion.
 8. For every terminal status, including skipped/blocked/not_html/failed, upsert `article_bodies`,
    run language detection on available feed text, CAS the input revision, and advance through
    `pipeline.after('extract', ..., tx)`. An early return must not strand the article as `ingested`.
@@ -527,20 +616,84 @@ and keep both identities; golden labels must not be silently rewritten.
   active users. These rules preserve current positive state; feedback history is also retained.
 - Repoint **all** `feedback_events` to the survivor without dropping events. Learning collapses
   explicit labels by current article identity and latest event; a merged story must not become two
-  training examples. Move outstanding match-card requests, keeping minimum priority, oldest enqueue
+  training examples. Repoint `analysis_requests.article_id` before deleting the source article so
+  completed frozen training history survives; keep immutable input/results unchanged. Cancel old
+  pending/running request generations and their leases rather than letting stale jobs publish to a
+  different live identity. Move outstanding match-card requests, keeping minimum priority, oldest enqueue
   time and conservative attempt count. Reconcile story-cluster representative/count fields.
+- Move snapshot associations without rewriting their captured bytes or URLs. If the same user has
+  independently saved **different** snapshots of both articles, defer the destructive merge and keep
+  both article identities until a version-preserving merge UI/contract exists; never choose one
+  snapshot arbitrarily and delete the other. Unexpired Undo snapshot pins also block any destructive
+  merge that would make exact Undo impossible. Identical snapshot checksums can share storage.
 - Keep the target's source metadata and any valid target body; take the source body only when the
   target lacks a successful extraction. Use `resetArticleAnswers` once to increment the surviving
   content revision, retain the chosen body at that revision, clear incompatible translations/active
-  answers/features, and schedule current-revision enrichment/matching. Provider
+  answers/features, and schedule current-revision enrichment/matching only for eligible demand. Provider
   audit rows remain audit rows; no stale cached result becomes active by virtue of the merge.
 - Only after every foreign-key dependent has an explicit move/reset policy may the source row be
   deleted. Its queued jobs become successful no-ops. Insert aliases for every former canonical key,
   so subsequent ingests resolve to the survivor. Run the new-feed fan-out in §7 for moved associations.
 
 Tests merge two articles with conflicting ratings, independent bookmarks/labels, feedback, aliases,
-body/translation rows, match work and clusters while extraction is in flight; no reader data is lost
+body/translation rows, immutable bookmark snapshots/Undo pins, selected-analysis requests, match
+work and clusters while extraction is in flight; no reader data is lost
 and a stale worker cannot recreate the deleted article or overwrite the survivor.
+
+### 8.5 Durable bookmark capture (`article.capture-bookmark`)
+
+A bookmark retains the **full available readable text and sanitized HTML**, not just `body_lead`,
+the short excerpt, a URL or a fresh fetch on every read. `article_snapshots` and the per-user capture
+reference/status are defined in spec 02. The frozen payload includes captured title/author,
+publication time/source URL, source revision, capture time, extractor version, completeness/reason and SHA-256 of canonical
+snapshot content. `user_article.bookmark_snapshot_id` is the ownership reference;
+`bookmark_capture_generation`, `bookmark_capture_status` and `bookmark_capture_error_code` fence
+and describe pending capture, while `bookmark_origin_feed_id` fixes the user's source-media policy.
+It remains readable if the source changes or disappears, the feed is unsubscribed,
+inference is off, or the current body is purged. External images/attachments are not mirrored under
+this contract; Q14 decides that additional scope, and the UI must not promise a complete media mirror.
+
+1. The authorized bookmark mutation locks the article and current reader row. In the same transaction
+   it preserves any already available full body through
+   `capture_bookmark_snapshot(articleId, originFeedId)` (spec02), binds the immutable snapshot to
+   this user's bookmark, advances the capture generation and records local capture work if content
+   is absent/partial. If a partial snapshot exists while a fetch is queued, retain that binding with
+   status `pending`; set terminal `partial` only after the attempt cannot improve it. A browser cannot submit arbitrary shared snapshot
+   content or attach another user's snapshot. Capture from trusted existing rows does not require a
+   network request. A body awaiting this atomic snapshot step cannot be purged or overwritten first.
+2. A repeated bookmark request is idempotent. Unbookmark increments the capture generation and
+   releases that user's live snapshot reference; a `bookmark_snapshot_pins` row protects the exact
+   old snapshot through the ten-minute Undo window (specs02/08). Rebookmark is a new generation. HTTP success means the
+   bookmark is saved, not that a still-pending source fetch has succeeded. DTOs distinguish `pending`,
+   `saved`, `partial` and `failed`, and include a bounded capture reason/time.
+3. The worker gathers current pending bookmark generations for the article. Prefer an already
+   captured matching full snapshot, then a current full body, before network fetch. If needed, run
+   safe local extraction with the same robots/SSRF/timeout/size/politeness limits as §8.1; this path
+   can capture an older retained article but never creates training or other model demand. Fetch
+   once for coalesced requests. Only bounded transient retries are automatic; an explicit user retry
+   can try again after a terminal blocked/missing/partial result.
+4. Freeze the best available content before reporting a terminal capture outcome. A feed summary or
+   paywall teaser remains a `partial` snapshot; a failed page fetch cannot replace an existing full
+   snapshot. A complete result means the available readable extraction was retained without a known
+   omission, not a claim to content behind a paywall. On no readable content keep the bookmark and
+   metadata with `failed`, never fabricate saved body text.
+5. In a short completion transaction lock the article then user rows, recheck bookmark existence and
+   each captured generation and input article revision, insert/reuse the immutable snapshot and bind
+   only still-pending matching generations/revision. If current source revision changed, preserve
+   existing saved content and retry capture from current source rather than mislabeling stale input. No late worker can resurrect an unbookmark or change a newer successful capture.
+   Once a full snapshot is bound, source revisions cannot silently replace it. A later successful
+   retry of a partial capture may bind a new immutable snapshot, preserving other users' references.
+6. Snapshot reads/exports are authorized through the requesting user's current bookmark reference,
+   never merely an article's globally shared ID. Sanitize HTML again when rendering and load no
+   external media automatically. A JSON attachment exports the exact stored full text + already
+   sanitized HTML as inert data, checksum, provenance and partial/failure status; it does not execute
+   HTML or silently rewrite the archived bytes. If a future rendered export re-sanitizes content,
+   distinguish its derived-output checksum from the immutable stored checksum. Compression is transparent.
+
+Cold storage and retention are spec 11 §5.2. Integration tests cover source deletion after bookmark,
+100k+ character content (no old truncation), capture failure/teaser, unbookmark/rebookmark during
+fetch, two users sharing one snapshot, source edits, body purge, merge conflict, unsubscribe, export
+and a backup/restore round-trip. Full saved content and checksum must survive every permitted path.
 
 ---
 
@@ -609,8 +762,17 @@ A feed with no prior new-item timestamp uses the 24-hour MAX until it has actual
   - on duplicate subscriptions, keep target title/folder preferences, earliest created time,
     `hidden = source.hidden AND target.hidden`, `allow_duplicates = source OR target`; preserve
     user data rather than relying on arbitrary `ON CONFLICT DO NOTHING`
+  - on duplicate inference settings use the more restrictive mode (`off`, then `training`, then
+    `active`); if both remain active use the later activation timestamp. Advance `inference_version`
+    beyond both prior versions. A source-only subscription retains its mode/activation boundary
+    with a new version; merging cannot implicitly enable or backfill inference
+  - move selected `analysis_requests` before deleting the source subscription, preserving completed
+    training history; cancel old pending/running generations and rebuild automatic work only from
+    current eligibility. An explicit fresh selection is required to reauthorize cancelled manual work
   - re-point `user_cards.scope_feed_id`, feed rule values and eval feed references; deduplicate
-    identical rules and apply §7 new-feed fan-out for newly moved article associations
+    identical rules and apply §7 demand-aware fan-out for newly moved article associations
+  - remap `user_feed_preferences` and `bookmark_origin_feed_id`; conflicting image settings choose
+    `block` over `allow` over `inherit`, preserving the strictest explicit privacy choice
   - set `old.merged_into_id = survivor.id`, mark old feed `dead`, clear its validators; redirects to
     old IDs resolve through this pointer, and old subscriptions are not recreated on retry
   - refresh feed subscribers/cards for both IDs and record a full rank for every affected subscriber
@@ -714,3 +876,13 @@ are found.
 - A feed returns invalid XML with an ETag, then recovers; stale validators do not trap recovery. A
   410 stays dead, quarantine caps at 16 days, and jitter cannot fetch before MIN/server Retry-After.
 - Backup/recovery checks in spec 11 resume the same pipeline without replaying deleted-user work.
+
+Follow-up acceptance cases:
+- An all-off feed with 200 fresh items, card additions, source edits and repeated recovery passes
+  makes zero article-provider calls. Local read/extraction/bookmark operations still work.
+- Training two specifically selected articles does not process their siblings. Enable-active uses
+  the activation boundary; queued stale-generation work after opt-out cannot start provider calls.
+- Two authorized users demanding the same article share one current provider result; one user's
+  training/activation never activates another subscriber or exposes private demand/card text.
+- Saved full content survives publisher 404, 30-day body maintenance and restored backups, with the
+  same checksum; cold storage never converts it into lead-only text.

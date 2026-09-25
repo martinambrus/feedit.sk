@@ -12,7 +12,14 @@ instead of failing the pipeline.
 ```ts
 // ── packages/shared/src/ports.ts  (shared, because packages/db implements EngineStore; engine re-exports) ──
 export type EngineName = 'typesafe' | 'llm' | 'laya';
-export type CallKind = 'enrich' | 'match' | 'cluster' | 'suggest' | 'translate' | 'eval';
+export type CallKind = 'enrich' | 'match' | 'cluster' | 'suggest' | 'translate' | 'eval' | 'credential_probe';
+export type InferenceAuthorization =
+  | { type: 'article'; articleId: string; articleRevision: string;
+      witnesses: Array<{kind:'automatic'; userId:string; feedId:string; inferenceVersion:string}
+                     | {kind:'manual'; analysisRequestId:string}> }
+  | { type: 'suggest'; userId:string; eligibleArticleIds:string[] }
+  | { type: 'credential_probe'; provider:'typesafe'|'ollama'; candidateVersion:string }
+  | { type: 'eval'; runId:string }; // separately authorized eval; never inferred from a feed fetch
 export type CallStatus = 'ok' | 'error' | 'timeout' | 'rate_limited' | 'invalid_request' | 'invalid_response' | 'auth_error';
 
 export interface EngineCallRow {               // mirrors engine_calls (spec 02 §3.1)
@@ -21,6 +28,7 @@ export interface EngineCallRow {               // mirrors engine_calls (spec 02 
   inputTokens: number; outputTokens: number; costUsd: number; latencyMs?: number;
   billing: 'known'|'uncertain';
   logicalRequestId: string; reservationId?: string; articleRevision?: string; stateSha256?: string;
+  credentialVersion?: string; // metadata only; never the key or encrypted envelope
   attempts: number; status: CallStatus; error?: string; createdAt: Date; // attempts = attempt ordinal
   // One row per wire attempt; reservationId is unique for idempotent settlement.
   // attempts increases monotonically for this engine across ALL subpacks of logicalRequestId.
@@ -30,14 +38,17 @@ export interface UsageRow {                    // mirrors usage_daily
   engine: string; kind: CallKind; calls: number; inputTokens: number; outputTokens: number; costUsd: number;
 }
 export interface ExternalCall {                // non-engine calls logged through the router (translation, spec 07 §2)
-  engine: 'libretranslate' | 'llm'; kind: 'translate' | 'eval'; model?: string; articleId?: string;
+  engine: 'libretranslate' | 'llm' | 'typesafe'; kind: 'translate' | 'eval' | 'credential_probe'; model?: string; articleId?: string;
   inputTokens: number; outputTokens: number; costUsd: number; latencyMs: number;
   status: CallStatus; error?: string; billing: 'known'|'uncertain';
   logicalRequestId: string; attempt: number; articleRevision?: string; stateSha256?: string;
+  credentialVersion?: string;
 }
 export interface EngineStore {                 // implemented in packages/db
   reserveSpend(input: { day: string; engine: string; kind: CallKind; userId?: string;
-    estimateUsd: number; priority: 'interactive'|'bulk'; callCap?: number }): Promise<string | null>;
+    estimateUsd: number; priority: 'interactive'|'bulk'; callCap?: number;
+    authorization: InferenceAuthorization }): Promise<string | null>; // rechecks live demand atomically
+  authorizeInference(authorization: InferenceAuthorization): Promise<boolean>; // free/local call fence
   settleReservation(id: string, call: EngineCallRow, usage: UsageRow,
     billing: 'known'|'uncertain'): Promise<void>; // one transaction: call + rollup + reservation
   insertCall(row: EngineCallRow): Promise<void>; // zero-cost calls only; idempotent
@@ -70,7 +81,7 @@ export type ScoreAnswer  = { type: 'score';  score: number; probabilities: numbe
 export type Answer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
 
 export interface EngineRequest {
-  kind: Exclude<CallKind, 'translate'>;     // translation uses ExternalCall
+  kind: Exclude<CallKind, 'translate'|'credential_probe'>; // translation/probes use ExternalCall
   state: JsonValue;
   questions: Record<string, Question>;     // keys: [a-zA-Z0-9_.-]{1,64}
   questionSetId?: string;                  // for logging
@@ -81,12 +92,13 @@ export interface EngineRequest {
   cardIds?: string[];
   userId?: string;                         // cost attribution
   priority: Priority;
+  authorization: InferenceAuthorization; // server-produced capability, not model state
 }
 
 export type EngineOutcome =
   | { ok: true; engine: EngineName; model: string; answers: Record<string, Answer>;
       usage: { inputTokens: number; outputTokens: number }; costUsd: number; latencyMs: number }
-  | { ok: false; reason: 'no_key' | 'budget' | 'circuit_open' | 'error' | 'invalid_request'; detail?: string; retryAt?: Date };
+  | { ok: false; reason: 'no_key' | 'budget' | 'circuit_open' | 'error' | 'invalid_request' | 'no_demand'; detail?: string; retryAt?: Date };
 
 export type EngineAttempt =
   | Extract<EngineOutcome, {ok: true}>
@@ -94,12 +106,25 @@ export type EngineAttempt =
       retryAfterMs?: number; detail?: string;
       usage?: {inputTokens: number; outputTokens: number};
       billing: 'known'|'uncertain' };
+export interface ProviderAuth { // SERVER-ONLY transport data; never serialize or log this object
+  apiKey: string; source:'db'|'env'; credentialVersion?:string;
+}
+export interface CredentialResolver { // app composition + encrypted DB repo; Node-only shared port
+  metadata(provider:'typesafe'|'ollama'): Promise<{source:'none'|'env'|'db'; enabled:boolean;
+    revision?:string; activeVersion?:string}>;
+  useActive<T>(provider:'typesafe'|'ollama', signal:AbortSignal,
+    send:(auth:ProviderAuth)=>Promise<T>): Promise<T>;
+  useCandidate<T>(provider:'typesafe'|'ollama', candidateVersion:string, validationToken:string,
+    signal:AbortSignal, send:(auth:ProviderAuth)=>Promise<T>): Promise<T>; // provider.validate ONLY
+}
 export interface DecisionEngine {                // adapters perform exactly ONE attempt
   readonly name: EngineName;
-  ask(req: EngineRequest, signal: AbortSignal): Promise<EngineAttempt>;
+  ask(req: EngineRequest, signal: AbortSignal, auth?: ProviderAuth): Promise<EngineAttempt>;
+  // Router calls remote adapters inside useActive; local Laya has no auth object.
 }
 
 export interface RouterStatus {
+  credentials: Record<'typesafe'|'ollama', {source:'none'|'env'|'db'; enabled:boolean; activeVersion?:string}>;
   breakers: { typesafe: BreakerState; llm: BreakerState };  // BreakerState as in settings['engine.circuit'] (spec 02 §2)
   spendTodayUsd: number; budgetUsd: number; llmCallsToday: number;
 }
@@ -109,13 +134,15 @@ export interface EngineRouter {                  // the ONLY thing handlers use
   status(): Promise<RouterStatus>;
   canSpend(estimateUsd: number, priority: Priority): Promise<boolean>; // advisory only, never authorization to send
   reserveExternalCall(input: {engine: ExternalCall['engine']; kind: ExternalCall['kind'];
-    estimateUsd: number; priority: Priority; userId?: string}): Promise<string | null>;
+    estimateUsd: number; priority: Priority; userId?: string;
+    authorization: InferenceAuthorization}): Promise<string | null>;
   recordExternalCall(call: ExternalCall, reservationId?: string): Promise<void>;
   // Paid external calls MUST reserve before HTTP. A failed attempt also settles conservatively.
 }
 
 export function createEngineRouter(deps: {
   config: EngineConfig; store: EngineStore; logger: Logger; clock: Clock;
+  credentials: CredentialResolver; // server-only, resolves current active key for each wire attempt
   engines?: Partial<Record<EngineName, DecisionEngine>>;       // inject fakes (tests, E2E, eval dry run)
   budgetOverrideUsd?: number;                                    // eval only; see below
   ignoreDailyCaps?: boolean;                                     // eval: ignore llm/tier-2 daily caps
@@ -136,6 +163,126 @@ export function createEngineRouter(deps: {
   adapters share the same invocation budget authority, not independently reset $ limits.
 
 Handlers never see HTTP errors. They get `ok: false` and apply their degraded behaviour.
+
+### 1.1 Inference requires live user demand
+
+Subscribing, polling, saving/bookmarking, extracting for reading and retaining an article grant **no**
+model/translation permission. Each user/feed starts `off` (specs 02/03). Before dispatch and before
+any retry/fallback, the caller and router verify server-produced `InferenceAuthorization`:
+
+- **Automatic:** the witness subscription is still `active`, its `inference_version` matches, and
+  this article's eligible feed-membership time is on/after `inference_activated_at`. Activation is
+  prospective; it does not authorize a historical backfill. An off/training subscriber contributes
+  neither cards nor automatic inference demand merely because another subscriber has enabled a feed.
+- **Manual:** `analysisRequestId` points to a live, user-selected `analysis_requests` row for exactly
+  this feed/article, frozen input snapshot/hash, article revision and subscription inference version.
+  It permits the necessary translation/enrichment/matching for that one item, not adjacent items or
+  a full feed. If the live article later changes, a still-authorized frozen request can complete its
+  own `result_snapshot/result_sha` for training; it must not overwrite newer shared article caches.
+  Cancelled requests or changed subscription inference versions cannot publish personal results.
+- **Shared work:** one valid eligible witness is sufficient for shared article enrichment; matching
+  asks only cards authorized by eligible requesters. Cached compatible public article features can
+  be reused without duplicate provider spend, but another person's active subscription must not
+  secretly opt an off subscriber into personalized scoring or training. Never send authorization
+  witnesses, user identifiers or credential metadata as model input.
+- **Suggestions:** use only the user's previously authorized manual/active article evidence and
+  currently eligible interest scope. Off-feed bookmark/rating activity alone does not grant inference.
+- **Eval and credential probes:** explicit, separate admin/evaluation actions with their own bounded
+  request purpose. Their synthetic/evaluation inputs are not a way to bypass production feed gates.
+
+Paid admission verifies the witness and reserves spend in one transaction. Free/local inference
+(including LibreTranslate article translation and optional Laya) acquires the equivalent validated
+work claim. A mode change cancels queued/unadmitted demand and attempts to abort admitted requests;
+already-sent calls may finish and incur cost, but user-result commits recheck the inference version.
+No DB transaction spans HTTP. `no_demand` is a quiet cancellation, not degraded service or an attempt
+failure; recovery/backfill/reenrichment must not revive it. The $2 baseline budget remains provisional
+until G1 measures **eligible articles and eligible distinct card pairs**, retries and active-feed count.
+
+### 1.2 Provider credentials and lifecycle
+
+The owner uses personal **Jev and Ollama** accounts. Store provider API keys in encrypted DB
+`provider_credentials` rows (spec 02), editable through dedicated admin endpoints (spec 08) and the
+admin UI (spec 09). Until the UI exists, a server CLI/admin API stages the same rows using the same
+validation and authorization rules; do not put plaintext into SQL migrations or generic settings.
+
+Reject empty/oversized keys (maximum 4 KiB UTF-8) and CR/LF/NUL before encryption; never place a
+key in a URL/query string or shell argument. Credentials CLI accepts protected stdin/input with echo
+disabled. Env keyring ids are bounded allowlisted strings; decoded values must be exactly 32 bytes.
+
+**Envelope format (`format=1`):** each active/candidate secret contains `key_id`, `nonce`, `tag`,
+`ciphertext` and `wrapped_key:{nonce,tag,ciphertext}` (binary fields base64, bounded and validated).
+Use Node `crypto.randomBytes`, a fresh random 32-byte data key per staged credential and
+`aes-256-gcm` for both payload and data-key wrapping. Nonces are independent fresh 12-byte values;
+authentication tags are exactly 16 bytes. The wrapping key is selected by `key_id` from the
+host-only `PROVIDER_MASTER_KEYS` keyring, with `PROVIDER_MASTER_KEY_ID` for new writes. Authenticate
+canonical AAD `{format,provider,secretVersion,purpose:'payload'|'wrap'}`; never reuse a ciphertext
+under another provider/version/purpose. Set AAD before update, verify the tag in `final()` before
+using any plaintext, and fail closed on an unknown key id or modified envelope. The schema stores
+only envelopes and metadata; SQL never receives the master key.
+
+**Access:** the API's ordinary DB role has no SELECT/direct mutation grant on secret columns. An
+admin service encrypts the submitted key locally and calls narrow SECURITY DEFINER setters which
+verify the current active administrator, expected revision and envelope shape. Metadata getters
+return no encrypted blobs, full/partial key, or hash of a key. Worker/eval repositories can read the
+needed envelope; a server-only `CredentialResolver` unwraps it in memory for one provider request.
+Its `useActive` transport callback receives the secret; only the validation handler may use
+`useCandidate` with its current lease. Missing/decryption/DB lookup errors return a typed unavailable
+credential reason without original crypto/provider payloads. `EngineRequest`, outbox payloads,
+audit rows, errors and generic logs never contain the secret. An API-process compromise remains outside DB-only secrecy;
+AES protects stolen dumps, not a host holding both ciphertext and master keys.
+
+**State machine (one row/provider):**
+1. `PUT` with `{apiKey,expectedRevision}` allocates `candidateVersion=nextRevision`, encrypts and
+   stages a `pending` candidate. Existing active DB credentials remain usable. Saving does not send
+   provider traffic. Never persist the plaintext body in `api_mutations`, traces, request logs or jobs.
+2. Explicit `validate` enqueues `provider.validate {provider,candidateVersion}`. A worker claims its
+   validation lease, probes the expected provider using synthetic data, and records `valid`/`invalid`
+   plus sanitized capabilities/errors. Allow at most **3 HTTP attempts total** per validation action,
+   no reader content, and at most **$0.02 reserved spend** plus the normal platform budget; validation
+   LLM output is capped at 512 tokens. Exceeding these bounds fails or defers validation with a clear
+   reason. Every paid probe uses `kind='credential_probe'` and the normal spend guard. Validating a candidate
+   never resets the active credential's breaker or replaces its account silently.
+3. `activate` is an optimistic-CAS admin transaction requiring the exact validated candidate, an
+   unchanged endpoint/model-policy fingerprint and a validation result no older than 24h. It swaps
+   candidate into the active slot and clears the superseded envelope, enables the provider, increments row revision, clears old candidate
+   state and invalidates the provider's old auth breaker. No automatic promotion after validation.
+4. `DELETE` locally revokes/clears both envelopes, leaves an `enabled=false` tombstone, increments
+   revision and invalidates outstanding validation leases. It does not revoke a provider-side API
+   key; the admin UI states that provider dashboard action separately. No new calls are admitted;
+   in-flight calls can remain billable and cannot resurrect a revoked candidate on completion.
+5. Poll metadata at most every 10s for UI/cache refresh and recheck DB `revision/enabled/activeVersion`
+   immediately before every admission. Do not cache plaintext between attempts. A DB read/decrypt
+   failure or disabled row returns unavailable; **never fall back to an older key or environment**.
+
+`TYPESAFE_API_KEY`/`OLLAMA_API_KEY` are optional bootstrap sources **only when no row for that provider
+exists**. A staged row without an active key is pending/unavailable, and a disabled row deliberately
+blocks environment fallback. Missing credentials leave reading usable and inference pending; do not
+fail whole-app startup. Model ids/base URLs remain allowlisted host configuration, so an admin key
+cannot be exfiltrated by editing a generic provider URL setting. Production HTTP clients send keys
+only to the configured HTTPS provider origin and never forward Authorization on redirects.
+
+**Validation:** confirm authentication/model availability and the required Jev or Ollama capability
+contract (§10.1) without real readers' interests. Store the tested model/config hash, validation time,
+account concurrency limit when known and sanitized capability flags. Unknown limits remain
+conservative configuration, not guessed entitlements. A 401 for the active version opens auth mode;
+a late 401 from a superseded version cannot disable its replacement. Record only credential version
+with billing for diagnosing rotation. No actual user keys are provided by this plan update, so no
+live validation or provider action is performed while editing the plan.
+
+Provider clients attach Authorization only inside that callback. The callback returns answers or
+redacted errors, never auth objects; release secret buffers/references promptly and zero temporary
+Buffers where possible. JavaScript cannot promise complete memory zeroization. An env credential
+has no DB `credential_version` (store NULL); DB active/candidate versions are decimal bigint ids.
+
+**Master-key rotation:** add a new random key under a new id to host secrets, deploy that keyring,
+then rewrap stored data keys under the new id with CAS and fresh nonce/tag; payload plaintext need
+not be re-encrypted or sent to providers. Keep old key ids until all live envelopes and retained
+backup restore requirements are covered. Do not place keyrings in DB backups, source control or
+container build layers. Test restoring a DB with separately supplied keys and report unavailable
+credentials safely when the keyring is missing. Delete old envelopes when replaced/revoked; retained
+encrypted backups obey the normal backup retention policy.
+
+Crypto implementation reference: [Node 22 crypto](https://nodejs.org/docs/latest-v22.x/api/crypto.html).
 
 ---
 
@@ -166,7 +313,7 @@ The normalized answers are what is stored in `article_facets.answers`, `card_ans
 ## 3. TypeSafeEngine (Jev over HTTP)
 
 **Request:** `POST {TYPESAFE_BASE_URL}/v1/systemone` with headers
-`Authorization: Bearer {TYPESAFE_API_KEY}` and `Content-Type: application/json`.
+`Authorization: Bearer <resolved active Jev credential>` and `Content-Type: application/json`.
 
 ```json
 { "model": "jev-1.13.0", "state": <state>, "questions": { "<key>": { "type": "noul|choice|score", "instructions": …, "criteria": … } } }
@@ -258,8 +405,9 @@ bounded by the job deadline, cancellation works while queued, and aging prevents
 
 **Fallback chain** in `EngineRouter.ask(req)`:
 
-1. Validate the request. In dev without a primary key return `no_key` (unless an injected test engine
-   exists). Production boot validates required primary credentials; missing key is not a normal outage.
+1. Validate the request and its live demand (§1.1). Resolve the active Jev credential (§1.2); if
+   unavailable return `no_key` without inference (unless an injected test engine exists). Missing
+   provider setup is a supported application state, not a reason to fail reader startup.
 2. Check breaker and reserve the selected provider's estimated spend (§6) before each send.
 3. TypeSafe breaker closed or half-open → TypeSafeEngine. On success, return.
 4. If TypeSafe failed or its breaker is open:
@@ -279,7 +427,7 @@ bounded by the job deadline, cancellation works while queued, and aging prevents
 `house.rescore-degraded` (every 10 min, spec 11 §6) re-enqueues `article.enrich` for articles with
 `pipeline_state = 'degraded'` within the full supported **14-day** ranking/backfill window, using
 feed membership time for newly subscribed/deduplicated items, while the primary engine is available
-and the budget allows. Use persisted keyset cursors and bounded pages with priority aging, so new
+and the budget allows **and a current automatic/manual demand remains authorized**. Use persisted keyset cursors and bounded pages with priority aging, so new
 arrivals do not starve older recoverable work. Answers produced by the LLM fallback are **replaced** by Jev answers
 when the article is re-processed, because personal models must learn from one engine
 (spec 06 §8.1). `house.rescore-degraded` therefore also re-enqueues articles whose `enrich_engine = 'llm'`, **and**
@@ -357,7 +505,7 @@ Exact per-question costs are not stored. The admin usage page (spec 08 §9) show
 
 ## 8. LlmFallbackEngine (Ollama Cloud)
 
-**Request:** `POST {OLLAMA_BASE_URL}/api/chat` with header `Authorization: Bearer {OLLAMA_API_KEY}`.
+**Request:** `POST {OLLAMA_BASE_URL}/api/chat` with the currently resolved Ollama credential (§1.2).
 
 ```json
 {
@@ -459,6 +607,12 @@ property per question key. Every probability has `minimum: 0, maximum: 1`.
 - Retry-After HTTP dates, delays longer than job deadline, cancellation while waiting, no nested retries
 - malformed finite/range/key data, mismatched model pins, prompt injection fixtures and output truncation
 - shared breaker lost-update, probe lease expiry and reset across process instances
+- off/untrained feeds make zero inference calls; one manual request covers only its selected snapshot;
+  activation is prospective; disabling during queued work cancels it; shared eligible-cache reuse
+- encrypted-key stage/validate/activate/revoke; admin and DB role isolation; no secret echo/logs/receipts;
+  tampered AAD/tag, wrong master key, missing keyring, revocation versus in-flight probe and rotation
+- no environment fallback after DB tombstone; two workers observe hot rotation; old-version auth error
+  cannot open replacement credential breaker; separate DB/keyring restore and master-key rewrap
 
 **Deterministic fake TypeSafe server** (`packages/testing/src/fake-typesafe.ts`, built in M2-T2): an
 HTTP server implementing `POST /v1/systemone` with the documented response shape, so any question set

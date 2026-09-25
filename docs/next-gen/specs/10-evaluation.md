@@ -7,7 +7,10 @@ thresholds. Later, every change to questions, thresholds or the model version is
 same **frozen inputs**. Development selection and locked holdout reporting are separate; repeatedly
 tuning against the holdout turns it into development data and requires a new holdout.
 
-No FeedIt.sk data is used (locked decision). The golden set is built from scratch.
+No FeedIt.sk data is used (locked decision). The golden set is built from scratch. The owner can
+start alone, including several real topic-specific reading contexts. This is a valid **owner pilot**;
+personas do not turn one human into independent testers. Tooling and development continue without
+waiting for recruitment; broader beta launch evidence is a separate Q13 decision (PLAN §17).
 
 Notation: `eval <command>` below is short for the root script `pnpm evaluate <command>` (spec 01 §2).
 
@@ -26,11 +29,12 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
      "recommended_daily_budget_usd": 2.0,
      "translate_tier2_daily_cap": 300 | 1000,
      "laya_track_recommended": false,
-     "runs": { "B0": 11, "B1": 12, "E1": 13, … },      // eval.runs ids used for the decisions (M7-T7 reads them)
+     "runs": { "B0": "11", "B1": "12", "E1": "13", … },      // eval.runs ids used for the decisions (M7-T7 reads them)
      "notes": "…",
      "dataset": { "version": "golden-v1", "snapshotSha": "…", "splitSha": "…" },
-     "selection": { "developmentRunIds": [11,12,13], "lockedAt": "ISO timestamp", "configSha": "…" },
-     "gate": { "status": "pass" | "fail" | "needs_more_data", "reportSha": "…" } }
+     "selection": { "developmentRunIds": ["11","12","13"], "lockedAt": "ISO timestamp", "configSha": "…" },
+     "gate": { "profile": "owner_pilot" | "multi_person_beta", "participants": 1,
+               "status": "pass" | "fail" | "needs_more_data", "reportSha": "…" } }
    ```
 
 3. `pnpm evaluate apply-g1 apps/eval/config/g1.json` (paths are relative to the repository root; the
@@ -46,11 +50,16 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
    | `translate_tier2_daily_cap` | `translate.tier2_daily_cap` |
    | `laya_track_recommended`, `runs`, `notes`, `dataset`, `selection`, `gate` | not settings; kept in the report and in git |
 
-`g1.json` itself is valid JSON (the example above is a schema sketch). Validate it with the shared
+`g1.json` itself is valid JSON (the example above is a schema sketch). Database bigint ids in
+config/reports/CLI JSON are decimal strings, including run ids; participant counts remain numbers. Validate it with the shared
 `RankerConfig` schema/defaults from M0 and pure score/lane/tier helpers from the M2-T10 bootstrap;
 G1 does not depend on the full M5 rank worker. `apply-g1` rejects missing/incomplete runs, hash
 mismatches and a gate other than `pass`, applies settings in one transaction, and bumps the version
-only when relevant values changed. Dry-run output can never authorize production settings.
+only when relevant values changed. A passed `owner_pilot` artifact requires `--development-only`
+and an explicitly allow-listed development DB; it supports development and M7 simulation, never
+production application or a claim of multi-person validation. Production needs the normal beta gate
+or a separately recorded owner launch decision under Q13. Dry-run output can never authorize
+production settings.
 
 ---
 
@@ -95,11 +104,20 @@ only when relevant values changed. Dry-run output can never authorize production
 - **Status (`eval status`):** per-language sample counts, then per rater: cards written, feeds picked,
   assigned, rated, skipped. Also facet-label counts per language.
 
-### 2.2 Raters (3–5 people: the owner plus testers with different tastes)
+### 2.2 Participants and reading contexts (owner pilot first; beta expansion later)
 
-- **`eval rater add --name <n> --langs sk,en`** creates `eval.raters` and prints a private URL with a
-  token: `${EVAL_PUBLIC_URL}/r?t=<token>`. `EVAL_PUBLIC_URL` defaults to `http://localhost:5180`.
-- **Step 1 in the rating app: write interests first.** Before seeing any article, each rater writes
+- **Actual participant identity:** `eval.raters.participant_key` is an opaque random UUID grouping
+  all contexts authored/rated by the same human. `context_name` describes a topic/reading purpose,
+  not a fabricated person. `eval rater add --name <n> --langs sk,en [--participant <key>]
+  [--context <label>]` creates `eval.raters` and prints the key (for adding another context) plus a
+  private URL with a token: `${EVAL_PUBLIC_URL}/r?t=<token>`. `EVAL_PUBLIC_URL` defaults to `http://localhost:5180`.
+- **Owner pilot:** start with one participant; the owner may define separate contexts such as web
+  development, speech systems and local news **before seeing articles**. A context can express a
+  genuine different reading goal, but every report identifies the same underlying participant.
+  Prefer distinct topic/feed cohorts; shared articles/story groups keep one common dev/test split.
+- **Beta profile:** recruit 3–5 actual people with different tastes when available. Reusing the owner
+  under different names/accounts/languages must never satisfy a multiple-participant requirement.
+- **Step 1 in the rating app: write interests first.** Before seeing any article, each context writes
   **5–10 interest cards** (and optionally 1–3 "never" cards) in their own words, in their preferred
   language. Stored as real `interest_cards` (visibility `shared`) and `eval.rater_cards`. The spec 05
   authoring rules are shown as hints.
@@ -120,7 +138,9 @@ only when relevant values changed. Dry-run output can never authorize production
   - Progress is saved on every click (`eval.ratings`) and ratings can be changed.
   - A rater may skip an article; persist `eval.assignments.status = skipped` (and an optional reason).
     Rating sets `rated`, returning to a skipped article is supported, and pending remains distinct.
-    Goal: ≥ 250 ratings per rater. Never silently convert a skip to a dislike. Report skip rates and
+    Goal: ≥250 distinct article ratings per actual participant, with supported context/language
+    cells (§5). Rating one article under three personas counts as one article toward participant
+    readiness. Never silently convert a skip to a dislike. Report skip rates and
     language/source coverage alongside quality metrics.
 
 ### 2.3 Facet labels (the enrichment accuracy check)
@@ -168,6 +188,10 @@ Each run:
   settings and content revision; simple string concatenation is not a safe key. Writes are atomic,
   cache hits retain actual provenance, failures are not cached as answers
 - uses the production packages: `questions`, `engine`, `translate`, `ranker`
+- frozen assignments are **explicit evaluation demand**, isolated from production subscriptions.
+  An eval run may process only assigned snapshots approved for that invocation, subject to its cost
+  cap; subscribing the ingestion-only eval user does not make all collected articles inference-active.
+  Production benchmarks separately exercise off, selected-training and active-new-arrival mixes
 - builds its own `EngineRouter` (spec 04 §1, "Eval routers") with `budgetOverrideUsd = --max-usd`
   (default 10) and `ignoreDailyCaps: true`. Every call, translations included, is recorded as
   `kind = 'eval'`, so eval spend never touches the production daily budget or the tier-2 cap.
@@ -217,8 +241,14 @@ invocation budget, retain completed answers, and resume explicitly; partial runs
   eval process connects through `TEST_ADMIN_DATABASE_URL` only to create it. It writes
   `reports/DRYRUN-<date>.md` and `reports/DRYRUN-<date>.g1.json`, both git-ignored, and never touches
   the real `eval` tables.
+- **`eval gate --profile owner_pilot|multi_person_beta`:** validate the frozen dataset/run manifests,
+  compute profile readiness, select on development, lock the profile/config hash, then reveal the
+  test confirmation and write the scoped report plus `g1.json` (§5). `--profile` is mandatory and
+  recorded before any scoring/selection metrics are exposed; a rerun cannot switch profile after
+  seeing test results under the same manifest. `needs_more_data` writes an honest incomplete report,
+  never fabricated values. The owner-pilot path does not require three humans.
 - **`eval replay`:** §6. Implemented in M3a-T6, first used after G1.
-- **`eval learning-curve`:** M7-T7. Reads `eval.run_answers` of the runs listed in `apps/eval/config/g1.json`
+- **`eval learning-curve`:** M7-T7; a complete owner-pilot artifact is sufficient for this offline check. Reads `eval.run_answers` of the runs listed in `apps/eval/config/g1.json`
   `runs`. For n=10/20/30/50/100, train on each rater's earliest **development** feedback by event time,
   with story groups disjoint from evaluation; evaluate every n against the same untouched test set.
   Frozen eval answers may construct synthetic event-time features for this offline simulation; mark
@@ -233,16 +263,19 @@ invocation budget, retain completed answers, and resume explicitly; partial runs
 
 ## 4. Metrics (`apps/eval/src/metrics`)
 
-**Ranking** (per rater, per language, per experiment):
+**Ranking** (per reading context and participant, language and experiment):
 - **ROC AUC** of the score vs the rating (Mann–Whitney U, ties counted as ½), with a **95 % CI** from
   1,000 **paired story-group bootstrap** resamples; the same resampled groups compare candidate and
   baseline. Report ΔAUC and its CI directly. A group is resampled together across raters.
 - **P@10, P@20:** like-rate among top k, with stable `(score DESC, firstSeenAt DESC, id DESC)` ties;
   report actual denominator and null when fewer than k eligible ratings exist.
-- **Macro averages:** equal weight to each eligible rater's AUC (all their languages pooled); language
-  summaries equally weight eligible rater-language cells. Publish counts, class prevalence and both
+- **Macro averages:** first aggregate supported contexts within each actual participant with equal
+  context weights, then equally weight participants. Language summaries follow the same hierarchy.
+  Bootstrap entire story groups across all copies/contexts; do not multiply effective sample size
+  because one owner rated an article in several personas. Publish counts, class prevalence and both
   development/test tables. Never average a null single-class AUC as 0 or 0.5.
-- **Win count:** raters beating the locked B1/B1-T baseline, with raw B1 comparison also shown.
+- **Win count:** actual participants beating the locked B1/B1-T baseline; context-level wins are
+  separate diagnostics. The owner pilot always has one participant, however many contexts exist.
 
 **Calibration** (heuristic card score P vs like-rate): ten fixed-width bins on [0,1], each bin's
 count, mean score and positive fraction; ECE = Σ(n_bin/N)*|meanScore-positiveFraction|, plus Brier
@@ -270,11 +303,27 @@ The report renders these as tables, plus one reliability plot (SVG) per language
 
 ## 5. Decision rules for G1 (development selects, locked test confirms)
 
-**Readiness:** at least three raters with ≥250 non-skipped ratings each; the locked test has ≥60
-ratings and ≥10 of each class per rater, and ≥50 ratings/≥10 of each class per language across
-raters. Any reported rater-language AUC needs ≥20 items and ≥5 of each class. Missing support,
-incomplete variants or required language coverage yields `needs_more_data`; collect more with the
-same selection procedure. Do not lower the gate or silently drop a language/rater to pass.
+**Profile selection happens before scoring, not after a failed test.** Both profiles use the same
+frozen grouped split, blind labels, cost limits, development-only parameter selection, paired
+baselines and test confirmation below.
+
+- **`owner_pilot`:** one actual participant with ≥250 distinct rated articles overall and ≥60 distinct
+  held-out articles, including ≥10 likes and ≥10 dislikes. Each evaluated context/language cell needs
+  ≥20 test articles and ≥5 of each class for its AUC; unsupported cells are explicitly unmeasured.
+  Start with the owner's real language/topic coverage; missing Czech (or another target language)
+  is a documented gap, not a made-up independent rater. A pilot pass applies only to the measured
+  owner/context/language population. Keep default settings for unmeasured languages and mark them
+  unvalidated; their wider launch suitability remains a Q13 consideration.
+- **`multi_person_beta`:** ≥3 **distinct actual participants**, each with ≥250 distinct non-skipped
+  ratings and ≥60 held-out ratings/≥10 of each class; ≥50 test ratings/≥10 of each class per target
+  language across participants. A reported participant-context-language cell needs ≥20 items/≥5 of
+  each class. Count participant keys, never persona rows, in readiness and win requirements.
+
+Incomplete engine variants or inadequate class support within a chosen profile yields
+`needs_more_data` for that profile. With only the owner, produce the honest pilot report and continue
+tooling/development; do not call that a failed attempt to recruit testers. Q13 asks whether the owner
+accepts the narrower evidence for a limited beta or wants independent testers first. Neither an LLM
+nor extra owner personas can silently waive that decision.
 
 **Selection uses development only:**
 
@@ -282,7 +331,7 @@ same selection procedure. Do not lower the gate or silently drop a language/rate
    Select E* from E1/E2/E3/E3b by development macro AUC; ties choose the cheaper native variant.
    E4/E5 are diagnostics/translation fallback evidence, not all-language core candidates.
 2. Choose global card text mode: `english` if its paired development gain on non-English-card
-   raters is ≥0.02 in the selected state family; otherwise `as_written`. If no eligible non-English
+   participant-contexts is ≥0.02 in the selected state family; otherwise `as_written`. If no eligible non-English
    card cohort exists, retain `as_written` and mark that decision unmeasured.
 3. Choose `sk` and `cs` language modes **within that selected card text mode**. Compare native vs
    translated scores on the same language, raters and articles. Native suffices if its AUC is no
@@ -292,13 +341,15 @@ same selection procedure. Do not lower the gate or silently drop a language/rate
    translation gain and flag the English comparison as inconclusive. E4 must use the same selected
    card mode; tier-2 cap is 1000 only if its paired gain over tier 1 is ≥0.05 for SK or CS, else 300.
 4. **One global threshold object:** pool development examples from the per-language variants chosen
-   by steps 2–3. The schema has no per-language thresholds. Weight each rater equally (per-item
-   weight 1/their development count) so a prolific rater does not dominate.
+   by steps 2–3. The schema has no per-language thresholds. Equal total weight per actual participant,
+   then per supported context inside that participant, then per article inside that context; persona
+   count cannot give the owner extra weight relative to independent testers.
    - `lanes.forYou`: smallest t on 0.50…0.85, step 0.05, with weighted like-rate among P≥t ≥0.70,
-     at least 30 items from ≥2 raters and at least 10% development coverage; if unsupported, keep
+     at least 30 distinct items and at least 10% development coverage (beta also requires ≥2 actual
+     participants; pilot uses its one identified participant); if unsupported, keep
      default 0.65 and mark the precision target **unmet**, not "achieved at 0.85".
    - `lanes.maybe`: largest t on 0.20…0.50, step 0.05, with weighted like-rate below t ≤0.15 and
-     at least 30 items from ≥2 raters, also t<forYou. If unsupported keep default 0.35 (or the
+     at least 30 distinct items (beta: ≥2 actual participants; pilot: one), also t<forYou. If unsupported keep default 0.35 (or the
      largest valid grid point below forYou) and mark target unmet.
    - `tiers`: retain defaults if development ECE≤0.10. Otherwise weighted isotonic regression of
      like-rate on raw score supplies the smallest score reaching 0.2/0.4/0.6/0.8. Require supported
@@ -311,23 +362,31 @@ same selection procedure. Do not lower the gate or silently drop a language/rate
 **Confirmation uses the test only:** evaluate the actual selected per-language composition (not just
 whichever single experiment won selection), against the locked B1/B1-T baseline on the same cohort.
 Pass requires macro AUC≥baseline+0.05, macro AUC≥0.70, and a higher AUC than baseline for **every**
-rater. Report paired bootstrap CIs; point estimates determine this initial small-beta gate, so the
+actual participant. In the owner pilot also report every supported context separately so averaging
+does not hide a failing domain; a context is never claimed to be an independent human. Report paired
+bootstrap CIs; point estimates determine this initial small-beta gate, so the
 report must not claim population-level certainty. Also report all policy metrics and per-language
 results. Hard-hide false negatives and unmet For You precision targets are explicit owner-review
 items before launch; no threshold change is allowed to make those disappear from the report.
 
-`fail` stops launch progression after M3b and reports per-rater/language diagnostics and 20
+`fail` blocks claims of a passed gate for the selected profile and reports per-rater/language diagnostics and 20
 worst-ranked liked articles (identify development vs test). The owner chooses remedies. Reusing
 revealed test failures to change cards/questions/settings requires a new held-out golden version for
-the next gate. M4–M7 work already allowed in parallel may continue, but cannot waive the launch gate.
+the next gate. M4–M7 work and owner-pilot simulations may continue, but cannot waive the production launch
+decision or relabel a one-person result as broad beta evidence.
 
-**Budget:** measured production-policy $/1,000 articles × (expected beta articles/day **÷1000**) ×2,
+**Budget:** measured production-policy $/1,000 **authorized uncached article revisions** ×
+(expected daily authorized revisions **÷1000**) ×2,
 rounded **up** to the next $0.50, minimum $1/day. Include translation/fallback and the expected
-card-holder mix once; document the volume assumption and a high-volume sensitivity estimate. The
+authorized card-holder mix once; use spec 05 §9's off/training/active demand model. The forecast
+separates total fetched volume, exact selected-training count, newly active arrivals, explicitly
+requested history and reusable cache hits. Document activation assumptions and an all-active/high-
+volume sensitivity estimate; no implicit cost for all articles of untrained feeds. The
 original price-per-1,000 figure must never be multiplied by raw article count without the divisor.
 
 The report ends with readiness/selection/test tables, denominators, policy risks, applied defaults,
-cost assumptions and anomalies. Only a passed and complete artifact can be applied by `apply-g1`.
+cost assumptions and anomalies. Only a passed and complete artifact can be applied by `apply-g1`, with owner-pilot application
+restricted to the explicit development-only path (§1).
 
 ---
 
@@ -375,7 +434,9 @@ source (`cards/model/degraded`), language, and prompt/calibration vs voluntary f
   golden set for that risk; no <2% production regret guarantee is inferred from unseen articles.
 - **Personal models:** activation rate, effective sample/skip counts, median paired validation AUC
   and logloss change vs baseline, invalidation/failure rate and time back on cards-only ranking.
-- **Engine:** p50/p95 live latency, errors, output coverage/degraded share and billed $/day.
+- **Engine:** p50/p95 live latency, errors, output coverage/degraded share and billed $/day, split
+  by selected training vs active arrivals; off feeds must contribute zero authorized provider calls.
+  Report shared cache savings and training queue age separately from all fetched article volume.
 
 Store bounded aggregates in `settings['metrics.daily.<date>']`; retain 90 daily snapshots and no
 article/card text or per-user traces in this shared settings object. Restrict it to admin responses.
@@ -413,3 +474,7 @@ until a separate schema/API/retention/consent design and privacy notice are appr
 - Rating-token ownership/expiry/redaction and separate golden DB worker-mode guards are enforced.
 - Learning curves use one unchanged holdout at every n and cannot tune on it; feedback-time online
   metrics survive reranking and undo without moving their original lane attribution.
+- one owner with multiple topic contexts is one participant in readiness/macros/wins; owner-pilot
+  outputs unlock development-only settings and offline learning, never automatic beta launch
+- evaluating absent language support is marked unmeasured; pilot success cannot override Q13
+- cost forecasts use authorized uncached training/active demand, not all off-feed articles

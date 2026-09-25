@@ -165,11 +165,12 @@ root `package.json` defines these shortcut scripts, and every doc uses them:
 
 ## 3. Configuration
 
-All configuration comes from environment variables, parsed once at startup by
+Bootstrap and host-secret configuration comes from environment variables, parsed once at startup by
 `loadConfig({ process: 'api' | 'worker' | 'eval' | 'migrate' | 'test' })` in
 `packages/shared/src/config.ts` with zod. "Required" in the table means required **for the processes
 listed under "Used by"**. An invalid config makes the process exit with a readable error.
-`.env.example` lists every variable with a comment.
+`.env.example` lists every variable with a comment and placeholder values only. Validation errors
+identify secret variable names/paths, never their supplied contents or a serialized config object.
 
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
@@ -191,13 +192,15 @@ listed under "Used by"**. An invalid config makes the process exit with a readab
 | `MAIL_FROM` | `FeedIt <no-reply@localhost>` | api, worker | |
 | `SIGNUP_MODE` | `invite` | api | `invite` / `open` / `closed`; `settings['signup_mode']` overrides it |
 | `RATE_LIMITS_ENABLED` | `true` | api | `false` only for E2E/load tests with `NODE_ENV=test`; refused in production |
-| `TYPESAFE_API_KEY` | — | worker, eval | Jev key; if missing, the engine runs in Degraded mode |
+| `TYPESAFE_API_KEY` | — | worker, eval | optional bootstrap Jev key, used only if no DB credential row exists; DB configuration/revocation takes precedence (spec 04 §1.2) |
 | `TYPESAFE_MODEL` | `jev-1.13.0` | worker, eval | always a pinned version in production |
 | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | worker, eval | |
 | `TYPESAFE_PRICE_PER_MTOK_USD` | `0.042` | worker, eval | cost accounting (without it, eval's `--max-usd` could never trigger) |
 | `ENGINE_CONCURRENCY` | `8` | worker, eval | max in-flight Jev calls per process |
 | `DAILY_BUDGET_USD` | `2.00` | worker | spend guard ([spec 04 §6](./04-decision-engine.md)) |
-| `OLLAMA_API_KEY` | — | worker, eval | Ollama Cloud; if missing, tier-2 translation and LLM fallback are disabled |
+| `OLLAMA_API_KEY` | — | worker, eval | optional bootstrap Ollama key, used only if no DB credential row exists; no fallback to it after DB disable/revoke |
+| `PROVIDER_MASTER_KEY_ID` | — | api, worker, eval | id of the active wrapping key in the host-only keyring; required for DB credential writes and production credential management |
+| `PROVIDER_MASTER_KEYS` | — | api, worker, eval | JSON map of key id to base64-encoded random 32-byte AES key; injected from a protected host secret, never DB/settings/browser/build args; include old ids during rotation only |
 | `OLLAMA_BASE_URL` | `https://ollama.com` | worker, eval | |
 | `OLLAMA_MODEL_FAST` | `glm-5.3-flash` | worker, eval | |
 | `OLLAMA_MODEL_STRONG` | `glm-5.3` | worker, eval | |
@@ -209,7 +212,7 @@ listed under "Used by"**. An invalid config makes the process exit with a readab
 | `FETCH_MAX_BYTES` | `5242880` | api, worker, eval | 5 MB for feeds and pages |
 | `FETCH_TIMEOUT_MS` | `20000` | api, worker, eval | (the API fetches during discovery, the first fetch and OPML import) |
 | `FETCH_ALLOW_PRIVATE` | `false` | api, worker, eval | tests only; refused when `NODE_ENV=production` (spec 03 §4) |
-| `INGEST_MAX_AGE_DAYS` | `14` | worker | older items are stored as `stale` and never enriched |
+| `INGEST_MAX_AGE_DAYS` | `14` | worker | automatic age window, in addition to subscription inference authorization; explicit manual analysis uses the selected snapshot policy (specs 03/05) |
 | `PREFILTER_MIN_CARDS` | `60` | worker | spec 05 §5.5 |
 | `EVAL_INGEST_ONLY` | `false` | worker | M3a: stop the pipeline after extract (spec 10 §2.1) |
 | `EVAL_PUBLIC_URL` | `http://localhost:5180` | eval | base URL printed in rater links (spec 10 §2.2) |
@@ -223,7 +226,21 @@ listed under "Used by"**. An invalid config makes the process exit with a readab
 
 Runtime-tunable settings (budget, thresholds, language modes, circuit state) are **also** stored in
 the `settings` table ([spec 02](./02-data-model.md)). The table value wins over the env default, and
-the admin UI edits the table.
+the admin UI edits the table. Provider API keys are a separate encrypted, versioned
+`provider_credentials` resource, never a generic setting. They can be configured through the
+admin API/CLI before the UI is built, then through the admin UI (specs 04/08/09). Reading and
+untrained feeds keep working with no configured provider; health/readiness must not require an API
+key or a successful external probe. The selected personal Jev and Ollama accounts are accepted;
+capability validation and budget limits still apply.
+
+**Credential code boundary:** put AEAD envelope helpers in a Node-only shared server subpath
+(`@feedit/shared/server/credential-crypto`), with an ESLint boundary forbidding web imports. The
+API encrypts supplied keys; the worker/eval credential resolver alone reads/decrypts stored
+envelopes. DB repositories handle encrypted blobs/metadata only. No encryption keys are available
+to SQL functions, Vite, the browser, migration reports or generic settings serialization. A
+missing/malformed wrapping key disables credential writes/decryption with a redacted health reason;
+never store plaintext as a temporary fallback. Host keyrings are backed up separately from DB dumps
+and restored explicitly (spec 11).
 
 ---
 
