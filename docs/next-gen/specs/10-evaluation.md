@@ -9,8 +9,10 @@ tuning against the holdout turns it into development data and requires a new hol
 
 No FeedIt.sk data is used (locked decision). The golden set is built from scratch. The owner can
 start alone, including several real topic-specific reading contexts. This is a valid **owner pilot**;
-personas do not turn one human into independent testers. Tooling and development continue without
-waiting for recruitment; broader beta launch evidence is a separate Q13 decision (PLAN §17).
+personas do not turn one human into independent testers. Under the owner's resolved Q13 decision
+(PLAN §17), a **passed owner pilot is sufficient evaluation evidence for the initial invite-only
+beta and production settings**. Quality, coverage, cost and operational gates still apply. Wider
+multi-person validation is an optional later profile, not a recruitment prerequisite for launch.
 
 Notation: `eval <command>` below is short for the root script `pnpm evaluate <command>` (spec 01 §2).
 
@@ -55,11 +57,13 @@ config/reports/CLI JSON are decimal strings, including run ids; participant coun
 `RankerConfig` schema/defaults from M0 and pure score/lane/tier helpers from the M2-T10 bootstrap;
 G1 does not depend on the full M5 rank worker. `apply-g1` rejects missing/incomplete runs, hash
 mismatches and a gate other than `pass`, applies settings in one transaction, and bumps the version
-only when relevant values changed. A passed `owner_pilot` artifact requires `--development-only`
-and an explicitly allow-listed development DB; it supports development and M7 simulation, never
-production application or a claim of multi-person validation. Production needs the normal beta gate
-or a separately recorded owner launch decision under Q13. Dry-run output can never authorize
-production settings.
+only when relevant values changed. A complete passed `owner_pilot` artifact is accepted for both
+development and production settings under the resolved Q13 launch policy, through the same normal
+admin deployment/application flow as a passed `multi_person_beta` artifact. No development-only flag
+or second approval is required merely because the pilot has one participant. Preserve
+`profile='owner_pilot'`/`participants=1` in the applied report; acceptance never means multi-person
+validation. Dry-run, failed, incomplete or hash-mismatched artifacts cannot authorize production
+settings, regardless of profile.
 
 ---
 
@@ -115,7 +119,8 @@ production settings.
   development, speech systems and local news **before seeing articles**. A context can express a
   genuine different reading goal, but every report identifies the same underlying participant.
   Prefer distinct topic/feed cohorts; shared articles/story groups keep one common dev/test split.
-- **Beta profile:** recruit 3–5 actual people with different tastes when available. Reusing the owner
+- **Optional later multi-person profile:** recruit 3–5 actual people with different tastes when
+  useful for broader validation; this is not an initial beta requirement. Reusing the owner
   under different names/accounts/languages must never satisfy a multiple-participant requirement.
 - **Step 1 in the rating app: write interests first.** Before seeing any article, each context writes
   **5–10 interest cards** (and optionally 1–3 "never" cards) in their own words, in their preferred
@@ -313,17 +318,19 @@ baselines and test confirmation below.
   Start with the owner's real language/topic coverage; missing Czech (or another target language)
   is a documented gap, not a made-up independent rater. A pilot pass applies only to the measured
   owner/context/language population. Keep default settings for unmeasured languages and mark them
-  unvalidated; their wider launch suitability remains a Q13 consideration.
-- **`multi_person_beta`:** ≥3 **distinct actual participants**, each with ≥250 distinct non-skipped
+  unvalidated in the production report; an initial owner-pilot beta must not claim validated quality
+  for an unmeasured language.
+- **`multi_person_beta` (optional later validation):** ≥3 **distinct actual participants**, each with ≥250 distinct non-skipped
   ratings and ≥60 held-out ratings/≥10 of each class; ≥50 test ratings/≥10 of each class per target
   language across participants. A reported participant-context-language cell needs ≥20 items/≥5 of
   each class. Count participant keys, never persona rows, in readiness and win requirements.
 
 Incomplete engine variants or inadequate class support within a chosen profile yields
-`needs_more_data` for that profile. With only the owner, produce the honest pilot report and continue
-tooling/development; do not call that a failed attempt to recruit testers. Q13 asks whether the owner
-accepts the narrower evidence for a limited beta or wants independent testers first. Neither an LLM
-nor extra owner personas can silently waive that decision.
+`needs_more_data` for that profile. With only the owner, produce the honest pilot report. Q13 has approved that narrower evidence for
+the initial invite-only beta: `owner_pilot` + `pass` clears the evaluation launch gate and can be
+applied to production. It still must satisfy every owner-pilot readiness/quality/coverage/cost rule;
+adding personas never increases the actual participant count or repairs missing labels. There is no
+additional ≥3-person requirement or unresolved owner waiver for this initial launch.
 
 **Selection uses development only:**
 
@@ -372,8 +379,9 @@ items before launch; no threshold change is allowed to make those disappear from
 `fail` blocks claims of a passed gate for the selected profile and reports per-rater/language diagnostics and 20
 worst-ranked liked articles (identify development vs test). The owner chooses remedies. Reusing
 revealed test failures to change cards/questions/settings requires a new held-out golden version for
-the next gate. M4–M7 work and owner-pilot simulations may continue, but cannot waive the production launch
-decision or relabel a one-person result as broad beta evidence.
+the next gate. M4–M7 work may continue after an unsuccessful experiment, but a failed/incomplete
+owner-pilot artifact cannot clear the production gate. A passed one-person result is valid initial
+launch evidence under Q13 and must still be described as one-person evidence.
 
 **Budget:** measured production-policy $/1,000 **authorized uncached article revisions** ×
 (expected daily authorized revisions **÷1000**) ×2,
@@ -385,8 +393,8 @@ volume sensitivity estimate; no implicit cost for all articles of untrained feed
 original price-per-1,000 figure must never be multiplied by raw article count without the divisor.
 
 The report ends with readiness/selection/test tables, denominators, policy risks, applied defaults,
-cost assumptions and anomalies. Only a passed and complete artifact can be applied by `apply-g1`, with owner-pilot application
-restricted to the explicit development-only path (§1).
+cost assumptions and anomalies. A passed and complete artifact from either profile can be applied
+by `apply-g1` and the normal production settings flow (§1); owner-pilot scope remains visible.
 
 ---
 
@@ -475,6 +483,8 @@ until a separate schema/API/retention/consent design and privacy notice are appr
 - Learning curves use one unchanged holdout at every n and cannot tune on it; feedback-time online
   metrics survive reranking and undo without moving their original lane attribution.
 - one owner with multiple topic contexts is one participant in readiness/macros/wins; owner-pilot
-  outputs unlock development-only settings and offline learning, never automatic beta launch
-- evaluating absent language support is marked unmeasured; pilot success cannot override Q13
+  PASS outputs support production settings and initial invite-only beta under Q13 without claiming
+  multi-person evidence; failed/incomplete/dry-run outputs remain rejected
+- absent language support is marked unmeasured; owner-only launch approval does not fabricate
+  coverage or relax the chosen profile's quality/cost/holdout requirements
 - cost forecasts use authorized uncached training/active demand, not all off-feed articles

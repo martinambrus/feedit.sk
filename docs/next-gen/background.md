@@ -9,7 +9,9 @@
 > are dated research inputs, not measured FeedIt results. The specs require capability preflight,
 > workload-based cost measurement and held-out evaluation. Owner decisions are tracked in PLAN §17.
 > The owner's follow-up makes inference opt-in per feed, bookmarks durable full-content snapshots,
-> library upgrades opt-in and labels neutral; those decisions supersede earlier hypotheses below.
+> library upgrades opt-in and labels neutral. Final decisions allow publication after 30 days of creator
+> inactivity, accept a passing owner-only pilot for initial beta, and exclude media from bookmark archives.
+> Those decisions supersede earlier hypotheses below.
 
 ## 1. The idea in one page
 

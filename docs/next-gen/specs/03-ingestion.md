@@ -40,8 +40,9 @@ content. Merely adding a feed, card, bookmark, label or opening an article never
 | `training` | none, including newly arriving articles | only durable requests for the individual articles the user selected |
 | `active` | new feed-item associations first seen at/after `inference_activated_at`, within the supported age window | individually selected historical articles; a broader backfill requires a separate explicit request |
 
-Until Q11 defines automatic graduation, the user explicitly enables `active`; a certain number of
-ratings or a learned-model threshold cannot silently enable it. Mode changes increment the
+The accepted Q11 policy is explicit user enablement of `active`, processing new arrivals only;
+ratings or a learned-model threshold cannot silently enable it, and activation never starts an
+implicit historical backfill. Mode changes increment the
 subscription's `inference_version`. Disabling, unsubscribe or account deletion invalidates its
 outstanding demand; job payloads alone never recreate authorization. A subscription in training does
 not cause all its feed articles to be queued. Local preference learning from already recorded user
@@ -650,8 +651,11 @@ snapshot content. `user_article.bookmark_snapshot_id` is the ownership reference
 `bookmark_capture_generation`, `bookmark_capture_status` and `bookmark_capture_error_code` fence
 and describe pending capture, while `bookmark_origin_feed_id` fixes the user's source-media policy.
 It remains readable if the source changes or disappears, the feed is unsubscribed,
-inference is off, or the current body is purged. External images/attachments are not mirrored under
-this contract; Q14 decides that additional scope, and the UI must not promise a complete media mirror.
+inference is off, or the current body is purged. Under accepted Q14, saved archives contain full
+available readable text and sanitized HTML only: no image, attachment or other asset binaries are
+archived. External image links may still follow the user's remembered source-display preference,
+but they are not mirrored or guaranteed to survive publisher removal; the UI does not promise a
+complete offline media copy.
 
 1. The authorized bookmark mutation locks the article and current reader row. In the same transaction
    it preserves any already available full body through

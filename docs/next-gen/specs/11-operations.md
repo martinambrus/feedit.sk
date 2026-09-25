@@ -230,7 +230,10 @@ rater-erasure request; “golden forever” does not authorize retaining persona
 
 ### 5.2 Lossless saved-content storage and cold maintenance
 
-Bookmark preservation takes precedence over the 30-day hot-body cleanup. Saved snapshot payloads
+Bookmark preservation takes precedence over the 30-day hot-body cleanup. Accepted Q14 limits saved
+content to full available readable text and sanitized HTML; image/attachment/other asset binaries
+are excluded. External image display continues to use the per-user-feed preference and does not
+create an archival guarantee. Saved snapshot payloads
 are immutable, with separate per-user ownership references; article revisions, feed unsubscribe,
 model changes and source disappearance cannot overwrite them. Removing the last bookmark permits
 snapshot garbage collection after a 7-day unreferenced grace, and only after all unexpired
@@ -276,9 +279,11 @@ have their own bounded lifecycle; reconciling them never expands their one-artic
 Cancel unresolved requests when their 180-day input-retention window expires; preserve their bounded
 failure/cancellation record until the purge transaction removes related personal inputs. Save/extract, immutable archive reads
 and compression are local operations and cannot trigger a provider merely because content exists.
-Publication or retirement of user-created cards follows the explicit opt-in/moderation contract in
-specs05/08: private training/examples are not automatically promoted into the public library, and
-operational retention must not erase still-owned private cards or snapshots while publishing copies.
+Publication or retirement follows specs05/08: an eligible user-created card may be published with
+creator approval, or after 30 days of creator inactivity under the accepted Q12 moderation policy.
+Inactivity is measured from the creator's last activity, not a seven-day consent-request timeout.
+Private training/examples are not automatically promoted into the public library, and operational
+retention must not erase still-owned private cards or snapshots while publishing copies.
 
 ---
 
@@ -389,6 +394,9 @@ It sends through the shared mailer (`packages/shared/src/mail/`, which uses `SMT
 ## 9. Launch checklist (invite-only beta, end of M8)
 
 - [ ] All milestones through M8 are done. G1 decisions are applied in production settings.
+- [ ] G1 has an `owner_pilot` or `multi_person_beta` PASS under spec 10 (accepted Q13). A passing
+      owner-only pilot is sufficient for this initial beta; additional raters are not a prerequisite. All existing
+      quality, cost, security, operational and recovery gates still pass.
 - [ ] `TYPESAFE_MODEL` is pinned. The daily budget is set from the G1 recommendation.
 - [ ] Off-site encrypted backups and offline keys restore successfully, including roles/RLS,
       deletion-ledger replay and queue recovery; measured RPO/RTO accepted. Every alert and recovery

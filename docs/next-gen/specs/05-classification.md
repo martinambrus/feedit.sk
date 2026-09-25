@@ -33,8 +33,8 @@ separately authorized **per user subscription**, never by the global feed alone:
 | `training` | Only article ids/revisions explicitly selected through `POST /subscriptions/:feedId/analyze`; process slowly on the bulk queue |
 | `active` | New feed items whose `feed_items.first_seen_at ≥ inference_activated_at`, plus explicitly selected historical articles |
 
-`active` is enabled explicitly for now; a feedback count/model activation does **not** graduate a
-feed automatically. The automatic graduation criterion remains PLAN §17 Q11. Activation never sweeps
+`active` is enabled explicitly per feed (PLAN §17 Q11 resolved); a feedback count/model activation
+does **not** graduate a feed automatically. This is the approved v1 behavior. Activation never sweeps
 an existing backlog. Historical analysis/backfill needs an explicit bounded user request, represented
 by exact `analysis_requests` rows; adding a card, changing scope or subscribing cannot create that
 permission. Mode changes increment `inference_version` and rerank the affected user's items.
@@ -362,7 +362,8 @@ returns **effects** `{ refreshFeedIds: string[], backfill?: {cardIds, feedIds?},
   a user's own held/shared or owned/private rows are exposed through the API. Keep owner identities,
   holdings and examples private. Cross-tenant FK/kind rules are enforced in DB writes too. Never
   promote a private fork or move its examples to a public row. Text sharing/reuse
-  is authorized, but library publication follows the explicit creator-consent procedure (§8.1).
+  is authorized, but library publication follows the creator-approval or approved 30-day-inactivity
+  procedure (§8.1).
   `creator_user_id` records the immutable original creator when a new shared row is first inserted;
   it is separate from private `owner_user_id`. Reusing a text hash, adopting or renaming a card never
   transfers authorship. Deleted/unknown creators do not grant presumed publication permission.
@@ -685,7 +686,7 @@ Expired leases recover after a crash; queue throttling alone does not replace th
     older versions remain accessible to their holders and through exact update lineage.
     Keep the old card readable/answer-valid and held by existing users. Do **not** retire a held old
     version, re-point `user_cards`, rematch its holders, or change their model context automatically.
-    A reused non-public shared hash must first complete creator consent (§8.1), so seed cannot bypass
+    A reused non-public shared hash must first satisfy the publication authorization policy (§8.1), so seed cannot bypass
     publication controls; hold that entry with a report rather than silently promote it.
   - Each seed entry/version-link transaction is idempotent. Cosmetic title/i18n/topic corrections are
     permitted in place only when they do not alter classification semantics; question/example/text
@@ -736,31 +737,47 @@ Expired leases recover after a crash; queue throttling alone does not replace th
 | `space-launches` | Space launches | Rocket launches, spacecraft missions and launch-industry news | Astrology; sci-fi films | `science.space` |
 | `personal-finance-eu` | Personal finance (EU) | Saving, investing and pensions for individuals in the EU, especially Slovakia and Czechia | Corporate earnings | `business.personal_finance` |
 
-### 8.1 Public promotion of a user-created shared card (Q2)
+### 8.1 Public promotion of a user-created shared card (Q2/Q12 resolved)
 
-Sharing/reuse is allowed; inclusion in the discoverable public library requires separate affirmative
-consent from `interest_cards.creator_user_id`, for the **exact immutable card id/text hash and proposed
-publication metadata**. Holder count (≥3 for candidate discovery) is useful curation evidence, never
-a consent substitute. Private forks/examples cannot be promoted or copied into public text.
+Sharing/reuse is allowed. Discoverable public-library publication is admin-controlled, requires the
+existing **≥3 current holders** candidate threshold and unchanged exact immutable card id/text hash
+and publication metadata, plus **one** authorization basis below. Private forks/examples cannot be
+promoted or copied into public text. The original `creator_user_id` controls this policy; holding,
+renaming or reusing the shared text hash never transfers authorship.
 
-1. Admin records a `card_publication_requests` row through
-   `POST /admin/library/promotion-requests`. Resolve the original creator from stored provenance;
-   do not choose a current holder, latest editor, hash adopter or the admin as substitute creator.
-2. If the original creator has `last_active_at ≥ now−7 days`, expose the request to that creator via
-   `GET /cards/publication-requests`; their `respond` action records approve/decline against the exact
-   request version. Seven days defines **recent activity**, not an automatic response deadline.
-3. `POST /admin/library/promote {requestId,expectedVersion}` locks the request/card, verifies an
-   affirmative current creator response and unchanged immutable/publication payload, then changes
-   visibility to public and records the audit event. Rejection or changed metadata cannot pass.
-4. No response, inactive/deleted/unknown creator, conflicting provenance, or withdrawn consent keeps
-   the card shared and unlisted. PLAN §17 Q12 must decide any future inactive/no-response policy;
-   there is no timeout-to-consent fallback. Do not send actual requests as part of implementing this
-   plan; these are future in-app workflows.
+1. Admin records `card_publication_requests` through
+   `POST /admin/library/promotion-requests`, binding card text hash, publication payload/hash and
+   expected version. Resolve the original existing, non-deleted creator from recorded provenance;
+   unknown/deleted creators or conflicting provenance stay on hold. Do not substitute another holder.
+2. **Creator active within the preceding 30 days:** require affirmative approval for the exact
+   request version through `GET /cards/publication-requests` and its `respond` action. No response
+   while recently active leaves the card shared. Record `authorization_kind='creator_approval'`
+   only for an actual affirmative response; preserve response time/version in the audit evidence.
+3. **Creator inactive for at least 30 consecutive days:** admin may promote without an affirmative
+   response under the owner-approved inactivity policy. At publication time compute
+   `lastActivity = creator.last_active_at ?? creator.created_at`; use `created_at` only when it is a
+   known trustworthy timestamp for that same existing creator. Require
+   `lastActivity ≤ publishTime − interval '30 days'`. Missing/untrustworthy provenance remains on
+   hold. This is measured from creator activity, **not** from card age or request age. Any intervening
+   activity restarts the 30-day period. Record `authorization_kind='creator_inactive_30d'` and exact
+   activity/evaluation timestamps, policy version, card/payload hashes and publishing admin in
+   `authorization_evidence`; do not fabricate approval, `responded_at`, or a consent event.
+4. **An explicit decline is a veto.** It cannot be overridden by inactivity or by creating another
+   request for the same card. Only a later explicit creator approval that supersedes that decline
+   can authorize publication; retain both events in the audit trail.
+5. `POST /admin/library/promote {requestId,expectedVersion}` locks the original creator, card and
+   request in a stable order and rechecks current activity, holder count, vetoes, provenance and
+   exact payload before writing. Concurrent login/activity and publication must serialize on that
+   creator row; a refreshed activity timestamp removes the inactivity basis. A changed payload
+   cannot reuse old approval. Atomically set visibility/publication metadata, status `promoted`,
+   `promoted_at`/`promoted_by` and the actual authorization evidence. Idempotent replay creates no
+   duplicate publication and never rewrites the recorded basis.
 
-A concurrent first insert decides creator once; hash reuse never changes it. Seed-authored library
-cards are curated public inputs with recorded seed provenance, but collisions with user-created
-shared cards still follow this procedure. Audit records distinguish author consent, admin publication
-and later semantic version proposals.
+Thirty days replaces the earlier seven-day activity rule. Eligibility does not auto-publish a card:
+the existing admin curation/promotion action still decides whether to include it. Seed-authored
+library cards are curated public inputs with seed provenance; collisions with user-created shared
+cards must follow the same authorization policy. Audit records distinguish affirmative consent from
+inactivity-based publication, admin curation and later semantic version proposals.
 
 ---
 
@@ -840,7 +857,9 @@ per-kind engine precedence/calibration policy; it is not automatically interchan
   preserves settings, conflicting target holdings roll back, and private forks remain unchanged
   unless their owner explicitly submits a reviewed edit
 - creator provenance survives hash reuse; consent is exact-version, another holder cannot approve,
-  and inactive/no-response/deleted creator keeps publication on hold
+  and an active creator without approval or deleted/unknown provenance stays on hold; exactly 30 days
+  permits audited admin inactivity publication, concurrent renewed activity blocks it, and decline
+  cannot be bypassed by the clock or by a fresh request
 - off-only ingestion makes zero inference calls even when shared answers exist; training analyzes
   only selected ids; active admits new arrivals since activation without historical auto-backfill
 - request cancellation/mode-version races revoke that user without breaking other active demand;

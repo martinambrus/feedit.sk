@@ -28,8 +28,8 @@
 > *order* and *done-ness*.
 >
 > **Review status (2026-09-25):** this is an implementation specification, not a claim that the app
-> or its integrations have passed tests. Owner answers and remaining follow-ups are tracked in §17. Their gates apply
-> only to the affected work; proceed with independent fixture-based implementation.
+> or its integrations have passed tests. All fourteen owner decisions are recorded in §17;
+> deployment inputs and implementation verification remain required.
 
 ---
 
@@ -175,7 +175,7 @@ show me what I care about—and always tell me why."
    a feed off cancels that user's pending demand; it cannot cancel another active reader's demand.
 7. **Save for later:** bookmarking captures and indefinitely retains readable full text and sanitized
    HTML while bookmarked. Cold content may be losslessly compressed; capture failures/partial bodies
-   are explicit. Mirroring embedded media is a separate open decision (§17 Q14).
+   are explicit. Images and other media/attachments are excluded from archive capture (§17 Q14).
 
 **v1 non-goals:** AI summaries or any generated text, social features, a full-text search engine,
 native apps (the PWA covers mobile), and migrating FeedIt.sk data.
@@ -197,10 +197,11 @@ Background and rationale: [`background.md`](./background.md).
 | 7 | Translation / LLM provider | Tier 1 = **free CPU machine translation** (LibreTranslate/Argos). Tier 2 and the LLM fallback = **Ollama Cloud GLM** (`glm-5.3-flash`, `glm-5.3`). **No Claude** (too expensive for the quality needed) |
 | 8 | Decision model | **Jev** (TypeSafe) through its HTTP API, pinned version (`jev-1.13.0`). Laya is an optional later engine |
 | 9 | Inference eligibility | **No inference for untrained/off subscriptions.** Training is per selected article; trained/active subscriptions admit automatic new-article inference. The state is per reader/feed, not global |
-| 10 | Bookmarks | Preserve captured full readable article content indefinitely while bookmarked; cold compression must be lossless and transparent |
-| 11 | Sharing and updates | Text-only cards may be shared. Active creators (used service within the preceding 7 days) must consent to public promotion. Semantic library updates are opt-in |
+| 10 | Bookmarks | Preserve captured full readable text and sanitized HTML indefinitely while bookmarked; exclude images/media/attachments. Cold compression must be lossless and transparent |
+| 11 | Sharing and updates | Text-only cards may be shared. Public promotion needs exact-version creator approval while active within 30 days; after 30 consecutive days of inactivity an eligible candidate may be promoted under the audited inactivity policy. Explicit declines remain a veto. Semantic library updates are opt-in |
 | 12 | Labels and media | Labels are neutral. Remote images default off; an explicit per-reader/feed allow overrides that reader's global default |
 | 13 | Provider credentials | Owner's personal Jev/Ollama accounts; encrypted database credentials managed through a write-only admin UI, with encryption keys outside the database |
+| 14 | Initial beta evidence | A passing `owner_pilot` evaluation is sufficient for the initial invite-only beta; retain all quality, coverage, cost and operational gates, and report the actual human count |
 
 **Decided by measurement at gate G1 (M3b), with defaults until then:**
 - language mode per language (default `native`)
@@ -278,10 +279,11 @@ flowchart TD
 - Merge conflicts are limited to one-line map entries.
 
 M6 and M7 work done before the selected G1 profile passes is speculative implementation. A failed
-profile requires an owner decision before treating it as validated. An owner-only pilot may support
-private development; it never substitutes for multi-person beta approval. Fixture tests do not
-override the actual evidence scope or Q13. M8 can prepare operations in parallel with M7, but cannot
-declare launch ready while any M7 task or owner launch gate is outstanding.
+profile requires an owner decision before treating it as validated. Under the approved Q13 policy,
+an `owner_pilot` PASS satisfies the initial invite-only beta's evaluation gate; broader multi-person
+validation remains useful follow-up evidence. Report its actual scope, without relabeling one person
+as several. M8 can prepare operations in parallel with M7, but cannot declare launch ready while any
+M7 task or other launch gate is outstanding.
 
 ---
 
@@ -581,8 +583,9 @@ Complete milestone M2 "Decision engine and classification" exactly as specified 
   - The seed is idempotent.
   - A semantic library change creates a versioned replacement/upgrade offer; existing holders
     keep their original card until explicit acceptance. Accept/decline/conflict/fork cases are tested.
-  - Active creator promotion requires exact-version consent; inactivity/no response never silently
-    publishes a candidate under the unresolved Q12 policy.
+  - Promotion requires exact-version creator approval or at least 30 consecutive days of verified
+    inactivity under Q12, rechecked under lock and recorded as distinct authorization bases.
+    Recent activity resets eligibility; explicit decline blocks publication. Test the 30-day boundary.
   - `question_sets.active` is filled only for absent kinds.
 - **T7:** a fake LibreTranslate server (ok/weak/fail/timeout); the `assessTranslation` truth table;
   best-row selection; skipped tier-2 rows.
@@ -730,11 +733,12 @@ a monitoring command; a background `--watch` process is not completion evidence.
    articles keep growing; do not mutate frozen rated samples. `ingest-sample --watch` monitors it.
 2. Start the rating server on the dev box (`pnpm evaluate serve-rating`) and expose
    it through a tunnel (`docs/eval/TUNNEL.md`). `golden-v1` lives in a dedicated evaluation database on the dev host.
-3. Add 3–5 raters (`eval rater add --name … --langs …`) and send them their URLs and `RATERS.md`.
+3. Add the owner (`eval rater add --name … --langs …`) for `owner_pilot`; additional raters are
+   optional for the initial beta. A later `multi_person_beta` profile uses 3–5 independent people.
 4. Each rater writes 5–10 interests, picks ≥ 10 feeds, and rates ≥ 250 articles.
 5. The owner labels facets for 100 articles per language (a second person labels 50 if possible).
-6. If only the owner is available, use the single-person pilot mode with separate topic profiles
-   (spec 10); this improves topic coverage but does not satisfy the independent-human count.
+6. Owner topic profiles may separate science/cooking interests (spec 10); count them as one human.
+   A passing owner pilot is sufficient for the initial beta under Q13.
 7. Check progress with `eval status` and back up the self-contained golden snapshot plus referenced
    content/cards/feeds (spec 10). An eval-schema-only dump cannot restore its public-table foreign
    keys. Continue to M3b only when the coverage/split preflight in spec 10 passes.
@@ -744,10 +748,9 @@ a monitoring command; a background `--watch` process is not completion evidence.
 ## 9. M3b: Run gate G1
 
 **Outcome:** the experiments run on the real golden set with live Jev, LibreTranslate and Ollama. The
-G1 report and `apps/eval/config/g1.json` are committed with an explicit evaluation profile. A
-`multi_person_beta` PASS can satisfy the launch evidence gate; an `owner_pilot` PASS supports only
-private development and learning-curve work, never automatic beta approval. Failures/coverage gaps
-are reported with the scope they actually establish.
+G1 report and `apps/eval/config/g1.json` are committed with an explicit evaluation profile. An
+`owner_pilot` PASS or `multi_person_beta` PASS satisfies the initial beta's evaluation gate under Q13.
+All other launch gates remain required. Failures/coverage gaps are reported with their actual scope.
 
 **Needs:** active Jev/Ollama credentials through the encrypted database resolver (or authorized
 first-use environment bootstrap), LibreTranslate running (`--profile translate`),
@@ -758,7 +761,7 @@ reported as blocked, never replaced by mislabeled native/fallback output.
 **Goal text:**
 
 ```
-Complete milestone M3b "Run gate G1" as specified in docs/PLAN.md §9 and docs/specs/10-evaluation.md §3–§5. Read those sections first and create one task per row of the M3b task table. Live calls to TypeSafe Jev, Ollama Cloud and the local LibreTranslate are allowed in this milestone; run every experiment with `--yes --max-usd <10 minus the actual spend so far>`, print the estimate before each experiment and the actual cost after, and keep the total under $10. Constraints: do not change the decision rules or thresholds of spec 10 §5 to get a different outcome; do not change locked decisions; commit the report and config as "M3b-T<n>: <summary>". The goal is met only when the transcript shows (1) a final "M3b report" in the format of PLAN.md §0.4 (the Verification section may show only `pnpm typecheck` because no code changes) listing M3b-T1…M3b-T4, (2) the printed G1 decision table from the committed report apps/eval/reports/G1-<date>.md with every rule's inputs and result, (3) either a profile-scoped "PASS" with actual independent-human count, apps/eval/config/g1.json committed and `eval apply-g1` output (owner_pilot requires --development-only), or "CORE BET: FAIL/INCONCLUSIVE" with the failure/coverage summary of spec 10 §5 printed for the owner, (4) the total actual spend printed, and (5) `git status --short` printing nothing. Or stop after 80 turns and print what is missing.
+Complete milestone M3b "Run gate G1" as specified in docs/PLAN.md §9 and docs/specs/10-evaluation.md §3–§5. Read those sections first and create one task per row of the M3b task table. Live calls to TypeSafe Jev, Ollama Cloud and the local LibreTranslate are allowed in this milestone; run every experiment with `--yes --max-usd <10 minus the actual spend so far>`, print the estimate before each experiment and the actual cost after, and keep the total under $10. Constraints: do not change the decision rules or thresholds of spec 10 §5 to get a different outcome; do not change locked decisions; commit the report and config as "M3b-T<n>: <summary>". The goal is met only when the transcript shows (1) a final "M3b report" in the format of PLAN.md §0.4 (the Verification section may show only `pnpm typecheck` because no code changes) listing M3b-T1…M3b-T4, (2) the printed G1 decision table from the committed report apps/eval/reports/G1-<date>.md with every rule's inputs and result, (3) either a profile-scoped "PASS" with actual independent-human count, apps/eval/config/g1.json committed and `eval apply-g1` output (owner_pilot is accepted under Q13), or "CORE BET: FAIL/INCONCLUSIVE" with the failure/coverage summary of spec 10 §5 printed for the owner, (4) the total actual spend printed, and (5) `git status --short` printing nothing. Or stop after 80 turns and print what is missing.
 ```
 
 **Tasks**
@@ -768,10 +771,11 @@ Complete milestone M3b "Run gate G1" as specified in docs/PLAN.md §9 and docs/s
 | M3b-T1 | Preflight: coverage/classes/facets and frozen split pass spec 10 readiness; actual model/MT capabilities verified; keys valid with budgeted tiny calls; total estimate printed | ratings | 10 §2–3 |
 | M3b-T2 | Run B0, B1, B1-T, E1, E2, E3, E3b, E4 (E5 only if Laya is installed), each with `--yes --max-usd <10 − spent so far>` | T1 | 10 §3 |
 | M3b-T3 | Select/tune only on development groups; lock config and evaluate held-out production policy; report PASS/FAIL/INCONCLUSIVE; write `apps/eval/config/g1.json` (runs/snapshot/split hashes), commit | T2 | 10 §1, §4–5 |
-| M3b-T4 | On profile-scoped PASS: `apply-g1` to development (owner_pilot requires `--development-only`); record measured recommendations, not pilot production approval, in `docs/DECISIONS.md` (daily budget recommendation, language modes, card text mode, thresholds, tier-2 cap; Q1 governs production cap increases). On FAIL/INCONCLUSIVE: write `docs/G1-FAIL.md` with the rule 1 details and the 20 worst-ranked liked articles | T3 | 10 §1, §5 |
+| M3b-T4 | On profile-scoped PASS: `apply-g1` to development; record the actual evidence scope and owner-approved initial-beta eligibility in `docs/DECISIONS.md` (daily budget recommendation, language modes, card text mode, thresholds, tier-2 cap; Q1 governs production cap increases). On FAIL/INCONCLUSIVE: write `docs/G1-FAIL.md` with the rule 1 details and the 20 worst-ranked liked articles | T3 | 10 §1, §5 |
 
-**Milestone done when:** the report is committed and the goal evidence is printed. **A failed/inconclusive selected profile does not approve launch. An owner-pilot PASS may unblock
-private development/M7; the multi-person beta gate and Q13 remain separate (§4).**
+**Milestone done when:** the report is committed and the goal evidence is printed. **A failed or
+inconclusive selected profile does not approve launch. An owner-pilot PASS satisfies the evaluation
+gate for development/M7 and the initial beta; M8's other launch requirements still apply (§4).**
 
 ---
 
@@ -974,7 +978,7 @@ offline; E2E smoke tests in CI.
 **Goal text:**
 
 ```
-Complete milestone M6 "Web app" exactly as specified in docs/PLAN.md §12 and docs/specs/09-web-app.md, using the API DTOs from packages/shared and the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §12 and the referenced specs first, create one task per row of the M6 task table, and implement them in dependency order, using subagents for independent lanes under the parallel-work rules of PLAN.md §0.3 (per-feature i18n files). Commit each task as "<task-id>: <summary>". Constraints: all server state via TanStack Query with optimistic updates as specified; English and Slovak strings for every screen; no live third-party calls (E2E uses the fake TypeSafe server and the fixture feed server started by Playwright webServer); locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M6 report" in the format of PLAN.md §0.4 listing M6-T1…M6-T9 each with ✓, commit hash and evidence, and every M6 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int && pnpm e2e` run after the last commit, ending with exit code 0 and listing the six smoke scenarios of spec 09 §9 and the PWA check as passed, and (3) `git status --short` printing nothing. Or stop after 250 turns and print the report with the unfinished items.
+Complete milestone M6 "Web app" exactly as specified in docs/PLAN.md §12 and docs/specs/09-web-app.md, using the API DTOs from packages/shared and the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §12 and the referenced specs first, create one task per row of the M6 task table, and implement them in dependency order, using subagents for independent lanes under the parallel-work rules of PLAN.md §0.3 (per-feature i18n files). Commit each task as "<task-id>: <summary>". Constraints: all server state via TanStack Query with optimistic updates as specified; English and Slovak strings for every screen; no live third-party calls (E2E uses the fake TypeSafe server and the fixture feed server started by Playwright webServer); locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M6 report" in the format of PLAN.md §0.4 listing M6-T1…M6-T9 each with ✓, commit hash and evidence, and every M6 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int && pnpm e2e` run after the last commit, ending with exit code 0 and listing the eleven smoke scenarios of spec 09 §9 and the PWA check as passed, and (3) `git status --short` printing nothing. Or stop after 250 turns and print the report with the unfinished items.
 ```
 
 **Tasks**
@@ -989,7 +993,7 @@ Complete milestone M6 "Web app" exactly as specified in docs/PLAN.md §12 and do
 | M6-T6 | Feeds manager (folders), Interests (cards, library, suggestions, editor), Labels, Rules, Settings | T1 | C | 09 §5–7 |
 | M6-T7 | Admin UI including provider credential lifecycle and consent status | T1 | D | 09 §8 |
 | M6-T8 | PWA: manifest, service worker, account-scoped offline store, foreground replay plus optional Background Sync; accessibility pass | T2, T9 | D | 09 §1, §9 (PWA check) |
-| M6-T9 | Playwright environment (`webServer`) and six smoke scenarios (PWA test belongs to T8), added to CI | T2–T6 | E | 09 §9; 01 §7 |
+| M6-T9 | Playwright environment (`webServer`) and eleven smoke scenarios (PWA test belongs to T8), added to CI | T2–T7 | E | 09 §9; 01 §7 |
 
 **Done when:**
 
@@ -1014,7 +1018,7 @@ Complete milestone M6 "Web app" exactly as specified in docs/PLAN.md §12 and do
 - **T8:** `pwa.pw.ts` passes (service worker ready, `getInstallabilityErrors` returns `[]`, offline
   reload shows cached items); axe-core finds no serious or critical violations on the reader, the
   Why-this drawer and onboarding.
-- **T9:** the six smoke scenarios of spec 09 §9 pass **locally** (output shown), and the
+- **T9:** the eleven smoke scenarios of spec 09 §9 pass **locally** (output shown), and the
   E2E job is present in `ci.yml`.
 
 **Milestone done when:** all tasks are done and the full check, including E2E, passes.
@@ -1032,7 +1036,7 @@ from unexplained likes. Learning curves are verified on the golden set.
 **Scheduling:** T1–T6 can start once M4, M5 and M6 are merged. M6 is needed because the M7 goal
 runs the E2E suite. **T7 needs M3b merged** (it reads
 `apps/eval/config/g1.json` `runs` and the dedicated evaluation database's `golden-v1`). An owner-pilot artifact is usable, with its
-limited human count reported; it does not approve launch. If M3b is not merged yet, finish T1–T6
+actual human count reported; a PASS satisfies the initial beta's evaluation gate. If M3b is not merged yet, finish T1–T6
 and stop with the report marking T7 "blocked on M3b". Run the goal again afterwards.
 
 **Goal text:**
@@ -1148,7 +1152,8 @@ Complete milestone M8 "Operations and launch readiness" exactly as specified in 
 
 **Implementation done when:** all tasks are done, the full check passes, and every launch item has
 evidence or is explicitly marked blocked/owner. **Launch ready** requires all M7 tasks merged, G1
-`profile: multi_person_beta` PASS applied (or an explicit recorded Q13 gate change) and every launch item (including owner items and §17 launch gates) resolved. A local
+`profile: owner_pilot` or `multi_person_beta` PASS applied and every launch item (including owner
+deployment inputs in §17) resolved. A local
 production-like rehearsal does not prove DNS, mail delivery, host capacity or production recovery.
 
 ---
@@ -1173,40 +1178,42 @@ production-like rehearsal does not prove DNS, mail delivery, host capacity or pr
 | 2026-09-24 | Review pass: DB bootstrap, grants and definer functions; SSRF hardening; pg-boss semantics; immutable cards and labels; E2E and fake engine; eval budget isolation; dependency and ordering fixes |
 | 2026-09-25 | Cross-spec review: transactional outbox and leases, content/answer/rank freshness, private-card isolation, lossless identity merges, atomic spend reservations, auth/offline mutation safety, held-out evaluation, recovery and launch gates; task dependencies and owner decisions made explicit |
 | 2026-09-25 | Owner answers applied: per-feed inference modes, slow selected-article training, permanent bookmark snapshots, per-feed media overrides, encrypted admin-managed credentials, active-author consent, opt-in library upgrades, neutral labels and a single-human evaluation pilot |
+| 2026-09-25 | Final owner decisions: explicit prospective feed activation, public-card eligibility after 30 days of creator inactivity, owner-pilot PASS accepted for initial beta, and text/HTML bookmark archives without media |
 
 ## 17. Owner decisions and implementation gates
 
-Answers received **2026-09-25**. These supersede the earlier recommendations and are implemented
-throughout the specs. Remaining questions below affect only the named behavior; they do not block
-independent implementation or fixture tests. Record subsequent answers and update all affected specs
-in the same commit. `INCONCLUSIVE` maps to `status: needs_more_data` in the G1 artifact; a single-person
-pilot is not silently relabeled a multi-reader PASS.
+Answers received **2026-09-25**, including the final follow-up decisions Q11–Q14. All fourteen
+product questions are resolved below; later answers supersede earlier activity-window and launch
+recommendations. Record any future change and update affected specs in the same commit.
+`INCONCLUSIVE` maps to `status: needs_more_data` in the G1 artifact. The approved owner pilot remains
+one-person evidence even though a PASS is sufficient for the initial invite-only beta.
 
 ### 17.1 Recorded answers
 
 | ID | Owner answer | Binding consequence / remaining operational input |
 |---|---|---|
-| Q1 | Workload is unknown and variable; keep a baseline and measure once running. Untrained feeds use no inference; training selects articles slowly; trained feeds classify automatically. | Keep the 20-reader benchmark, $2/day initial inference cap and $10 G1 cap as adjustable test baselines, not capacity promises. Gate all provider work by per-user/feed mode and explicit demand. Record selected-training vs automatic volumes, distinct questions, reuse and actual spend. No workload estimate requires another owner answer now; Q11 covers transition semantics. |
-| Q2 | Cards are shareable; require the creator's consent when they used the service within a week. | Internal sharing of identical text-only cards is approved. Public promotion needs exact-version affirmative approval from active creators (`last_active_at` within the preceding 7 days). Track authorship independently of holders/deduplication. Seven days defines recent activity, not a consent-response deadline. Inactive/no-response behavior remains Q12. |
-| Q3 | Public feeds only at the start. | Public-corpus boundary approved; credentials and private/tokenized feed support remain outside v1. |
-| Q4 | Proposed recovery targets accepted. | RPO ≤24 h and RTO ≤4 h are targets requiring a successful drill. Host/domain, mail provider, backup destination and encryption-key custodian still need real deployment values, not another policy decision. |
-| Q5 | Preserve bookmarked content indefinitely, even if the source disappears; compression after 30 days is acceptable. | Capture retained full readable text plus sanitized HTML, title/date/source metadata and capture provenance. Lossless cold compression may reduce storage without expiry. Failed/partial extraction is disclosed. Unbookmark/account erasure retention is specified; embedded media scope is Q14. |
-| Q6 | Privacy defaults accepted; users must be able to always allow images per feed. | Remember an explicit `allow`/`block`/`inherit` preference per reader/feed. `allow` wins over the reader's global default; one reader's choice never affects another. Account-isolated offline storage and controllable implicit feedback remain required. |
-| Q7 | Additional raters uncertain; owner can evaluate several topics with different preferences. | Support multiple evaluation profiles belonging to the same human, such as science and cooking. Useful for coverage and within-reader personalization, but never count them as independent people or bootstrap them as independent raters. Add an owner-only pilot; multi-reader launch evidence remains Q13. |
-| Q8 | Jev/Ollama accepted; use the owner's personal accounts and provide admin API-key management or database storage first. | Add encrypted database credential envelopes, write-only admin configuration/test/rotation/revoke, metadata-only status and a CLI/bootstrap path. Master keys stay outside the database/repository; no actual API secrets were supplied in this conversation. |
-| Q9 | Semantic library updates are opt-in. | Publishing a replacement never repoints existing holders automatically. Offer an explicit version-specific upgrade; keep existing card identity/evidence until accepted. Metadata-only corrections remain separate. |
-| Q10 | Labels are neutral. | Remove label-assignment-as-positive training, its opt-in flag and its pending-approval gate. Label/unlabel/rename may change organization and ranking context, never the interest target. |
+| Q1 | Workload is unknown and variable; keep a baseline and measure once running. Untrained feeds use no inference; training selects articles slowly; trained feeds classify automatically. | Keep the 20-reader benchmark, $2/day initial inference cap and $10 G1 cap as adjustable test baselines, not capacity promises. Gate provider work by per-user/feed mode and explicit demand. Measure selected vs automatic volumes, distinct questions, reuse and spend. Q11 confirms transition semantics. |
+| Q2 | Cards are shareable; creator approval is required while active. The initial one-week window is superseded by Q12. | Internal sharing of identical text-only cards is approved. Public promotion requires exact-version approval for creators active within 30 days, or the audited inactivity basis in Q12. Track original authorship independently of holders/deduplication. |
+| Q3 | Public feeds only at the start. | Public-corpus boundary approved; private/tokenized feed support remains outside v1. |
+| Q4 | Proposed recovery targets accepted. | RPO ≤24 h and RTO ≤4 h require a successful drill. Host/domain, mail provider, backup destination and encryption-key custodian still need real deployment values. |
+| Q5 | Preserve bookmarked content indefinitely, even if the source disappears; compression after 30 days is acceptable. | Capture full readable text, sanitized HTML, title/date/source metadata and provenance. Lossless cold compression does not expire content. Disclose failed/partial capture; unbookmark/account-erasure retention remains specified. Q14 excludes media capture. |
+| Q6 | Privacy defaults accepted; users must be able to always allow images per feed. | Remember per-reader/feed allow/block/inherit. Allow overrides that reader's global default. Account-isolated offline storage and controllable implicit feedback remain required; Q14 does not disable normal image display. |
+| Q7 | Additional raters uncertain; owner can evaluate several topics with different preferences. | Support multiple topic contexts belonging to the same human; never count them as independent people. The owner-only pilot is accepted for initial beta under Q13. |
+| Q8 | Personal Jev/Ollama accounts accepted; provide admin API-key management or DB storage first. | Encrypted DB credentials with write-only admin configuration/test/rotation/revoke and CLI/bootstrap; master keys outside DB/repository. No actual API secrets have been supplied. |
+| Q9 | Semantic library updates are opt-in. | Replacement publication never repoints existing holders automatically. Offer a version-specific upgrade; metadata-only corrections remain separate. |
+| Q10 | Labels are neutral. | Label operations never supply positive/negative personal-interest training targets; no label-as-positive flag. |
 
-### 17.2 Remaining follow-up decisions
+### 17.2 Final follow-up decisions
 
-| ID | Question for the owner | Safe implementable default until answered |
+| ID | Owner answer | Binding implementation |
 |---|---|---|
-| Q11 | What makes a feed “trained”: your explicit “Enable automatic classification” action, or an automatic transition after a number/quality of ratings? Should activating also classify its existing backlog? | Explicit per-feed enable, no guessed numerical threshold. Cards alone and a learned-model activation do not silently enable a subscription. Automatic mode covers arrivals since activation; selected old articles remain trainable. Historical bulk backfill requires a separate explicit bounded request. |
-| Q12 | May an inactive creator's card be published without asking? What happens when an active creator never responds or returns while promotion is pending? | Keep the candidate pending; no inferred consent or timeout approval. Recheck recent activity and exact card version at publication. Deduplicating or adopting a card does not transfer its original creator identity; missing/ambiguous provenance stays pending. |
-| Q13 | If only you can rate initially, should an owner-only pilot be sufficient to begin a limited invite-only beta with explicitly provisional evidence, or retain the ≥3-independent-human gate before inviting testers? | Tooling and private pilot proceed. Report profiles/topics and one actual human accurately; the current multi-reader launch gate stays unsatisfied until enough independent evidence or a recorded owner-approved gate change. |
-| Q14 | Must bookmarks also download and preserve embedded images/attachments, or is preserved full text plus sanitized article HTML sufficient for v1? | Preserve text/HTML now; external media URLs may fail later and are not advertised as mirrored. Do not archive arbitrary binaries or third-party tracking resources without a defined bounded asset-capture policy. |
+| Q11 | Current default is correct. | Explicit per-feed enable activates automatic classification for arrivals since activation. Cards, ratings and model readiness never silently enable a subscription. Existing articles remain manually selectable; historical bulk backfill needs a separate explicit bounded request. |
+| Q12 | Make eligible cards public after 30 days of creator inactivity; one week is too short. | Keep existing administrator curation/eligibility requirements. Exact-version affirmative approval permits promotion while active; otherwise require 30 consecutive days since the original creator's last activity, rechecked under lock at publication and recorded as an inactivity-policy basis, never fabricated consent. A return resets the inactivity clock; a pending-request age alone grants nothing. An explicit decline remains a veto. Use known account creation time if activity is null; missing/deleted/ambiguous creator provenance stays pending. |
+| Q13 | Owner-only pilot is sufficient. | An `owner_pilot` PASS with one real human can supply production settings and satisfy the initial invite-only beta's evaluation gate. Keep quality, coverage, cost, M7 and operational gates intact. Multiple topic profiles remain one person; broader multi-person validation can follow later. |
+| Q14 | Exclude images. | Preserve full readable text and sanitized HTML; do not download/archive images, embedded media or attachment binaries. Safe external references may remain subject to existing display preferences and can disappear later. Capture status concerns text/HTML completeness, not unavailable media. |
 
-**Technical preflight:** verify installed model IDs, account limits, protocol/cost fields, MT language
-paths, encryption-key recovery, compression support and target-host performance. Report unsupported
-capabilities honestly; do not invent an endpoint, silently switch providers, exceed spending caps or
-count a private pilot as a passed multi-user evaluation.
+No product decision remains pending from this review. Implementation still needs the deployment
+values listed in Q4 and technical preflight: installed model IDs, account limits, protocol/cost
+fields, MT language paths, encryption-key recovery, compression support and target-host performance.
+Report unsupported capabilities honestly; do not invent endpoints, silently switch providers,
+exceed spending caps or represent an owner pilot as multi-person validation.

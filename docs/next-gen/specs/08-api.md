@@ -232,7 +232,7 @@ email never hits the unique constraint through the signup path.
 | `GET /subscriptions` | — | `[{feed: FeedInfo, titleOverride, folder, allowDuplicates, hidden, inferenceMode, inferenceVersion, inferenceActivatedAt, imagePolicy, effectiveImagesAllowed, unread: {forYou, maybe, everything, new}}]` |
 | `POST /subscriptions` | `{url, folder?}` | Discovery (spec 03 §10). One feed → `201 {subscription}` with `inferenceMode:'off'`; local fetch/parse makes articles readable without inference/backfill. Several → `200 {status: 'choose', candidates: [{url, title, type}]}`. Errors `FEED_*` (422). Quota `maxFeeds`. Existing subscriptions keep their mode |
 | `PATCH /subscriptions/:feedId` | `{titleOverride?, folder?, allowDuplicates?, hidden?, imagePolicy?: 'inherit'\|'allow'\|'block'}` | Update metadata/image policy only; inference mode changes use the explicit endpoint below |
-| `POST /subscriptions/:feedId/inference` | `{mode:'off'\|'training'\|'active', expectedVersion}` | CAS `inference_version`, persist the selected mode, refresh demand and rank eligibility → `200 {subscription}`. Activation semantics are provisional pending Q11 (§4.1) |
+| `POST /subscriptions/:feedId/inference` | `{mode:'off'\|'training'\|'active', expectedVersion}` | CAS `inference_version`, persist the selected mode, refresh demand and rank eligibility → `200 {subscription}`. Active requires explicit enable and applies to new arrivals only (§4.1) |
 | `POST /subscriptions/:feedId/analyze` | `{articles:[{id, contentRevision}][1..20], expectedInferenceVersion, startTraining?:boolean}` | In training/active, create exact article requests only (§4.1); off requires explicit `startTraining:true`. Persist requests plus `analysis.process {analysisRequestId}` intents atomically → `202 {requests:[{id, articleId, status}]}` |
 | `GET /analysis-requests/:id` | — | Own request only → `{id, feedId, articleId, contentRevision, status, createdAt, completedAt, errorCode?}`; status is `pending\|running\|complete\|failed\|cancelled` |
 | `GET /feed-preferences` | — | Own remembered preferences, including unsubscribed bookmark sources: `[{feedId,imagePolicy,effectiveImagesAllowed}]` |
@@ -272,11 +272,10 @@ two users must not force duplicate provider calls. Another user's active subscri
 this user's off subscription. Local feed fetching, reading, rating and bookmark capture remain
 available while off; GET/counts/card edits/calibration polls must not bypass the demand gate.
 
-**Provisional Q11 default, implementable now:** the user explicitly chooses "Enable automatic
+**Activation policy:** the user explicitly chooses "Enable automatic
 classification" to enter active. Record the activation timestamp atomically; only new feed arrivals
 from that point create automatic demand. Existing backlog requires explicit article selection; no
-rating-count threshold, automatic graduation or whole-feed backfill is inferred. Q11 asks whether the
-owner wants a different graduation/backfill policy, not whether the explicit control can be built.
+rating-count threshold, automatic graduation or whole-feed backfill is inferred.
 
 Changing mode advances `inference_version` and invalidates stale demand. Off cancels unstarted manual
 requests and automatic work for this subscription; running external calls may finish for accounting
@@ -296,7 +295,9 @@ DTOs identify `mediaPolicyFeedId` and `effectiveImagesAllowed`. For duplicate ar
 selected display feed consistently; a bookmark freezes its selected source id at save time. Do not
 pick a different sibling feed to bypass a block. Source-less content uses the global preference.
 These controls cover sidebar icons, thumbnails, detail images and saved HTML image placeholders;
-remote image retention/mirroring is separately undecided (Q14).
+bookmark archives contain text and sanitized HTML only, with no retained image/media binaries.
+Any permitted live remote image display still obeys the same source preference; allowing images
+does not cause the bookmark capture/export path to download or archive them.
 
 ---
 
@@ -465,8 +466,10 @@ BookmarkSnapshot = {
 Persist the full safely captured article text/sanitized HTML indefinitely while any bookmark pins
 the snapshot, and losslessly compress snapshots older than 30 days (specs 03/11). A feed teaser,
 paywall, failed fetch or extraction limit yields `partial`/`failed` with a stable error code; never
-claim a complete body that was not captured. Saved images/attachments are not promised by this text
-mirror contract; Q14 settles asset mirroring. Decompression and streaming have bounded memory and
+claim a complete body that was not captured. Snapshot storage and exports exclude image/media
+binaries, attachments, image data URLs and embedded media payloads; sanitized HTML may retain inert
+remote-image references or descriptive alt text, never an embedded archived image. Text capture
+completeness does not depend on excluded images. Decompression and streaming have bounded memory and
 response-size checks; compression is invisible to readers/exports and cannot truncate text. All
 snapshot access is authorized through the user's bookmark, never an unguessable snapshot id alone.
 
@@ -649,7 +652,7 @@ nor grants permission to analyze other articles.
 | `GET /admin/library/candidates?minHolders=3` | Promotion candidates: all non-retired `shared` interest cards, with holder counts from `admin_card_holders` (spec 02 §6), filtered to `holders ≥ minHolders`, sorted by holders descending, at most 100 |
 | `GET /admin/library` / `POST /admin/library` / `PATCH /admin/library/:id` | Manage library metadata; semantic text changes create a new immutable library version with predecessor identity (spec 05), never replace existing holders' text/examples |
 | `POST /admin/library/promotion-requests` | `{cardId,title,titleSk,topicIds}`. Require shared card and ≥3 holders; create a versioned exact-payload request addressed to its original creator → `201 {request}` |
-| `POST /admin/library/promote` | `{requestId,expectedVersion}`. Require exact approved request/current card/payload, then publish preserving unchanged text/id/answers. No response, decline or unapproved inactive creator → `409 CONFLICT`, with no publication |
+| `POST /admin/library/promote` | `{requestId,expectedVersion}`. Require shared card with ≥3 holders and either exact creator approval or audited ≥30-day creator inactivity (§9.2); recheck under lock and publish preserving unchanged text/id/answers. Decline, recent unapproved activity or missing/deleted provenance → `409 CONFLICT` |
 | `GET /admin/users?q=` / `PATCH /admin/users/:id` | Role, plan, `invites_left` |
 | `GET /admin/invites?status=unused\|used\|expired` / `POST /admin/invites` | List all invites; create `{count ≤ 50, email?, note?, expiresDays ≤ 90}` → codes |
 | `GET /admin/waitlist` / `POST /admin/waitlist/:id/invite` | Create an invite and email it |
@@ -694,16 +697,36 @@ use only; the UI explains that upstream account revocation is done in the provid
 
 ### 9.2 Public-card approval
 
-Internal reuse of identical text-only cards is approved. Public publication requires an affirmative
-version-specific response from the **original creator** when that creator used FeedIt within the
-preceding 7 days (`last_active_at`), and the request must disclose exactly what will become public.
-Seven days defines recent activity, not a response deadline. Silence is never approval. Requests
-without affirmative consent, including inactive/unreachable/deleted creators, remain held pending
-Q12; do not invent a timeout that authorizes promotion. Another holder or an administrator cannot
-respond on the creator's behalf. Any change to text/publication payload invalidates the old approval
-and requires a new version; promotion rechecks under lock and is idempotent. Ordinary library
-adoption does not change creator provenance or consent records. Seeded administrator-authored
-library cards follow their own authorship policy, not a forged user approval.
+Internal reuse of identical text-only cards is approved. The request must disclose the exact proposed
+public text/title/translations/topics to the **original creator**. An administrator may promote a
+shared card with at least three holders on either of these distinct authorization bases:
+
+- `creator_approval`: affirmative, version-specific creator approval of the exact current payload.
+- `creator_inactive_30d`: the known, existing creator has been inactive for **at least 30 days**,
+  measured from `last_active_at`, or that creator's `created_at` when last_active_at is null. The
+  absence of a reply is not recorded as approval. The administrator makes the promotion explicitly;
+  reaching 30 days does not publish anything automatically.
+
+With less than 30 days' inactivity, exact creator approval is required. An explicit decline vetoes
+promotion on the inactivity basis; creating a new request/version cannot erase that veto. Only a
+later affirmative creator decision may supersede it. Missing/deleted or ambiguous creator provenance
+remains held, and another holder's approval/activity cannot stand in for the original creator.
+
+The promotion transaction locks and rechecks the request, current card/payload, original creator's
+activity and any applicable decline. A return to the service resets the inactivity clock: the age of
+the request, email or notification alone never establishes eligibility. Store `authorization_kind`
+(`creator_approval` or `creator_inactive_30d`), the evaluated activity timestamp/source, checked-at
+time, exact payload/version, authorization-policy version, and promoting administrator in the audit
+ledger (specs 02/05). Inactivity
+publication does not synthesize `approved`/`responded_at` or a fictitious creator response.
+
+Admin request/candidate DTOs expose current `promotionEligibility` (basis or held reason) and, once
+published, `authorizationKind` and sanitized audit evidence. Eligibility displayed before the click
+is advisory; a concurrent creator return/decline can make promotion fail with `409 CONFLICT`.
+Any text/publication-payload change invalidates earlier approval and requires a new version and a
+fresh authorization check. Promotion is idempotent. Ordinary library adoption does not change
+creator provenance or consent records. Seeded administrator-authored library cards follow their own
+authorship policy, not a forged user approval.
 
 ---
 
@@ -791,6 +814,9 @@ Send `Retry-After` for 429. Public waitlist upserts never expose whether an addr
   stable source policy. Changing one user's preference changes no other user's response.
 - **Credentials and consent:** staged keys never appear in GET/export/logs/idempotency bodies;
   invalid/obsolete probes cannot replace the active key; stale admin writes fail CAS and local
-  disable prevents environment fallback. A hash adopter cannot approve creator publication; no
-  response, inactive/unapproved creator and changed payload cannot promote. Library upgrades are
+  disable prevents environment fallback. A hash adopter cannot approve creator publication; recent
+  unapproved activity, explicit decline, unknown/deleted provenance and changed payload cannot use
+  stale authorization. Test 29 days 23:59:59 versus exactly 30 days, null last_active_at falling back
+  to known created_at, a creator return racing promotion, and an old request from a recently active
+  creator. Inactivity publication records its own audit basis without inventing approval. Library upgrades are
   explicit and do not overwrite private examples; label assignment contributes no preference label.

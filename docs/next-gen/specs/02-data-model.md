@@ -611,6 +611,7 @@ CREATE TABLE interest_cards (
   parent_card_id  bigint NULL REFERENCES interest_cards(id) ON DELETE SET NULL,
   owner_user_id   uuid NULL REFERENCES users(id) ON DELETE CASCADE,  -- access owner, private forks only
   creator_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL, -- original author; never a holder count
+  publication_veto_at timestamptz NULL,            -- only original-creator response function may set/clear
   i18n            jsonb NOT NULL DEFAULT '{}',    -- {"sk": {"title": "…", "interest": "…"}} for library cards
   created_at      timestamptz NOT NULL DEFAULT now(),
   retired_at      timestamptz NULL,
@@ -816,8 +817,8 @@ state is not permission to expand inference for every subscribed reader.
 Mode changes lock the subscription, check the client's expected version, increment
 `inference_version`, set `inference_activated_at` to the activation transaction time only when entering
 active (null when leaving), invalidate old authorization and refresh affected `feed_cards`. Reapplying
-the same mode is an idempotent no-op. Q11 still decides automatic graduation; until then only explicit
-user enablement activates automatic inference, and ordinary ratings never silently do it.
+the same mode is an idempotent no-op. Only explicit user enablement activates automatic inference
+for new arrivals; there is no automatic graduation from accumulated ratings or historical backfill.
 
 `feed_cards` materializes cards/labels of **active subscriptions only**. It is a candidate demand cache,
 not an authorization proof: a worker must recheck live user/subscription, article carrier+activation
@@ -843,7 +844,8 @@ than treating unavailable features as zero or mixing future context into an old 
 
 `article_snapshots` stores the exact available readable text and sanitized HTML, with provenance and a
 checksum; source safety limits still apply and paywalls/truncation/extraction errors are explicitly
-partial. It does not mirror images/media while Q14 is open. Model input length limits apply only to
+partial. Bookmark preservation is text and sanitized HTML only: no images or media bytes are mirrored,
+embedded as data URLs, or cached as archive assets. Model input length limits apply only to
 model views, never destructively shorten archived source content. Snapshot content/provenance is
 immutable; only lifecycle fields `cold_at`/`unreferenced_at` and a vetted article-merge FK relocation may
 change in place. A corrected or more complete capture is another row.
@@ -885,16 +887,41 @@ Internal reuse of a shared card is allowed and does not publish it in the public
 holders; deduplication/re-adoption never changes it. User/fork inserts derive it from the authenticated
 creator. A user's erasure clears it rather than assigning authorship to a later holder.
 
-Public promotion of a user-created shared card requires `card_publication_requests` for that creator,
-who must be active (`last_active_at` within the preceding seven days) and not soft-deleted.
-Missing or ambiguous original-author provenance remains unpublished; do not elect an arbitrary holder. Approval
-binds exact card text hash and proposed publication metadata hash/version. Only that creator can
-approve/decline; an administrator may request publication but cannot impersonate consent. Recheck
-creator identity/activity, approval, expiry if set, hashes and version at promotion in one transaction.
-Metadata changes invalidate old consent; request version advances and approval is requested again.
-Inactive/deleted authors and no response stay shared while Q12 is unresolved; no timeout implies
-consent. Seeded library content is a separate reviewed publication source, not a way to relabel a
-user-created row to bypass its author.
+Public promotion remains an explicit administrator action for an eligible shared card (at least three
+holders, per spec 05), recorded through `card_publication_requests` for its original creator. It needs
+one of two distinct authorization bases:
+
+- `creator_approval`: that creator affirmatively approves the exact card text and proposed publication
+  metadata hash/version. Only the creator can approve/decline; the administrator cannot impersonate
+  a response.
+- `creator_inactive_30d`: the known, non-deleted original creator has been continuously inactive for
+  at least 30 days and there is no outstanding explicit publication veto. This authorizes publication
+  under the owner's policy; it is **not** affirmative creator consent. Leave `responded_at` null when
+  the creator never responded, do not manufacture an `approved` transition, and record the inactivity
+  evidence separately on the `promoted` row.
+
+At actual promotion, lock the original creator, card and request in the established order and verify
+identity, non-deleted state, proposal hashes, expected version and any request expiry. Read the creator's
+current `last_active_at`; only when that is null may the same known creator's trusted `created_at` be
+used. Compare this anchor with a publication timestamp captured **after** locking: at least 720 hours
+must have elapsed for the inactivity route. Never use card creation, request creation, another holder's
+activity, or an assumed date for a missing author. Any new activity resets the inactivity countdown;
+a prior eligibility display or a 30-day-old pending request is not sufficient evidence.
+
+Missing, ambiguous or deleted creator provenance stays pending/shared. A decline sets
+`interest_cards.publication_veto_at`; creating another request, changing metadata or waiting longer
+cannot clear it. Only a later affirmative decision by the original creator for the exact proposed
+publication can clear that veto, with the earlier rejection retained in the audit history. There is
+no automatic background publisher and no change to candidate eligibility or the admin promotion step.
+
+`authorization_kind`, immutable `authorization_evidence`, `promoted_at` and `promoted_by` are written
+atomically with public visibility. Evidence has a shared zod union: both branches include policyVersion
+(1), creatorUserId, cardTextHash, publicationSha and requestVersion; approval includes respondedAt and
+the approved version, while inactivity includes anchorSource (`last_active_at` or `created_at`),
+anchorAt and checkedAt. The timestamp difference proves the full 30-day interval. Metadata changes
+invalidate an old proposal approval and require a new version/authorization check. Seeded library
+content remains a separately reviewed source, never a way to relabel user-created material to bypass
+these rules.
 
 `library_card_versions` is an immutable semantic chain for a stable library slug; enforce consecutive
 versions and predecessor belonging to the same slug in the repository/constraint trigger. A semantic
@@ -972,7 +999,7 @@ CREATE INDEX analysis_requests_pending_idx ON analysis_requests (next_attempt_at
   WHERE status IN ('pending','running');
 CREATE INDEX analysis_requests_user_article_idx ON analysis_requests (user_id, article_id, created_at DESC);
 
-CREATE TABLE card_publication_requests (           -- original author's exact-version publication consent
+CREATE TABLE card_publication_requests (           -- exact proposal, genuine responses and publication basis
   id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   user_id             uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   card_id             bigint NOT NULL REFERENCES interest_cards(id) ON DELETE CASCADE,
@@ -984,9 +1011,18 @@ CREATE TABLE card_publication_requests (           -- original author's exact-ve
   publication_sha    text NOT NULL,
   version             bigint NOT NULL DEFAULT 1 CHECK (version > 0),
   requested_at        timestamptz NOT NULL DEFAULT now(),
-  expires_at          timestamptz NULL,            -- no response deadline assumed while Q12 is open
-  responded_at        timestamptz NULL,
-  CHECK (expires_at IS NULL OR expires_at > requested_at)
+  expires_at          timestamptz NULL,            -- optional proposal expiry, not the inactivity clock
+  responded_at        timestamptz NULL,            -- genuine creator response only
+  authorization_kind text NULL CHECK (authorization_kind IN ('creator_approval','creator_inactive_30d')),
+  authorization_evidence jsonb NULL,              -- immutable versioned union described in §3.6
+  promoted_at         timestamptz NULL,
+  promoted_by         uuid NULL REFERENCES users(id) ON DELETE SET NULL,
+  CHECK (expires_at IS NULL OR expires_at > requested_at),
+  CHECK ((authorization_kind IS NULL) = (authorization_evidence IS NULL)),
+  CHECK ((status = 'promoted') = (promoted_at IS NOT NULL)),
+  CHECK ((status = 'promoted') = (authorization_kind IS NOT NULL)),
+  CHECK (status NOT IN ('approved','rejected') OR responded_at IS NOT NULL),
+  CHECK (authorization_kind <> 'creator_approval' OR responded_at IS NOT NULL)
 );
 CREATE UNIQUE INDEX card_publication_pending_idx ON card_publication_requests (card_id)
   WHERE status IN ('pending','approved');
@@ -1227,7 +1263,7 @@ alone does not satisfy these requirements.
 | Invariant | Database enforcement and repository behavior |
 |---|---|
 | Card holdings cannot attach another tenant's private card | BEFORE INSERT/UPDATE trigger on `user_cards`, `user_labels`, `card_suggestions`: the referenced card exists, is public/shared or owned by `NEW.user_id`, and has kind `interest`, `label`, `interest` respectively. Check actual card ownership even for worker writes; raise generic constraint failure without private values |
-| Immutable card identity | BEFORE UPDATE on `interest_cards`: reject changes to `kind`, `text_hash`, `lang`, creator identity, ownership or base `body` text/examples. Creator FK clearing during verified account erasure is the sole authorship exception. `interest_en`/`not_for_en` permit initial validated pair fill, or an explicit authorized/audited full-pair retranslation/reset that updates the card-input fingerprint and invalidates only admitted dependent answers (specs 05/07). Partial or silent overwrites are forbidden. Label `title` cannot change because it is hashed. Private forks cannot be promoted. Shared→public metadata promotion requires the exact approved author consent plus admin; non-admin API writes can only un-retire an otherwise identical accessible row. Worker/owner metadata maintenance does not bypass identity invariants |
+| Immutable card identity | BEFORE UPDATE on `interest_cards`: reject changes to `kind`, `text_hash`, `lang`, creator identity, ownership or base `body` text/examples. Creator FK clearing during verified account erasure is the sole authorship exception. `interest_en`/`not_for_en` permit initial validated pair fill, or an explicit authorized/audited full-pair retranslation/reset that updates the card-input fingerprint and invalidates only admitted dependent answers (specs 05/07). Partial or silent overwrites are forbidden. Label `title` cannot change because it is hashed. Private forks cannot be promoted. Shared→public metadata promotion requires admin plus exact creator approval or a recorded valid 30-day inactivity authorization, with no outstanding creator veto; non-admin API writes can only un-retire an otherwise identical accessible row. Worker/owner metadata maintenance does not bypass identity invariants |
 | Label assignment integrity | DEFERRABLE INITIALLY DEFERRED constraint triggers on changed `user_article.label_ids`/`label_suggestions` and `user_labels` removals/repointing validate the **final row state**: distinct non-null IDs, each present in that user's `user_labels`, and suggestions exclude assigned labels. Label deletion removes its IDs from both arrays in the same transaction; fork replacement uses deduplicated arrays. Serialize label changes and assignments on the owning user row |
 | Scope owns a subscription | Composite FK on `(user_id, scope_feed_id)` removes a scoped holding when that subscription is deleted; it never silently widens it to every feed. Capture affected cards/feeds before deletion for cache refresh and outbox work |
 | Topic references | Taxonomy seeding validates each level-2 parent is level 1 and every `interest_cards.topic_ids` entry exists. BEFORE INSERT/UPDATE trigger enforces this on admin/runtime card changes; seeded taxonomy IDs are never deleted while used by arrays or model definitions |
@@ -1235,7 +1271,7 @@ alone does not satisfy these requirements.
 | One active personal model | Lock the `users` row before allocating a model version or switching `active`; deactivate old and activate new in one transaction. Partial unique index rejects dual activation; stale training input revision cannot activate a model |
 | Inference gate generation | Subscription BEFORE UPDATE validates mode/timestamp/version transition. Manual request BEFORE INSERT checks active tenant, live subscription/version, actual feed carrier and frozen input hash; its input snapshot/hash is immutable after insert. Vetted feed/article identity merges may relocate only operational FKs while preserving recorded source identity in the snapshot; cancel and clear leases for pending/running old-identity requests. Completed manual results are worker-only. No label action or shared card adoption may bypass this gate |
 | Bookmark binding | Snapshot BEFORE UPDATE rejects payload/provenance edits; lifecycle/approved merge changes only. Binding helper checks snapshot article identity and completeness, increments capture generation, and maintains `unreferenced_at` plus undo pins under locks. Ordinary API writes cannot choose snapshot IDs or saved status |
-| Original-author publication | Consent creation derives `user_id` from the card's immutable creator. Response/promote functions use request version and card/publication hashes; PUBLIC visibility updates fail unless the approved consent transaction or reviewed initial-library seed permits them |
+| Original-author publication | Request creation derives `user_id` from the immutable creator. Response functions alone maintain the durable publication veto. Promote locks/rechecks creator activity/provenance, veto, version and hashes and stores genuine-approval or 30-day-inactivity evidence; public visibility updates fail without that transaction or a reviewed initial-library seed. Published authorization evidence is immutable |
 | Library revision chain | Validate predecessor slug/version and immutable `library_card_versions` mapping. Semantic updates cannot re-point holdings except explicit recipient acceptance. Never mutate immutable label title |
 | Retention and account erasure | Gather user feed IDs and private card IDs, delete/rewrite personal derived references and receipts, clear arrays, then delete the account, refresh feeds and commit. Deferred card FKs allow the user's cascading holds/forks to disappear in either FK execution order; another user's hold of a private fork is impossible. Revoke live sessions at soft deletion |
 
@@ -1393,14 +1429,19 @@ ciphertext SELECT privilege is granted to the API role.
 
 **Publication consent functions (M0/M4).** Supply admin-only request/list/promote functions and
 `respond_card_publication(p_request_id bigint, p_expected_version bigint, p_approve boolean)` for the
-authenticated original author. Request derives the author from the card and checks the seven-day
-activity window, stores exact hashes, and exposes the proposed metadata for informed consent. Response
-checks caller ownership and pending state under lock, records approved/rejected and bumps version.
-Promotion rechecks author identity/activity, request status/version and exact hashes, then marks
-promoted and updates public visibility in one transaction. Expiry, altered content/metadata or missing
-consent returns a conflict; no response stays pending/shared. Admin listing goes through the function
-rather than bypassing tenant RLS on the request table. Library semantic update helpers write the next
-immutable revision but never migrate other readers' holdings.
+authenticated original author. Request derives the author from the card, stores exact hashes and
+exposes the proposed metadata for informed consent; inactivity does not prevent requesting a response.
+Response checks caller ownership and pending state under creator/card/request locks, records a genuine
+approved/rejected response, sets/clears the durable creator veto as §3.6 allows and bumps version.
+Promotion rechecks candidate eligibility, live creator identity/activity, veto, request status/version
+and exact hashes under those locks. It uses genuine approval when valid; otherwise only the 30-day
+inactivity rule may authorize it. Record the chosen authorization evidence and mark promoted/public in
+one transaction. No-response inactivity publication leaves `responded_at` null. Missing provenance,
+soft/hard-deleted creator, explicit veto, insufficient inactivity, expiry or stale proposal returns a
+conflict/hold. Admin eligibility listings are advisory and never a substitute for this final check.
+The functions preserve rejection/publication audit evidence, and no new request can erase a veto.
+Admin listing uses the function rather than bypassing tenant RLS. Library semantic update helpers
+write the next immutable revision but never migrate other readers' holdings.
 
 **Callers:**
 - **The refresh functions** are called by the API **in the same transaction** as the change that
@@ -1517,12 +1558,16 @@ parity. A generated migration is not complete until these pass with actual role 
     contain no secret. Saving a candidate makes no provider request, explicit validation is bounded,
     stale validation/activation cannot overwrite a newer version, disable cannot revive an env key,
     and restore with the matching external keyring decrypts while the database alone cannot.
-11. Shared adoption does not become public publication or transfer authorship. Inactive/missing creator,
-    no answer, altered publication hashes and stale approval versions cannot promote a card. A valid
-    exact consent can; new library semantics leave old holdings/examples unchanged until opt-in.
-    Assigning labels does not change ranking/training polarity or inference eligibility.
-12. Multiple evaluation personas belonging to one `participant_key` remain one human for independent
-    participant counts; pilot and wider-beta gate reports distinguish those measures.
+11. Shared adoption does not publish or transfer authorship. Promotion accepts genuine exact approval
+    or verified 30-day creator inactivity, records the correct evidence and never fakes a response.
+    Test just below/exactly at 720 hours, null last-active with known creator creation, activity racing
+    promotion, deleted/missing creator, changed hashes/version, and a decline followed by a fresh admin
+    request: a veto remains effective until later affirmative creator approval. Library semantic
+    updates preserve old holdings/examples until opt-in; labels remain ranking/training neutral.
+12. Multiple topic personas belonging to one `participant_key` remain one human. The owner's multi-topic
+    pilot may satisfy the limited invite-only beta gate; no additional independent-rater count is
+    required, and reports must describe the sample as one person's evidence. Bookmark archives contain
+    text/sanitized HTML, never cached image/media bytes or image data URLs.
 
 Implementation references: PostgreSQL 16 [row security](https://www.postgresql.org/docs/16/ddl-rowsecurity.html),
 [constraints](https://www.postgresql.org/docs/16/ddl-constraints.html),

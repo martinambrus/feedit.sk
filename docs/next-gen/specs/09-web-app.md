@@ -78,8 +78,10 @@ allow overrides global block, including on another device or after unsubscribe i
 the feed-preferences API. The decision follows `mediaPolicyFeedId`, never whichever duplicate source
 happens to allow loading. When enabled use `referrerPolicy="no-referrer"` and lazy loading; never
 fetch active SVG/HTML as embedded documents. Sanitized HTML uses inert image placeholders; hydrate
-their validated URLs only through the same policy. Text-mirror retention does not promise archived
-images or attachments; those may still depend on the publisher until Q14 is resolved.
+their validated URLs only through the same policy. Bookmark archives and exports contain text and
+sanitized HTML, without image/media binaries or attachments. Any allowed live remote images still
+depend on the publisher; enabling a source's images never archives them or changes that retention
+policy. The normal global/per-feed image preference remains unchanged.
 
 **Refresh and errors:** poll list/counts every 5 seconds only while a visible page has
 `rankingPending`/explicit pending analysis requests, back off to 30 seconds when idle, and pause
@@ -169,7 +171,9 @@ login without leaking the previous account's UI. Slow classification leaves arti
   version silently with live text. Partial/failed capture offers an explicit "Retry capture" and
   explains teaser/paywall/unavailable-source limitations. Keep any previous saved text readable
   during retry. Images obey the saved origin feed's remembered preference; missing remote assets
-  do not erase the retained text. Export includes saved full/partial content and truthful status.
+  do not erase the retained text. State clearly "Text and formatting saved; images and other media
+  are not archived". Export includes saved full/partial text/HTML and truthful status, without media
+  binaries, attachments or embedded image data.
 
 ### 3.3 Rating and training interactions (from FeedIt, adapted)
 
@@ -286,7 +290,7 @@ When the page becomes visible again after `/open`:
      user waiting for ten items. Persist completion once and allow calibration later
    - offer the separate explicit "Enable automatic classification for new articles" control for
      a chosen feed; explain that historical backlog remains manual. Never activate by reaching a
-     hidden number of ratings (provisional Q11 policy, spec 08 §4.1)
+     hidden number of ratings (spec 08 §4.1)
 5. **Done** → For you when personalized results exist, otherwise New with readable untrained items.
 
 ---
@@ -327,7 +331,9 @@ When the page becomes visible again after `/open`:
   - **Publication requests:** notify the original creator of an exact proposed public card,
     including text, translated title and topics; offer Approve / Decline. Explain internal reuse
     separately from public listing. Approval of one version does not authorize later semantic edits;
-    no response is not approval and no countdown implies publication by timeout
+    no response is not approval. Explain that an administrator may publish after at least 30 days
+    of creator inactivity unless the creator has declined; a return to FeedIt resets that activity
+    clock. Do not show request age as an automatic publication countdown
 - **Card editor:**
   - title (optional), "I want to read about…" (interest), "…but not about" (not_for), strength, scope
   - live guidance: the authoring rules from spec 05 §8 as hints ("Describe one topic", "Avoid 'not' in
@@ -373,11 +379,17 @@ Plain tables and forms, no polish needed:
   provider-side key revocation must also be done in the provider account. Do not persist keys in
   browser storage, query caches, analytics, crash reports or URL parameters
 - **Feeds:** filter by status; reset.
-- **Library:** metadata management, immutable semantic versions and promotion candidates. Request
-  creator approval for the exact proposed listing before exposing Promote. Show Pending/Approved/
-  Declined/Held for inactive creator; no-response/inactive policy remains held pending Q12. A fresh
-  payload requires a new approval; an admin cannot impersonate the creator. Public semantic updates
-  advertise an opt-in successor instead of editing all readers' cards in place.
+- **Library:** metadata management, immutable semantic versions and promotion candidates (shared
+  cards with at least three holders). Show the exact proposed listing and current eligibility:
+  Approved by creator / Eligible after 30 days inactive / Awaiting approval / Declined / Unknown
+  creator. Promote is an explicit administrator action, with the selected authorization basis shown
+  for review; never present inactivity as creator approval. Activity is rechecked on submit: a
+  returning creator or a concurrent decline can invalidate eligibility and requires a refresh.
+  A decline remains a veto until a later affirmative creator decision; a new request/version cannot
+  bypass it. Unknown/deleted creator provenance stays held. Published records show the actual
+  authorization basis and audit time. A changed payload needs a fresh authorization check; an admin
+  cannot impersonate the creator. Public semantic updates advertise an opt-in successor instead of
+  editing all readers' cards in place.
 - **Users:** plan, role, invites.
 - **Invites and waitlist.**
 
@@ -419,7 +431,9 @@ Test files are named `*.pw.ts` so Vitest never picks them up (spec 01 §6).
    switch Off while a request is queued and verify stale work cannot restart inference for that user.
 8. **Bookmark mirror:** capture a fixture's full body, unsubscribe, make its original URL fail and
    simulate snapshot compression after 30 days. Saved view and export retain the same text/HTML;
-   partial/failed capture remains visibly distinct, and another account cannot read the snapshot.
+   no archived image/media/attachment binary or embedded image data is included, even when that
+   feed allows normal remote images. Partial/failed capture remains visibly distinct, and another
+   account cannot read the snapshot.
 9. **Remembered images:** global images off, per-feed Always allow → images load in list/detail;
    reload/login on another context and unsubscribe → bookmarked saved view keeps that source choice.
    Always block overrides global on. Inherit resets to the global value; no blocked placeholder
@@ -427,8 +441,10 @@ Test files are named `*.pw.ts` so Vitest never picks them up (spec 01 §6).
 10. **Credentials:** admin stages a fixture key, validation fails and the old key remains active;
     a valid candidate can activate, stale validation cannot. No secret appears in subsequent UI,
     routes, browser stores, generated reports or API responses; disabled mode cannot fall back to env.
-11. **Cards and labels:** original creator approves an exact proposed public version; silence,
-    unrelated adopter approval or changed metadata cannot publish. A library update changes only a
+11. **Cards and labels:** original creator approves an exact proposed public version. Without that
+    approval an admin may publish only after at least 30 days of verified creator inactivity, with
+    a separate audit basis. A recent return, explicit decline, unrelated adopter approval or changed
+    metadata cannot bypass the check; an old request alone cannot publish. A library update changes only a
     holder who explicitly applies it and never silently modifies a private fork. Assigning a neutral
     label does not count as a positive rating or enable inference.
 

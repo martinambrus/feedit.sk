@@ -429,7 +429,13 @@ time. A current cache with identical pinned inputs may satisfy the request witho
 
 If inputs are absent/stale and no authorized frozen request exists, retain the rating but omit it
 from training until a new compatible event; do not infer permission from the rating alone. Saved
-bookmark actions may reference an older `snapshotId/contentRevision` (spec 08). Never borrow current
+bookmark actions may reference an older `snapshotId/contentRevision` (spec 08). Bookmark archives
+retain text and sanitized HTML (Q14), without capturing image or other media binaries. Harmless safe
+URL references may remain under the image-preference policy; they are not permanently archived media
+assets. A historical `has_image` feature may remain as an observed boolean in its immutable feature
+snapshot; it authorizes neither inference nor image download/retention, and must not be recomputed
+from the archive's media availability.
+Never borrow current
 features for that old content: use matching captured features/authorized frozen input or omit the
 sample. A changed rating supersedes its earlier label while keeping the exact source snapshot and
 chronology; it does not create duplicate evidence. Undo refers to
@@ -440,7 +446,8 @@ Feed training mode and personal model activation are separate. Selected training
 supply explicit samples before any feed is active; a successful `user.learn` never changes
 `subscriptions.inference_mode`. Off/revoked demand prevents new provider work and score application;
 retained explicit feedback is private history, not permission to reclassify arbitrary feed items.
-Automatic graduation remains Q11; enable feed inference explicitly until it is decided.
+Q11 is resolved: enable inference explicitly per feed; only new arrivals are automatic afterward.
+Older articles require explicit selection, and no learned-model threshold changes that mode.
 
 Only surviving samples with snapshot and feedback timestamps within the last **180 days** are used.
 The current `context_sha` must match; changing card definitions/strengths/scopes may therefore return
