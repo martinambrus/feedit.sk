@@ -4,7 +4,8 @@ Status: **binding**. **Intent:** prove the core bet before building on it. The b
 Jev rank articles clearly better than keyword matching, with zero training, in EN, SK and CZ.
 Measurement, not opinion, sets the open parameters: language modes, card text mode and lane
 thresholds. Later, every change to questions, thresholds or the model version is replayed against the
-same data.
+same **frozen inputs**. Development selection and locked holdout reporting are separate; repeatedly
+tuning against the holdout turns it into development data and requires a new holdout.
 
 No FeedIt.sk data is used (locked decision). The golden set is built from scratch.
 
@@ -18,7 +19,7 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
    costs).
 2. `apps/eval/config/g1.json`:
 
-   ```json
+   ```ts
    { "language_modes": { "en": "native", "sk": "…", "cs": "…" },
      "card_text_mode": "as_written" | "english",
      "ranker_thresholds": { …deep partial of RankerConfig… },
@@ -26,7 +27,10 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
      "translate_tier2_daily_cap": 300 | 1000,
      "laya_track_recommended": false,
      "runs": { "B0": 11, "B1": 12, "E1": 13, … },      // eval.runs ids used for the decisions (M7-T7 reads them)
-     "notes": "…" }
+     "notes": "…",
+     "dataset": { "version": "golden-v1", "snapshotSha": "…", "splitSha": "…" },
+     "selection": { "developmentRunIds": [11,12,13], "lockedAt": "ISO timestamp", "configSha": "…" },
+     "gate": { "status": "pass" | "fail" | "needs_more_data", "reportSha": "…" } }
    ```
 
 3. `pnpm evaluate apply-g1 apps/eval/config/g1.json` (paths are relative to the repository root; the
@@ -40,7 +44,13 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
    | `ranker_thresholds` | `ranker.thresholds` (and bump `ranker.settings_version`) |
    | `recommended_daily_budget_usd` | `engine.daily_budget_usd` |
    | `translate_tier2_daily_cap` | `translate.tier2_daily_cap` |
-   | `laya_track_recommended`, `runs`, `notes` | not settings; kept in the report and in git |
+   | `laya_track_recommended`, `runs`, `notes`, `dataset`, `selection`, `gate` | not settings; kept in the report and in git |
+
+`g1.json` itself is valid JSON (the example above is a schema sketch). Validate it with the shared
+`RankerConfig` schema/defaults from M0 and pure score/lane/tier helpers from the M2-T10 bootstrap;
+G1 does not depend on the full M5 rank worker. `apply-g1` rejects missing/incomplete runs, hash
+mismatches and a gate other than `pass`, applies settings in one transaction, and bumps the version
+only when relevant values changed. Dry-run output can never authorize production settings.
 
 ---
 
@@ -57,14 +67,31 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
   - **requires a running worker** with `EVAL_INGEST_ONLY=true`: the command checks
     `settings['worker.heartbeat']` for an entry younger than 90 s with `evalIngestOnly = true` (spec 02
     §2) and exits with instructions if there is none. So enrich and match never run, and there are no
-    Jev costs
+    Jev costs. **Every live worker on that database** must have this flag; a heartbeat from just one
+    ingest-only process is insufficient. Refuse collection if any non-ingest-only worker is live,
+    and do not share the golden DB with concurrent API/E2E development workers
   - fetches each feed once immediately, waits until the `article.extract` queue for these articles has
     drained, and prints per-language article counts
   - **`--watch`** keeps the eval user subscribed and prints counts every 10 minutes, until stopped
   - between the first run and rating, the normal schedule keeps fetching, because the eval user is a
     subscriber
 - **Sample (`eval sample`):** up to 1,500 non-stale articles, 500/500/500 by detected language (fewer
-  if a language runs short), preferring the most recent. Stored in `eval.sample`.
+  if a language runs short), stratified across feeds and collection days. Cap any one feed at 10% of
+  its language sample; report actual availability instead of quietly replacing source diversity
+  with one prolific feed. Store sampling seed, timestamps and exclusions.
+- **Freeze:** `eval.sample.snapshot` stores immutable article input (title, excerpt, body lead used by
+  the classifier, language, timestamps, carrier feeds, content revision and story-group id), with
+  `snapshot_sha`. Freeze rater cards/strengths and assignment membership before the first model run.
+  Experiments/replays read these snapshots, never mutable live articles. Translations and exact
+  request state/question manifests are frozen with the run, including failures and engine/version.
+- **Split before looking at outputs:** deterministic 70% development / 30% test, stratified by
+  language and grouped by story (all duplicates and all raters' copies of a story stay together).
+  Persist `eval.sample.split` and a split-manifest hash. Unclustered duplicates found later require a
+  new split/version before G1; do not move selected difficult items across the split.
+- Once frozen, additions, rating corrections or card edits create a new version manifest; they do
+  not silently mutate a run's ground truth. `eval.runs.config` captures dataset/split hashes plus the
+  exact rating/card snapshot used. Source rows may stay linked for browsing, but they are not the
+  reproducibility boundary.
 - **Status (`eval status`):** per-language sample counts, then per rater: cards written, feeds picked,
   assigned, rated, skipped. Also facet-label counts per language.
 
@@ -84,13 +111,17 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
     others
   - if the sample has fewer than 300 for these feeds, all of them are assigned, topped up from
     non-sampled recent articles of the rater's feeds (which are then added to `eval.sample`)
+  - every top-up receives the same frozen snapshot and story-group split before assignment
   - shuffled deterministically (seeded by the rater id)
   - **Blind:** no model output is shown.
   - The page shows the feed, title, excerpt (≤ 600 chars) and "open original".
   - Buttons: 👍 "I'd want to read this" / 👎 "Not for me", plus an optional reason (the spec 09 reason set).
   - Keyboard: `+`/`-`, `1`–`6`, `j`/`k`.
   - Progress is saved on every click (`eval.ratings`) and ratings can be changed.
-  - A rater may skip an article, and skips are not stored. Goal: ≥ 250 ratings per rater.
+  - A rater may skip an article; persist `eval.assignments.status = skipped` (and an optional reason).
+    Rating sets `rated`, returning to a skipped article is supported, and pending remains distinct.
+    Goal: ≥ 250 ratings per rater. Never silently convert a skip to a dislike. Report skip rates and
+    language/source coverage alongside quality metrics.
 
 ### 2.3 Facet labels (the enrichment accuracy check)
 
@@ -99,27 +130,43 @@ Notation: `eval <command>` below is short for the root script `pnpm evaluate <co
 - A labeller sets `content_type`, `topic_l1`, `depth` (0–4), `clickbait` (y/n), `promotional` (y/n),
   `time_sensitive` (y/n).
 - At least one labeller (the owner). A second labeller does 50 of the same articles so human agreement
-  (Cohen's κ) serves as the ceiling.
+  (Cohen's κ; weighted κ for ordinal depth) is a reference, not an absolute model-accuracy ceiling.
+  Preserve both labels and use a predeclared adjudication step for disagreement; do not choose the
+  label that agrees with a model. Include uncertain/not-applicable rather than forcing a false class.
 
 ### 2.4 Rating app (`apps/eval/src/rating-server`)
 
 - Fastify on port 5180, with vanilla HTML + CSS + a small ES-module script (no framework).
 - Mobile-friendly and keyboard-driven.
-- Token auth through the query string, which sets a cookie.
+- Generate ≥128-bit random rater tokens and store only a cryptographic hash. Exchange the link token
+  for an HttpOnly, SameSite cookie, then redirect to a token-free URL; Secure on the HTTPS tunnel.
+  Set `Referrer-Policy: no-referrer`, no external resources/analytics, redact token-bearing URLs in
+  logs, and rate-limit token exchange. Allow revocation and expiry. Every read/write is scoped to that
+  rater's assignment; the worker DB role makes application-level ownership checks essential.
 - Uses `DATABASE_URL_WORKER`.
 - Not deployed to production. It runs **on the dev box** (the same DB as M3b), exposed to raters
-  through a tunnel (e.g. `cloudflared tunnel --url http://localhost:5180`). `golden-v1` therefore lives
-  in the dev database that M3b and M7-T7 use. Back it up with `pg_dump -n eval` after collection.
+  through an authenticated HTTPS tunnel. Bind the service to loopback; only the rating routes are
+  exposed, with origin/CSRF checks on mutations. The dedicated golden database is shared by M3b and
+  M7-T7 through explicit eval connection config, not by ordinary development workers. Back up with a
+  **complete `pg_dump -Fc`** (or a tested self-contained snapshot export including referenced public
+  articles/cards/feeds and frozen manifests); `pg_dump -n eval` alone cannot restore its foreign-key
+  dependencies. Keep dumps/cache/rater tokens out of git and test restoring the golden set.
 
 ---
 
 ## 3. Experiments (`eval run --experiment <id> [--langs] [--raters]`)
 
 Each run:
-- writes `eval.runs` (config, git sha) and `eval.run_answers`
-- caches every engine call in `${EVAL_CACHE_DIR}/<sha256(model + state + questions)>.json`
+- writes `eval.runs` (config, git sha, dataset/split/config hashes, seed, provider/model, question and
+  translation manifests, runtime/dependency versions) and `eval.run_answers`; answer keys are unique
+  per run/article/card/question (variant is fixed by the run), so resume/upsert never duplicates results
+- caches each **successful validated** engine/translation call in
+  `${EVAL_CACHE_DIR}/<sha256(canonical request manifest)>.json`
   (default `~/.cache/feedit-eval`, outside the repository and shared by worktrees), so re-runs and
-  report tweaks cost nothing
+  report tweaks cost nothing. The canonical manifest includes provider, pinned model version,
+  adapter/schema version, operation, exact state/questions/translation source and target, decoding
+  settings and content revision; simple string concatenation is not a safe key. Writes are atomic,
+  cache hits retain actual provenance, failures are not cached as answers
 - uses the production packages: `questions`, `engine`, `translate`, `ranker`
 - builds its own `EngineRouter` (spec 04 §1, "Eval routers") with `budgetOverrideUsd = --max-usd`
   (default 10) and `ignoreDailyCaps: true`. Every call, translations included, is recorded as
@@ -132,25 +179,37 @@ Each run:
 | Id | State variant | Card text | Purpose |
 |---|---|---|---|
 | **B0** chrono | — | — | baseline: newer = higher |
-| **B1** BM25 | native (translated text for SK/CZ in B1-T) | as written | baseline: keyword match (spec 06 §9) |
+| **B1** BM25 | native | as written | keyword baseline (spec 06 §9) |
+| **B1-T** translated BM25 | frozen tier-1 English text for SK/CZ | English query translations | controls for translation improving the keyword baseline too |
 | **E1** native | native | as written | the core bet in its simplest form |
 | **E2** native + EN cards | native | cards translated to English by LibreTranslate | does English card text help? |
 | **E3** LT | translated with LibreTranslate | as written | free translation |
 | **E3b** LT + EN cards | translated with LibreTranslate | English | both |
-| **E4** GLM | translated with Ollama `glm-5.3-flash` | the better of as-written/English from E2 vs E1 | quality ceiling of the fallback translation (SK/CZ only) |
-| **E5** Laya zero-shot (optional) | native | as written | expected near random; recorded only as the M9 baseline. Skip if `laya` is not installed |
+| **E4** GLM | translated with Ollama `glm-5.3-flash` | global card mode selected on development (§5) | measured alternative for the fallback translation (SK/CZ only) |
+| **E5** Laya zero-shot (optional) | native | as written | measured M9 baseline without assuming an outcome. Skip if `laya` is not installed |
+
+**Completeness:** a gate experiment pins its intended engine; an LLM fallback must not silently
+become an E1–E4 Jev answer. Record unavailable cases and retry/resume within budget. Compare all
+variants on the identical assigned/rated cohort; require ≥95% valid scoring coverage per language
+and rater, and include conservative missing-output sensitivity (missing model score behaves as
+unknown/degraded). Below that coverage the result is `needs_more_data`, not a pass on easy items only.
 
 **Per article and rater:**
 - Call A (`enrich-v1`) once per article and variant.
 - Call B with the **rater's cards** (all raters' cards can share one call per article: namespaced
   keys, exactly like production).
 - The score is computed with `packages/ranker` card scoring (spec 06 §4.1). No demotions and no model:
-  the eval measures the zero-training case. A rater's never-card with `p ≥ 0.7` sets the score to 0 (the
-  item would be hidden). Soft never-matches are ignored.
+  the primary AUC measures the zero-training score. Record a second production-policy view using
+  the pure lane/tier helpers, known never/must/floor/cap precedence and the selected config; it must
+  report false hides and For You precision/coverage. A never hard match sets policy score to zero,
+  and soft never/must effects are included in policy lane metrics. Record raw card scores separately
+  so ranking quality cannot conceal a bad hide rule. `prefilter` is unknown, not a score of zero.
 
-**Estimated G1 cost:**
-1,500 articles × ≈ 5.5k tokens × 6 variants ≈ 50M tokens ≈ **$2.1**, plus GLM translation of about
-1,000 SK/CZ articles ≈ **$0.15**.
+**G1 cost:** estimate from a small pilot with the actual packed questions, number of raters/cards,
+repeated state, source/target translation tokens and the current provider price/configuration.
+Report estimated and actual billed cost separately, including cache savings and failed-call charges.
+Do not use a fixed historical dollar estimate as an executable budget guarantee. Abort safely at the
+invocation budget, retain completed answers, and resume explicitly; partial runs cannot pass G1.
 
 **Other commands:**
 - **`eval dry-run`:** runs the whole pipeline on synthetic data (M3a-T8) in a **separate database**
@@ -160,7 +219,15 @@ Each run:
   the real `eval` tables.
 - **`eval replay`:** §6. Implemented in M3a-T6, first used after G1.
 - **`eval learning-curve`:** M7-T7. Reads `eval.run_answers` of the runs listed in `apps/eval/config/g1.json`
-  `runs`.
+  `runs`. For n=10/20/30/50/100, train on each rater's earliest **development** feedback by event time,
+  with story groups disjoint from evaluation; evaluate every n against the same untouched test set.
+  Frozen eval answers may construct synthetic event-time features for this offline simulation; mark
+  them as eval data, never inject them into production feedback snapshots. Hold feature/card
+  definitions fixed before the simulated feedback stream.
+  Report eligible sample counts, activation/insufficient-data state, cards baseline, model AUC and
+  logloss. Under activation minimums report cards-only plus an optional clearly marked research fit;
+  do not pretend a production model exists after ten ratings. G1 test outcomes must not tune this
+  learner; a proposed adjustment requires another holdout/version.
 
 ---
 
@@ -168,66 +235,99 @@ Each run:
 
 **Ranking** (per rater, per language, per experiment):
 - **ROC AUC** of the score vs the rating (Mann–Whitney U, ties counted as ½), with a **95 % CI** from
-  1,000 bootstrap resamples of that rater's articles.
-- **P@10, P@20:** the like-rate among the top k by score.
-- **Macro averages** across raters; per-language splits (EN / SK / CZ).
-- **Win count:** for how many raters the experiment beats B1.
+  1,000 **paired story-group bootstrap** resamples; the same resampled groups compare candidate and
+  baseline. Report ΔAUC and its CI directly. A group is resampled together across raters.
+- **P@10, P@20:** like-rate among top k, with stable `(score DESC, firstSeenAt DESC, id DESC)` ties;
+  report actual denominator and null when fewer than k eligible ratings exist.
+- **Macro averages:** equal weight to each eligible rater's AUC (all their languages pooled); language
+  summaries equally weight eligible rater-language cells. Publish counts, class prevalence and both
+  development/test tables. Never average a null single-class AUC as 0 or 0.5.
+- **Win count:** raters beating the locked B1/B1-T baseline, with raw B1 comparison also shown.
 
-**Calibration** (card score P vs like-rate): a 10-bin reliability table and **ECE**.
+**Calibration** (heuristic card score P vs like-rate): ten fixed-width bins on [0,1], each bin's
+count, mean score and positive fraction; ECE = Σ(n_bin/N)*|meanScore-positiveFraction|, plus Brier
+score and logloss (clip only metric logarithms to [1e-6,1−1e-6]). Empty bins contribute zero. No fitted
+calibration/threshold may use test labels. Report the full scoring pipeline and label prevalence.
 
 **Enrichment accuracy** (Call A vs facet labels, per language):
 - `content_type`: accuracy and macro-F1
 - `topic_l1`: top-1 and top-2 accuracy
 - `depth`: MAE (levels) and Spearman ρ
 - `clickbait`, `promotional`, `time_sensitive`: AUC
-- the human κ (if available) as the reference ceiling
+- human κ (if available) as an agreement reference, with adjudication documented
 
-**Operations:** tokens, $ per 1,000 articles, and p50/p95 latency per call kind.
+**Policy:** For You precision and coverage, Maybe share, and hard-hide false negatives (liked items
+hidden / all liked items), with denominators and uncertainty, separately by language/rater. Unknown
+or failed answers are counted, not silently dropped.
+
+**Operations:** tokens, $ per 1,000 **distinct processed articles at the measured card/holder mix**,
+p50/p95 live-call latency by kind, coverage/failure/degraded rate. Cache lookup latency is separate;
+cached calls are not counted as newly billed spend.
 
 The report renders these as tables, plus one reliability plot (SVG) per language.
 
 ---
 
-## 5. Decision rules for G1 (apply mechanically; the report shows each rule's inputs)
+## 5. Decision rules for G1 (development selects, locked test confirms)
 
-1. **Core bet.** Let E* be the best of {E1, E2, E3, E3b} by macro AUC over all raters and all
-   languages. E4 and E5 cover only part of the data and are not eligible. **Pass** requires:
-   - E* macro AUC ≥ B1 macro AUC + **0.05**
-   - E* macro AUC ≥ **0.70**
-   - E* wins against B1 for **every** rater (the point estimate is enough)
+**Readiness:** at least three raters with ≥250 non-skipped ratings each; the locked test has ≥60
+ratings and ≥10 of each class per rater, and ≥50 ratings/≥10 of each class per language across
+raters. Any reported rater-language AUC needs ≥20 items and ≥5 of each class. Missing support,
+incomplete variants or required language coverage yields `needs_more_data`; collect more with the
+same selection procedure. Do not lower the gate or silently drop a language/rater to pass.
 
-   **Fail** → stop the build after M3 and report to the owner, with the per-rater breakdown and the 20
-   worst-ranked liked articles. Likely remedies: card-writing guidance and examples (spec 05 §5.1), the
-   Laya track, or an LLM classifier. The owner decides.
-2. **Language mode** for `sk` and `cs`, each separately:
-   - if E1 AUC(lang) ≥ E1 AUC(en) − **0.05** → `native`
-   - otherwise, if E3 AUC(lang) ≥ E1 AUC(lang) + **0.02** → `translate`
-   - otherwise keep `native` and set `laya_track_recommended = true`
-   - `translate_tier2_daily_cap` = **1000** if E4 AUC(lang) ≥ E3 AUC(lang) + **0.05** for sk or cs;
-     otherwise **300**. Tier 2 stays a fallback (locked decision).
-3. **Card text mode:** `english` if (E2 − E1) or (E3b − E3) ≥ **0.02** macro AUC measured on
-   non-English cards; otherwise `as_written`.
-4. **Thresholds.** Pool the rater data per language, using the experiment rules 2–3 chose for that
-   language:
-   - `native` + `as_written` → E1
-   - `native` + `english` → E2
-   - `translate` + `as_written` → E3
-   - `translate` + `english` → E3b
+**Selection uses development only:**
 
-   Then, over the pooled items:
-   - `lanes.forYou` = the smallest t ∈ [0.50, 0.85] (step 0.05) where the like-rate among items with
-     P ≥ t is **≥ 0.70**; if none, 0.85
-   - `lanes.maybe` = the largest t ∈ [0.20, 0.50] where the like-rate among items with P < t is
-     **≤ 0.15**; if none, 0.35
-   - `tiers`: keep the defaults if ECE ≤ 0.10. Otherwise fit isotonic regression of like-rate on P and
-     set each tier cut point at the smallest P where the fitted like-rate reaches 0.2 / 0.4 / 0.6 / 0.8.
-     A level the fit never reaches keeps its default. The four cut points must end up strictly
-     increasing; otherwise all four keep their defaults.
-5. **Budget:** `recommended_daily_budget_usd` = the measured $/1,000 articles × the expected daily
-   articles for the invite-only beta (spec 05 §9) × 2, rounded up to $0.50, with a minimum of $1.
+1. Choose the better keyword baseline B1/B1-T by development macro AUC (ties choose native B1).
+   Select E* from E1/E2/E3/E3b by development macro AUC; ties choose the cheaper native variant.
+   E4/E5 are diagnostics/translation fallback evidence, not all-language core candidates.
+2. Choose global card text mode: `english` if its paired development gain on non-English-card
+   raters is ≥0.02 in the selected state family; otherwise `as_written`. If no eligible non-English
+   card cohort exists, retain `as_written` and mark that decision unmeasured.
+3. Choose `sk` and `cs` language modes **within that selected card text mode**. Compare native vs
+   translated scores on the same language, raters and articles. Native suffices if its AUC is no
+   more than 0.05 below English on bilingual-rater comparisons; choose translate only when it adds
+   ≥0.02 AUC over native. If native falls short and translation does not help, retain native and
+   recommend the Laya track. If bilingual comparison is unsupported, use the within-language
+   translation gain and flag the English comparison as inconclusive. E4 must use the same selected
+   card mode; tier-2 cap is 1000 only if its paired gain over tier 1 is ≥0.05 for SK or CS, else 300.
+4. **One global threshold object:** pool development examples from the per-language variants chosen
+   by steps 2–3. The schema has no per-language thresholds. Weight each rater equally (per-item
+   weight 1/their development count) so a prolific rater does not dominate.
+   - `lanes.forYou`: smallest t on 0.50…0.85, step 0.05, with weighted like-rate among P≥t ≥0.70,
+     at least 30 items from ≥2 raters and at least 10% development coverage; if unsupported, keep
+     default 0.65 and mark the precision target **unmet**, not "achieved at 0.85".
+   - `lanes.maybe`: largest t on 0.20…0.50, step 0.05, with weighted like-rate below t ≤0.15 and
+     at least 30 items from ≥2 raters, also t<forYou. If unsupported keep default 0.35 (or the
+     largest valid grid point below forYou) and mark target unmet.
+   - `tiers`: retain defaults if development ECE≤0.10. Otherwise weighted isotonic regression of
+     like-rate on raw score supplies the smallest score reaching 0.2/0.4/0.6/0.8. Require supported
+     levels and four strictly increasing cuts in (0,1); otherwise retain all defaults. This adjusts
+     tier boundaries only; it does not transform stored scores or justify probability wording.
+5. Freeze the selected per-language composition, baseline, thresholds and run ids in a selection
+   manifest **before the CLI reveals test metrics**. No output-derived retuning is permitted under
+   the same test manifest.
 
-The report ends with a filled-in decision table and a list of anomalies (e.g. a question with
-`invalid_response`, a feed with bad excerpts).
+**Confirmation uses the test only:** evaluate the actual selected per-language composition (not just
+whichever single experiment won selection), against the locked B1/B1-T baseline on the same cohort.
+Pass requires macro AUC≥baseline+0.05, macro AUC≥0.70, and a higher AUC than baseline for **every**
+rater. Report paired bootstrap CIs; point estimates determine this initial small-beta gate, so the
+report must not claim population-level certainty. Also report all policy metrics and per-language
+results. Hard-hide false negatives and unmet For You precision targets are explicit owner-review
+items before launch; no threshold change is allowed to make those disappear from the report.
+
+`fail` stops launch progression after M3b and reports per-rater/language diagnostics and 20
+worst-ranked liked articles (identify development vs test). The owner chooses remedies. Reusing
+revealed test failures to change cards/questions/settings requires a new held-out golden version for
+the next gate. M4–M7 work already allowed in parallel may continue, but cannot waive the launch gate.
+
+**Budget:** measured production-policy $/1,000 articles × (expected beta articles/day **÷1000**) ×2,
+rounded **up** to the next $0.50, minimum $1/day. Include translation/fallback and the expected
+card-holder mix once; document the volume assumption and a high-volume sensitivity estimate. The
+original price-per-1,000 figure must never be multiplied by raw article count without the divisor.
+
+The report ends with readiness/selection/test tables, denominators, policy risks, applied defaults,
+cost assumptions and anomalies. Only a passed and complete artifact can be applied by `apply-g1`.
 
 ---
 
@@ -243,29 +343,73 @@ The report ends with a filled-in decision table and a list of anomalies (e.g. a 
   - activating a new question set
   - changing `ranker.thresholds`
   - enabling Laya for a kind or language
-- **Pass rule:** no rater's AUC drops by more than 0.03, and the macro AUC does not drop.
+- **Pass rule:** on the identical frozen cohort, no eligible rater/language AUC drops by more than
+  0.03 and macro AUC does not drop. Threshold-only changes cannot be assessed by AUC (it is unchanged):
+  also require no increase in hard-hide false-negative rate, no fall in For You precision >0.03,
+  and report coverage/Maybe-share changes. Unsupported cells yield inconclusive, not pass.
+- Dataset hashes, complete output coverage and the same paired bootstrap procedure are mandatory.
+  Replays of a repeatedly viewed test set are regression checks, not new independent quality proof;
+  use a fresh holdout for tuning/engine-selection claims.
 - The report is committed to `apps/eval/reports/`.
 
 ---
 
-## 7. Online metrics (computed nightly by `house.metrics`, shown in admin; spec 11 §6)
+## 7. Online metrics (nightly `house.metrics`, admin; spec 11 §6)
 
-- **Like-rate per lane and tier:** it must be monotonic. Alert if `for_you` falls below `maybe`.
-- **Maybe-lane share of scored unread items:** should fall as users rate.
-- **Regret rate:** the share of articles in `everything`/`hidden` that the user later opened, rated +1
-  or bookmarked. Target < 2 %.
-- **Personal models:** activation rate and median `cv_auc − baseline_auc`.
-- **Engine:** p50/p95 latency, error rate, degraded share, $/day.
+Use feedback-time `before` snapshots (spec 06 §8.2), never join feedback to the current lane/model,
+which may have been changed by that very feedback. Reduce to one effective explicit rating per
+user/article; undo/unrate removes it. Report trailing 7-day and 30-day windows with denominators,
+source (`cards/model/degraded`), language, and prompt/calibration vs voluntary feedback splits.
 
-Stored in `settings['metrics.daily.<date>']` (small JSON). No separate metrics DB.
+- **Observed like-rate per lane/tier:** positive explicit ratings / all explicit ratings with a
+  known pre-feedback lane. Treat monotonicity as a diagnostic; users choose what to rate and Maybe
+  is sampled more. Alert on For You below Maybe only with ≥30 rated items in each lane and an
+  uncertainty-supported gap persisting for three daily runs. It is not unbiased user satisfaction.
+- **Maybe share:** Maybe / scored visible unread rows after the same folding/filter policy as the
+  reader. Track with classifying backlog and source mix; a falling share alone does not prove
+  improvement and is not a target to optimize blindly.
+- **Observed recovery from Everything/Hidden:** distinct previously downranked articles later
+  opened/liked/bookmarked, using pre-action score history. Report numerator and eligible denominator
+  separately, and hide/unhide reasons. This is a lower-bound diagnostic: hidden articles are rarely
+  exposed, so a low recovery rate **cannot** establish low false-negative regret. Use the blind
+  golden set for that risk; no <2% production regret guarantee is inferred from unseen articles.
+- **Personal models:** activation rate, effective sample/skip counts, median paired validation AUC
+  and logloss change vs baseline, invalidation/failure rate and time back on cards-only ranking.
+- **Engine:** p50/p95 live latency, errors, output coverage/degraded share and billed $/day.
+
+Store bounded aggregates in `settings['metrics.daily.<date>']`; retain 90 daily snapshots and no
+article/card text or per-user traces in this shared settings object. Restrict it to admin responses.
 
 ---
 
 ## 8. Growing the golden set after launch (M9, optional)
 
-- A user setting "Help improve FeedIt: share my ratings anonymously for evaluation" (off by default)
-  lets the nightly job copy that user's explicit ratings of the last 30 days into a new golden version
-  (`golden-v2`, with a new `eval.raters` row per consenting user and no email or name).
-- The user's cards are copied as `eval.rater_cards` references (text only, no user id).
-- Replays (§6) then run on both `golden-v1` and `golden-v2`.
-- This needs a privacy-policy update before it is enabled.
+This is **pseudonymous contribution**, not guaranteed anonymity: interests, private feed URLs and
+article histories can identify a person even after removing an email. The feature stays disabled
+until a separate schema/API/retention/consent design and privacy notice are approved.
+
+- Explicit opt-in, off by default, describes the exact ratings, article metadata and interest text
+  that will be copied, access, retention, external model processing and revocation behavior.
+- Never retain `eval.rater_cards` references to production/private cards. Copy only consented,
+  reviewed text snapshots into a separate version with random contributor ids; exclude tokens,
+  credential-bearing URLs, names and private examples by default. Raw content is never committed to
+  public git or published in reports.
+- A restricted consent-to-contributor mapping allows withdrawal/account deletion to remove linked
+  raw contributions and invalidate/rebuild derived evaluation versions. Do not promise both
+  irreversible anonymization and individual deletion without a defined tradeoff.
+- Keep train/development/test boundaries by user and story; production feedback is selection-biased
+  and does not replace blind golden-v1 ratings. Replays run on both appropriate frozen versions.
+
+## 9. Required evaluation tests
+
+- Frozen article/card snapshots survive live content edits, purges and a full backup/restore.
+- Story groups and rater copies never cross dev/test; test labels cannot be read during selection.
+- Cache identity changes on provider/model/schema/state/questions/translation settings; failed calls
+  do not poison cache and retries/resume do not duplicate answer rows or billing attribution.
+- Skip counts, single-class metrics, empty bins/tails, short P@k and incomplete experiments never
+  produce a fabricated pass; confidence intervals are paired and group-aware.
+- Selected mixed-language deployment is tested, global thresholds remain valid, and budget units
+  include the /1000 divisor. Threshold-only replay detects policy regressions despite unchanged AUC.
+- Rating-token ownership/expiry/redaction and separate golden DB worker-mode guards are enforced.
+- Learning curves use one unchanged holdout at every n and cannot tune on it; feedback-time online
+  metrics survive reranking and undo without moving their original lane attribution.

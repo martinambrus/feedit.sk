@@ -4,11 +4,18 @@ This is a companion to [`PLAN.md`](./PLAN.md), researched in September 2026. The
 and many FeedIt feeds are Slovak or Czech. Could we use **Laya**, the open-source "Jev-compatible" model, and
 fine-tune it on EN + SK + CZ instead?
 
+> **Status:** optional M9 research, not a launch dependency or a verified implementation recipe.
+> The figures below are source-reported, dated measurements, not FeedIt acceptance evidence.
+> Before M9, pin the exact checkpoint, license, tokenizer and runtime revisions; validate the actual
+> input/output contract and benchmark on the target CPU and held-out FeedIt data. A compatible
+> method name does not establish compatible probability calibration or context limits. Follow
+> specs 04, 06 and 10 for capability, budget, cache/version and leakage controls.
+
 **Short answer.** Laya is a good fit as a *fine-tuned, self-hosted engine for a fixed set of questions*,
 such as the per-article enrichment questions. It is **not** a drop-in replacement for Jev's zero-shot
 "ask anything" behaviour, and that zero-shot behaviour is what the interest-card idea depends on.
 
-The plan should be a **hybrid**:
+A possible later plan is a **hybrid**, conditional on evaluation:
 
 - Keep Jev, plus translation if the spike shows it's needed, for free-form interest cards.
 - Fine-tune Laya-multilingual on EN/SK/CZ for the fixed enrichment questions, and later possibly for card
@@ -77,7 +84,7 @@ The plan should be a **hybrid**:
 | Call B: user-written interest cards | *new* free-text criteria every time | ✅ zero-shot | ❌ | ❓ only if fine-tuned *generically* on many (article, card) pairs and shown to work on cards it never saw (§4) |
 | Story-cluster verification | Choice over ≤ 6 candidates + a Noul | ✅ | ❌ | ✅ likely a good fit (fixed task, small option set) |
 | Labels | like cards | ✅ | ❌ | ❓ as for cards |
-| SK/CZ text | | ⚠️ "lower accuracy", unmeasured | ⚠️ unmeasured | ✅ **the main advantage**: we control the language data |
+| SK/CZ text | | ⚠️ "lower accuracy", unmeasured | ⚠️ unmeasured | Potential advantage: we control the language data; improvement must be measured |
 | Long state (body lead) | ~700+ tokens | ✅ 32k | ⚠️ 1,024 multilingual, including questions | ⚠️ title + excerpt only, unless we test the 8k mode |
 | Cost | | $0.042/M tokens, about $0.29/day for one user | $0 plus hardware | $0 plus hardware plus labelling effort |
 | Operations | | early access, dynamic rate limits | self-hosted, no vendor risk, data stays local | as base, plus retraining |

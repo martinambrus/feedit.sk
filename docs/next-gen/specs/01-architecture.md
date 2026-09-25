@@ -25,15 +25,24 @@ explicitly overrides a point. Deviations are allowed only through the process in
 | Language detection | **franc** (full build), restricted whitelist; `detectLanguage` lives in `packages/shared` ([spec 03 §8.3](./03-ingestion.md)) | |
 | Decision model | **Jev over its documented HTTP API** (`POST /v1/systemone`), with a small client of our own in `packages/engine` | the official SDK is not used, so retries, budgets and logging stay under our control ([spec 04](./04-decision-engine.md)) |
 | Generative LLM (fallback + translation tier 2) | **Ollama Cloud** HTTP API, `glm-5.3-flash` / `glm-5.3` | plain `undici` calls; no SDK |
-| Machine translation (tier 1) | **LibreTranslate** container (Argos models `sk→en`, `cs→en`) | [spec 07](./07-translation.md) |
+| Machine translation (tier 1) | **LibreTranslate** container; installed Argos translation paths verified at preflight | `LT_LOAD_ONLY` does not install or prove `sk→en` / `cs→en` support; [spec 07](./07-translation.md) |
 | Email | **nodemailer** over SMTP | |
 | Web client | **React 19 + Vite + TanStack Router + TanStack Query + Tailwind CSS 4**, **vite-plugin-pwa**, **i18next** (en, sk) | gestures: `@use-gesture/react` |
 | Unit / integration tests | **Vitest** | integration tests use a real Postgres from `docker compose -f compose.test.yml` |
-| E2E tests | **Playwright** (Chromium) | smoke flows only |
+| E2E tests | **Playwright** (Chromium, plus Firefox/WebKit critical auth and offline flows) | spec 09 defines browser coverage; Background Sync is an enhancement, not a requirement |
 | Logging | **pino** (JSON to stdout) | `pino-pretty` in dev |
 | Metrics / traces | Prometheus text endpoint `/metrics` (`prom-client`); OpenTelemetry traces **optional** (env-gated) | |
 | Reverse proxy / TLS | **Caddy 2** | serves the web build and proxies `/api` |
 | Deployment | **docker compose** on one box (8 vCPU / 16–32 GB, no GPU) | [spec 11](./11-operations.md) |
+
+**Reproducible bootstrap (M0-T1).** These major versions are design constraints, not an instruction
+to install every package's latest release. Resolve a compatible set of exact versions (including
+Fastify's Zod/Swagger adapters, Drizzle/kit, Vite, Vitest and Playwright), commit the pnpm lockfile,
+and pin the Node patch and container digests. Record the resolved versions in `docs/DEPENDENCIES.md`.
+Verify a clean install, typecheck, build and migrations against that set. If a maintained compatible
+set cannot satisfy a locked major version, report the conflict through §9; do not silently upgrade
+the stack. Provider model availability and installed MT language paths are checked separately at
+M3b and before launch, without requiring live calls in CI.
 
 ---
 
@@ -145,9 +154,11 @@ root `package.json` defines these shortcut scripts, and every doc uses them:
   `@feedit/shared` (`jobs.ts`), because the migrate job creates the pg-boss schema and queues
   (spec 02 §1.2). The "no pg-boss in `packages/db`" rule applies to everything else in
   `packages/db/src/**`.
-- **Repositories return effects, apps enqueue jobs.** `packages/db` never imports pg-boss. Repository
-  functions return effect descriptors (e.g. `{refreshFeedIds, backfill, rankFull}`). App services
-  enqueue jobs after commit through `shared/src/jobs.ts`.
+- **Repositories persist effects, apps relay jobs.** `packages/db` never imports pg-boss outside
+  migrations. State changes and validated effect descriptors are written to `job_outbox` in the
+  **same transaction** (specs 02–03). An app-owned relay uses `shared/src/jobs.ts` to deliver committed
+  intents to pg-boss at least once. A process crash after commit must not lose work. Immediate relay
+  wake-ups are optional optimizations; the durable relay and reconciliation provide recovery.
 - Only `packages/engine` talks to Jev, Ollama Cloud (as a decision engine) or Laya. Only `packages/translate` talks to LibreTranslate and to Ollama Cloud for translation.
 
 ---
@@ -163,7 +174,7 @@ listed under "Used by"**. An invalid config makes the process exit with a readab
 | Variable | Default | Used by | Meaning |
 |---|---|---|---|
 | `NODE_ENV` | `development` | all | `development` / `test` / `production` |
-| `DATABASE_URL` | — (required) | all | connection as role `feedit_app` (RLS enforced) |
+| `DATABASE_URL` | — (required) | api, test | connection as role `feedit_app` (RLS enforced) |
 | `DATABASE_URL_WORKER` | — (required) | worker, eval | connection as role `feedit_worker` (BYPASSRLS) |
 | `DATABASE_URL_MIGRATE` | — (required) | migrate | connection as role `feedit_owner` |
 | `TEST_ADMIN_DATABASE_URL` | `postgres://postgres:postgres@localhost:${PG_TEST_PORT}/postgres` | test, eval | superuser connection used only to create template, test, E2E and dry-run databases (spec 02 §1.1) |
@@ -224,11 +235,18 @@ the admin UI edits the table.
 | `worker` | `apps/worker` | 1–2 | all queues by default (`WORKER_QUEUES=*`); split if needed |
 | `web` | static build served by Caddy | — | — |
 | `postgres` | `postgres:16` | 1 | — |
-| `libretranslate` | `libretranslate/libretranslate` | 1 | only when any language mode is `translate` |
+| `libretranslate` | `libretranslate/libretranslate` | 1 | when any language mode is `translate`, card text mode is `english`, or an evaluation requires it |
 | `caddy` | `caddy:2` | 1 | TLS + reverse proxy |
 
 A **migration job** (`pnpm db:migrate`) runs before `api` and `worker` start
 (a compose `depends_on` with `condition: service_completed_successfully`).
+
+Processes trap SIGTERM: stop accepting requests/claiming jobs, finish or release bounded in-flight
+work, then close HTTP and DB pools. Provider/network calls have deadlines shorter than the shutdown
+grace period. Unfinished intents/leases are recoverable after restart. Liveness tests the process;
+readiness tests its own migration/config/DB prerequisites, not external provider uptime (an engine
+outage must leave the reader available in degraded mode). Database pools have explicit per-process
+limits whose combined maximum leaves headroom under Postgres `max_connections`.
 
 ---
 
@@ -238,8 +256,9 @@ A **migration job** (`pnpm db:migrate`) runs before `api` and `worker` start
   from outside the package.
 - **Naming:** files `kebab-case.ts`; types and classes `PascalCase`; functions and variables `camelCase`;
   DB columns `snake_case` (Drizzle maps to camelCase properties); queue names `dot.case`.
-- **IDs:** users use UUID v7 (`uuidv7` package). All other tables use `bigint` identity columns. IDs
-  travel as strings in JSON (never JS numbers for bigint).
+- **IDs:** users use UUID v7 (`uuidv7` package); other identifiers follow spec 02 (identity,
+  natural and composite keys all exist). Bigint IDs and revision counters travel as decimal strings
+  in JSON, cursors and job payloads; never round-trip them through JS `number`.
 - **Time:** all timestamps are `timestamptz` in UTC. Code uses `Date` objects or epoch ms. Formatting
   happens only in the web client.
 - **Errors:** throw subclasses of `AppError` (`packages/shared/src/errors.ts`) with a stable `code`
@@ -250,8 +269,10 @@ A **migration job** (`pnpm db:migrate`) runs before `api` and `worker` start
 - **Logging:** `logger.child({ component, jobId, userId, articleId })`. Never log secrets, email
   codes, session tokens, or full article bodies.
 - **SQL:** prefer Drizzle query builders. Use raw SQL (`sql```) for window functions, `pg_trgm`, and
-  bulk upserts. Every query that touches per-user tables goes through a repository in `packages/db`
-  that takes a `TenantTx` ([spec 02 §5](./02-data-model.md)).
+  bulk upserts. Tenant-owned user requests go through repositories in `packages/db` taking `TenantTx`
+  ([spec 02 §5](./02-data-model.md)). Auth/control-plane exceptions use only the explicit grants and
+  restricted functions in spec 02; worker repositories use the worker role. No exception grants
+  blanket BYPASSRLS credentials to the API.
 - **Pure logic is separated from I/O:** canonicalization, dedup keys, question building, ranking,
   model training and metrics are pure functions with unit tests. Handlers only wire I/O to them.
 - **Time and randomness are injected:** functions that depend on time or randomness receive `now` /
@@ -274,14 +295,23 @@ A **migration job** (`pnpm db:migrate`) runs before `api` and `worker` start
 | Eval | `pnpm evaluate …` | — | live Jev calls against the golden set | M3b, and any change to questions, thresholds or model |
 
 **Integration isolation:**
-- Each package's `test:int` uses its own database, `feedit_test_<worktree-hash>_<package>`, created from
+- Each package's `test:int` uses its own database, `feedit_test_<worktree-hash>_<package>_<run-id>`, created from
   the migrated template (spec 02 §1.1). Parallel worktrees and packages never share data.
 - Inside one package, Vitest runs with `fileParallelism: false` for `test:int`.
 - `turbo.json` sets `"test:int": { "cache": false }`.
 
-**Reporting named tests:** Turborepo's last lines are only a summary. When a goal asks for a named test,
-also run `pnpm test:int 2>&1 | grep -E "✓|✗|FAIL|PASS" | grep <name>`, or the package's Vitest with
-`--reporter=verbose` filtered to that file, and show the line.
+**Reporting named tests:** save the full command output once, with the command's actual exit code
+(`set -o pipefail` when piping through `tee`). Extract the named test lines from that saved log with
+`rg`, or run that package's Vitest filtered to the file with `--reporter=verbose`. A successful text
+search does not prove the test command passed; do not re-run the whole integration suite merely to
+format evidence. Tests skipped because a prerequisite is absent are reported as blocked, not passed.
+
+**Build and cache contract:** root typecheck must work after a clean install, before any local build
+artifacts exist. For packages exporting `dist`, make the build/typecheck dependency graph produce
+dependency declarations first; do not rely on a developer's stale `dist/`. Builds use committed
+sources and declared environment inputs. Integration, browser and live-evaluation runs are never
+served from Turborepo's cache. Empty placeholder tests cease counting as milestone evidence once
+their feature is implemented.
 
 Coverage target: **≥ 80 % lines** for `packages/feeds`, `packages/ranker`, `packages/questions`,
 `packages/engine`. No target for apps. CI fails if coverage in those packages drops below the target.
@@ -356,6 +386,9 @@ M0 writes this file verbatim, and later milestones append to its "Current state"
   - The lead commits each task by path.
   - Only one active branch at a time may add database migrations.
 - Start shared containers only with `docker compose … up -d --no-recreate`. Other worktrees use them.
+- This shared-container rule applies to dev/test only; production deployment follows spec 11.
+- Persist async intents with state in the transactional outbox; consumers must tolerate duplicates.
+- Treat unresolved owner decisions in PLAN.md as explicit gates for the affected work only.
 - Commit per task: `<task-id>: <summary>` (e.g. `M1-T1: SSRF-safe fetch dispatcher`).
 - Never call live third-party APIs in tests; use packages/testing fixtures.
 - Deviations from a spec: follow docs/specs/01-architecture.md §9 and log them in docs/DECISIONS.md.

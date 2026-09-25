@@ -19,7 +19,11 @@ export interface EngineCallRow {               // mirrors engine_calls (spec 02 
   engine: EngineName | 'libretranslate'; kind: CallKind; model?: string; articleId?: string;
   questionSetId?: string; cardIds?: string[]; userId?: string; nQuestions: number;
   inputTokens: number; outputTokens: number; costUsd: number; latencyMs?: number;
-  attempts: number; status: CallStatus; error?: string; createdAt: Date;
+  billing: 'known'|'uncertain';
+  logicalRequestId: string; reservationId?: string; articleRevision?: string; stateSha256?: string;
+  attempts: number; status: CallStatus; error?: string; createdAt: Date; // attempts = attempt ordinal
+  // One row per wire attempt; reservationId is unique for idempotent settlement.
+  // attempts increases monotonically for this engine across ALL subpacks of logicalRequestId.
 }
 export interface UsageRow {                    // mirrors usage_daily
   day: string /* YYYY-MM-DD, UTC */; userId: string /* or the platform sentinel */;
@@ -28,12 +32,24 @@ export interface UsageRow {                    // mirrors usage_daily
 export interface ExternalCall {                // non-engine calls logged through the router (translation, spec 07 §2)
   engine: 'libretranslate' | 'llm'; kind: 'translate' | 'eval'; model?: string; articleId?: string;
   inputTokens: number; outputTokens: number; costUsd: number; latencyMs: number;
-  status: CallStatus; error?: string;
+  status: CallStatus; error?: string; billing: 'known'|'uncertain';
+  logicalRequestId: string; attempt: number; articleRevision?: string; stateSha256?: string;
 }
 export interface EngineStore {                 // implemented in packages/db
-  insertCall(row: EngineCallRow): Promise<void>;                 // engine_calls
-  upsertUsage(row: UsageRow): Promise<void>;                     // usage_daily
+  reserveSpend(input: { day: string; engine: string; kind: CallKind; userId?: string;
+    estimateUsd: number; priority: 'interactive'|'bulk'; callCap?: number }): Promise<string | null>;
+  settleReservation(id: string, call: EngineCallRow, usage: UsageRow,
+    billing: 'known'|'uncertain'): Promise<void>; // one transaction: call + rollup + reservation
+  insertCall(row: EngineCallRow): Promise<void>; // zero-cost calls only; idempotent
+  upsertUsage(row: UsageRow): Promise<void>;      // used inside settlement, never independently for paid calls
   spendSince(fromUtc: Date, opts: { excludeKinds: CallKind[] | 'none' }): Promise<number>;
+  getBudgetSnapshot(dayUtc: string, opts: { excludeKinds: CallKind[] | 'none' }): Promise<{
+    settledUsd: number; reservedUsd: number; uncertainUsd: number;
+    callsByEngineKind: Record<string, number>; // keys `${engine}:${kind}`; each attempt once
+  }>;
+  // Snapshot reads actual settled cost plus separate outstanding/uncertain reservation amounts;
+  // never count one reservation and its audit row twice. Counts include admitted in-flight
+  // attempts. Production status/caps exclude eval; admission still locks/reserves atomically.
   getSetting<T>(key: string): Promise<T | undefined>;
   setSetting<T>(key: string, value: T): Promise<void>;
 }
@@ -54,12 +70,14 @@ export type ScoreAnswer  = { type: 'score';  score: number; probabilities: numbe
 export type Answer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
 
 export interface EngineRequest {
-  kind: CallKind;                          // never 'translate' (that is ExternalCall only)
+  kind: Exclude<CallKind, 'translate'>;     // translation uses ExternalCall
   state: JsonValue;
   questions: Record<string, Question>;     // keys: [a-zA-Z0-9_.-]{1,64}
   questionSetId?: string;                  // for logging
   questionSetSha: string;
   articleId?: string;
+  articleRevision?: string;               // immutable snapshot; decimal bigint string
+  stateSha256: string;                    // hash of the exact canonical serialized state
   cardIds?: string[];
   userId?: string;                         // cost attribution
   priority: Priority;
@@ -68,11 +86,17 @@ export interface EngineRequest {
 export type EngineOutcome =
   | { ok: true; engine: EngineName; model: string; answers: Record<string, Answer>;
       usage: { inputTokens: number; outputTokens: number }; costUsd: number; latencyMs: number }
-  | { ok: false; reason: 'no_key' | 'budget' | 'circuit_open' | 'error' | 'invalid_request'; detail?: string };
+  | { ok: false; reason: 'no_key' | 'budget' | 'circuit_open' | 'error' | 'invalid_request'; detail?: string; retryAt?: Date };
 
-export interface DecisionEngine {                // implemented by each engine
+export type EngineAttempt =
+  | Extract<EngineOutcome, {ok: true}>
+  | { ok: false; status: Exclude<CallStatus, 'ok'>; retryable: boolean;
+      retryAfterMs?: number; detail?: string;
+      usage?: {inputTokens: number; outputTokens: number};
+      billing: 'known'|'uncertain' };
+export interface DecisionEngine {                // adapters perform exactly ONE attempt
   readonly name: EngineName;
-  ask(req: EngineRequest, signal: AbortSignal): Promise<EngineOutcome>;
+  ask(req: EngineRequest, signal: AbortSignal): Promise<EngineAttempt>;
 }
 
 export interface RouterStatus {
@@ -81,10 +105,13 @@ export interface RouterStatus {
 }
 
 export interface EngineRouter {                  // the ONLY thing handlers use
-  ask(req: EngineRequest): Promise<EngineOutcome>;
-  status(): RouterStatus;
-  canSpend(estimateUsd: number, priority: Priority): boolean;   // spend-guard check for non-engine paid calls (tier-2 translation)
-  recordExternalCall(call: ExternalCall): Promise<void>;         // logs translation calls through the same store and budget
+  ask(req: EngineRequest, signal?: AbortSignal): Promise<EngineOutcome>;
+  status(): Promise<RouterStatus>;
+  canSpend(estimateUsd: number, priority: Priority): Promise<boolean>; // advisory only, never authorization to send
+  reserveExternalCall(input: {engine: ExternalCall['engine']; kind: ExternalCall['kind'];
+    estimateUsd: number; priority: Priority; userId?: string}): Promise<string | null>;
+  recordExternalCall(call: ExternalCall, reservationId?: string): Promise<void>;
+  // Paid external calls MUST reserve before HTTP. A failed attempt also settles conservatively.
 }
 
 export function createEngineRouter(deps: {
@@ -92,15 +119,21 @@ export function createEngineRouter(deps: {
   engines?: Partial<Record<EngineName, DecisionEngine>>;       // inject fakes (tests, E2E, eval dry run)
   budgetOverrideUsd?: number;                                    // eval only; see below
   ignoreDailyCaps?: boolean;                                     // eval: ignore llm/tier-2 daily caps
+  requiredEngine?: EngineName;                                  // eval: pin, no automatic fallback
 }): EngineRouter;
 ```
 
 **Eval routers.** A router created with `budgetOverrideUsd`:
 - records **every** call, engine and external (translation), with `kind = 'eval'`, so eval spend never
   counts against the production daily budget (spec 04 §6 excludes `kind = 'eval'`)
-- enforces its own budget: the router's **cumulative spend since it was created** (kept in memory,
-  starting at 0) plus the estimate must stay ≤ `budgetOverrideUsd`, otherwise the call returns `budget`
+- enforces its own budget: cumulative settled/uncertain spend plus all in-flight reservations since
+  creation must stay ≤ `budgetOverrideUsd`. Reserve under a router mutex before every attempt,
+  including retries and external translations; there is no 10% interactive allowance for eval
 - uses one router per `eval run` invocation, so `--max-usd` is a per-invocation cap (spec 10 §3)
+- `requiredEngine` pins the requested comparison engine and disables fallback. A failed Jev sample
+  remains a failed/missing Jev observation; it never quietly becomes an LLM sample. Manifest records
+  the selected engine, model, capability flags and price/normalization versions. Child evaluation
+  adapters share the same invocation budget authority, not independently reset $ limits.
 
 Handlers never see HTTP errors. They get `ok: false` and apply their degraded behaviour.
 
@@ -110,15 +143,20 @@ Handlers never see HTTP errors. They get `ok: false` and apply their degraded be
 
 Every engine converts its raw output into the `Answer` union above and validates it:
 
-- Every requested key is present, with the requested `type`. A missing or mistyped key makes the
-  whole response `invalid_response`.
+- Validate outbound keys, shapes, nonempty questions, option/level counts and configured request byte
+  limits before spending. All numeric answers and usage counts must be finite; token counts must
+  be nonnegative integers. All probabilities and confidence values must be within [0,1].
+- Exactly the requested keys are present, with the requested `type`. Missing, additional or mistyped
+  keys make the whole response `invalid_response`. Use own-property-safe maps for untrusted JSON.
 - `noul.p ∈ [0, 1]`.
 - Choice `probabilities` has exactly the option keys, and the values sum to 1 ± 0.02. Renormalize
-  within tolerance, reject outside it. `choice` is the argmax.
+  within tolerance, reject outside it. `choice` is the argmax; ties use the request's stable option order.
 - Score `probabilities` is an array of length `levels` (converted from TypeSafe's string-keyed object).
-  `score = Σ i·p_i` is recomputed and must match TypeSafe's value within 0.02.
+  Validate the same bounds and sum tolerance as Choice. `score = Σ i·p_i` is recomputed and must
+  match TypeSafe's value within 0.02; keys must be exactly `0` through `levels − 1`.
 - `confidence` comes from the engine when provided (Jev). Otherwise
-  `confidence = 1 − H(p) / ln(k)`, where H is the Shannon entropy and k the number of options or levels.
+  `confidence = 1 − H(p) / ln(k)`, using `0·ln(0) = 0`. This is our proxy, not a claim that it is
+  Jev's confidence formula. Confidence is not a probability of correctness; calibrate engines separately.
 
 The normalized answers are what is stored in `article_facets.answers`, `card_answers.p`,
 `article_topics_l2.answer` and `eval.run_answers`.
@@ -151,99 +189,150 @@ The normalized answers are what is stored in `article_facets.answers`, `card_ans
 |---|---|---|
 | 200 | ok | normalize (§2); `invalid_response` counts as a retryable error once |
 | 401 / 403 | bad key | no retry. Outcome `error` with `auth_error`. Opens the breaker in **auth** mode (§5) and alerts admins |
-| 422 | invalid request | no retry. Outcome `invalid_request`. Log the question-set sha and the response body. This is a bug and must surface in tests |
+| 400 / 413 / 422 | invalid request or size | no blind retry/fallback. Outcome `invalid_request`; log set sha, request hash and a redacted, length-capped error code (provider errors can echo private inputs) |
 | 429 | rate limited | retry (§4). Feeds the client-side limiter |
-| 5xx, network error, timeout | transient | retry (§4) |
+| 5xx (including 529), network error, timeout | transient | retry (§4) |
+| Other 4xx | unsupported model/endpoint or permanent request error | no retry; alert on model/configuration failures |
 
 - Per-attempt timeout: 30 s.
 - **Model pinning:** the `model` field is always `TYPESAFE_MODEL` (default `jev-1.13.0`), never an
   alias, in production.
-- The response's `model` is stored with every answer.
+- The response's `model` is stored with every answer. A different model from the requested pin is
+  an `invalid_response` in production; `jev-fake` is allowed only by an explicit test configuration.
 - **Cost:** `input_tokens × TYPESAFE_PRICE_PER_MTOK_USD / 1e6`. Output is free.
 
 **Client-side rate limiter:** token buckets at **1,000 requests/min** and **200,000 input tokens/s**
-per process. Both sit below the documented 1,200/min and 250k/s. Token cost is estimated before the
-call (§6.1). Calls wait for capacity (bulk priority waits behind interactive).
+per API account across the deployment. Allocate static per-process shares whose sum is no greater
+than those limits (API translation does not consume the Jev buckets); do not give every worker the
+full account allowance. These are configurable defaults below published limits, not a guarantee.
+Token cost is estimated before each attempt (§6.1); 429 lowers capacity temporarily. Waiting is
+bounded by the job deadline, cancellation works while queued, and aging prevents bulk starvation.
 
 ---
 
 ## 4. Retries and concurrency (router level)
 
-- **Attempts:** at most **4** per logical call.
-- **Delay before attempt n (n ≥ 2):** `500 ms × 2^(n−2)` ± 20 % jitter. If the server sent
-  `Retry-After`, use `max(delay, min(retryAfter, 30 s))`.
-- **Retry on:** 429, 5xx, network errors, timeouts, and one `invalid_response`.
-- **Concurrency:** a process-wide semaphore of `ENGINE_CONCURRENCY` (default 8) in-flight engine calls.
-  `interactive` requests get priority in the semaphore queue.
-- **Logging:** one `engine_calls` row per logical call (not per attempt), with `attempts`, the final
-  `status`, latency (first send to final answer), tokens and cost.
+- **Single retry owner:** adapters make one wire attempt; disable SDK automatic retries. The router
+  allows at most **4 TypeSafe attempts**, or **2 LLM attempts**, per logical request. Workers must
+  not restart this retry loop immediately on deferred outcomes (spec 05 §5.5).
+- **Delay before attempt n (n ≥ 2):** `500 ms × 2^(n−2)` ± 20% jitter. Parse `Retry-After` as
+  either seconds or an HTTP date. Never retry sooner than a valid server delay. If that delay is
+  longer than the remaining job deadline, return a deferred outcome with `retryAt` for the queue.
+- **Retry on:** 429, 5xx, network errors, timeouts, and at most one `invalid_response`. Cancellation,
+  auth errors and invalid requests are not retried. Reacquire limiter capacity and spend reservation
+  before every attempt and before entering fallback.
+- **Concurrency:** a process-wide semaphore of `ENGINE_CONCURRENCY` (default 8); the LLM also uses
+  `OLLAMA_MAX_CONCURRENCY`. Backoff does not hold a semaphore slot. Requests and responses have
+  bounded bytes; abort transport and release capacity on timeout/cancellation.
+- **Logging:** one `engine_calls` row per **wire attempt**, grouped by `logical_request_id`, with
+  `attempts` as a monotonically increasing ordinal for that engine across **all subpacks and retries**
+  in the logical request (do not restart at 1 for each split pack). Per-subpack retry limits are
+  enforced separately in memory. A fallback has its own engine rows under the same
+  logical id. Sum usage/cost across all attempts, even invalid answers; do not log only the successful
+  final attempt. `usage_daily.calls` counts wire attempts; reliability dashboards group by logical id.
+- Responses with unknown billable usage (e.g. timed out after sending) retain their reservation as
+  uncertain spend; they are not assumed free. Retrying may be billed again. Do not claim exactly-once
+  provider execution unless a provider documents an idempotency-key contract.
 
 ---
 
 ## 5. Circuit breaker and fallback chain
 
-**Breaker** (per engine and per worker process, in memory):
+**Breaker** (local failure windows, shared authoritative state per engine):
 
-- **Rolling window:** the last 5 minutes of logical calls.
-- **Opens** when the window has ≥ 20 calls **and** the failure share is > 20 %. Failures are final
-  outcomes `error`/`timeout`/`rate_limited` after retries.
-- **Open duration:** 2 min, doubling on each consecutive re-open, capped at 30 min.
-- **Half-open:** one probe call is allowed. Success closes the breaker and resets the doubling. Failure
-  re-opens it.
-- **Auth mode:** a 401/403 opens the breaker until the process restarts or an admin presses "retry" in
-  the admin UI. It does not self-heal.
-- **Mirror:** every state change is written to `settings['engine.circuit']` (shape in spec 02 §2), and
-  the worst state across processes wins. The admin UI and the house jobs (`house.rescore-degraded`,
-  `house.alerts`) read **the mirror**, never their own process's breaker.
-- **Reset:** `POST /admin/engine/reset-breaker {engine}` writes
-  `engine.circuit.resetRequested[engine] = now`. Every router polls the key every 10 s. When the value
-  is newer than its last reset, the router closes that breaker (including auth mode), resets the
-  doubling, and writes the new state to the mirror.
+- **Rolling window:** last 5 minutes of logical requests, counted once per provider after retries.
+  Open after ≥20 requests and >20% failures. Final `error`/`timeout`/`rate_limited`/
+  `invalid_response` count as failures; budget/cancellation/invalid-request do not.
+- **Open duration:** 2 min, doubling per consecutive re-open, capped at 30 min. A 401/403 instead
+  sets `auth` until explicit admin reset; restarting a process must not clear a bad-key incident.
+- `settings['engine.circuit']` is authoritative. Update an engine entry atomically under a row lock,
+  preserving the other engine and reset fields. Routers poll at most every 10s, check shared state
+  before paid attempts, and admin/house jobs read the same state. Do not overwrite the object from
+  a stale process-local copy.
+- **Half-open:** after `openUntil`, acquire one shared probe lease (`probeToken`, `probeUntil`) in
+  that same transaction. A successful probe closes and resets doubling; a failed one reopens.
+  Only the lease holder may complete that transition; an expired probe can be reclaimed after crash.
+- **Reset:** `POST /admin/engine/reset-breaker {engine}` records a timestamp and atomically closes
+  that engine/reset counter; routers discard older local state within one poll. State changes and
+  polling are bounded and tested across two router instances.
 
 **Fallback chain** in `EngineRouter.ask(req)`:
 
-1. `no_key` if `TYPESAFE_API_KEY` is missing (dev without a key).
-2. Spend guard (§6): `budget` if exceeded.
+1. Validate the request. In dev without a primary key return `no_key` (unless an injected test engine
+   exists). Production boot validates required primary credentials; missing key is not a normal outage.
+2. Check breaker and reserve the selected provider's estimated spend (§6) before each send.
 3. TypeSafe breaker closed or half-open → TypeSafeEngine. On success, return.
 4. If TypeSafe failed or its breaker is open:
    - if `LLM_FALLBACK_ENABLED` **and** `req.priority === 'interactive'` **and** the LLM daily call cap
      (`settings['engine.llm_daily_cap']`, default 200) is not reached **and** the LLM breaker is
-     closed → LlmFallbackEngine (§8)
+     closed or an acquired half-open probe → LlmFallbackEngine (§8). Reserve LLM input plus bounded
+     output at its own price; a cheap Jev reservation never authorizes an expensive fallback. The
+     router may split a Jev pack into smaller LLM subrequests, reusing the same immutable state; it
+     returns ok only after every original key has one valid answer, otherwise callers keep the work
+     pending. Each subrequest/attempt is separately reserved and logged
    - (M9) if a fine-tuned Laya checkpoint is configured for `req.kind` → LayaEngine (§9)
-5. Otherwise `circuit_open` or `error`.
+5. Otherwise return `budget`, `circuit_open` or `error` with a retry time when known. Never route an
+   invalid request into another provider. Optional Laya has an explicit eligible-kind/language and
+   engine-precedence policy; paid-provider budget exhaustion must not disable eligible local inference.
 
 **Degraded handling is the caller's job** (spec 03 §1, spec 05, spec 06).
 `house.rescore-degraded` (every 10 min, spec 11 §6) re-enqueues `article.enrich` for articles with
-`pipeline_state = 'degraded'` and `first_seen_at` in the last 72 h, but only while the TypeSafe breaker
-is closed and the budget allows. Answers produced by the LLM fallback are **replaced** by Jev answers
+`pipeline_state = 'degraded'` within the full supported **14-day** ranking/backfill window, using
+feed membership time for newly subscribed/deduplicated items, while the primary engine is available
+and the budget allows. Use persisted keyset cursors and bounded pages with priority aging, so new
+arrivals do not starve older recoverable work. Answers produced by the LLM fallback are **replaced** by Jev answers
 when the article is re-processed, because personal models must learn from one engine
-(spec 06 §8.1). `house.rescore-degraded` therefore also re-enqueues articles whose `enrich_engine = 'llm'`.
+(spec 06 §8.1). `house.rescore-degraded` therefore also re-enqueues articles whose `enrich_engine = 'llm'`, **and**
+requeues current LLM card/L2 answers even when Call A already succeeded with Jev. Recovery consults
+pending/unavailable pairs in spec 05 §5.5 and stays bounded; it does not repeatedly rebill a fresh Call A.
 
 ---
 
 ## 6. Spend guard
 
-- **Budget:** `settings['engine.daily_budget_usd']`, falling back to `DAILY_BUDGET_USD` (default $2.00).
-  The day is UTC.
-- **Spend today:**
-  `SELECT coalesce(sum(cost_usd), 0) FROM engine_calls WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AND kind <> 'eval'`.
-  - Loaded at start, refreshed every 60 s, and incremented locally after each call.
-  - Evaluation spend (`kind = 'eval'`) never consumes the production budget. Eval runs use their own cap
-    (`budgetOverrideUsd`, spec 10 §3).
-- **Before each call:** estimate the cost (§6.1). If `spend + estimate > budget`, return `budget`
-  without calling.
-- **Crossings:** when spend first crosses **80 %** or **100 %** of the budget on a UTC day, the router
-  records it in `settings['engine.budget_alerts'] = {day, p80At?, p100At?}`. It sends **no** email:
-  `house.alerts` (spec 11 §6.1) owns every notification.
-- **Interactive allowance:** `interactive` requests may exceed the budget by at most 10 % so users can
-  still add a card while the bulk backlog is paused. `bulk` requests stop at 100 %.
+- **Budget:** `settings['engine.daily_budget_usd']`, then `DAILY_BUDGET_USD` (default $2.00), by UTC
+  day. Interactive requests have a 10% allowance; bulk requests stop at 100%. Paid retries, fallback,
+  translations and API/worker processes all share this guard.
+- **Atomic reservation:** immediately before each paid wire attempt, reserve its estimated upper
+  cost in `engine_reservations` under a UTC-day advisory lock/transaction (spec 02). Admission uses
+  settled `engine_calls.cost_usd` plus outstanding reserved/uncertain amounts. Reserve call-cap slots
+  in that same operation. A 60s cache is useful for display only, never admission.
+- **Settlement:** insert the attempt row, update `usage_daily` and settle its reservation in one DB
+  transaction. `reservation_id` is unique so crash retries cannot double-charge internal totals.
+  Known usage replaces the reserve; unknown billing keeps it `uncertain` (unknown billed cost is
+  not invented in the call row; spend UI includes the reserve separately). Count each reservation
+  once, not both its outstanding estimate and settled call cost. Lease expiry alone must
+  not refund a request that may already have reached the provider. Reconcile uncertain spend from
+  provider usage or retain it for that budget day; the next UTC day has a separate allowance.
+  Attribute an attempt and its usage to `reservation.day` (UTC at send/admission), even if settlement
+  crosses midnight. `engine_calls.created_at` is the send timestamp, not completion time; reserve
+  each retry on its own actual UTC send day. Budget queries join reservation day, avoiding charges
+  disappearing from yesterday or being counted twice today during late settlement.
+- **Cap meaning:** with estimated tokenization this is a conservative application budget, not a
+  mathematically exact provider invoice cap. Actual usage above a reserve stops further calls and
+  alerts. Set a provider-side hard spend limit when available. Never fabricate exact accounting for
+  network timeouts or unavailable usage.
+- **Crossings:** atomically mark 80% and 100% crossings in `settings['engine.budget_alerts']` once
+  per UTC day; `house.alerts` alone sends notifications. Budget-blocked work remains queued until a
+  usable budget or next UTC day; it does not consume failure attempts.
+- **Evaluation:** `kind='eval'` is excluded from production spend and uses its own synchronized
+  per-invocation cap (§1), including uncertainty and all concurrent attempts.
 
-### 6.1 Token estimation
+### 6.1 Token and output estimation
 
 `estimateTokens(state, questions) = ceil(len(JSON.stringify(state)) / 3.5) + Σ ceil(len(JSON.stringify(q)) / 3.5) + 20`.
 
-This is deliberately conservative. The same function is used for request packing (spec 05 §5.2). A
-metric records `actual / estimated` so the divisor can be tuned later.
+This is a planning heuristic, **not** a conservative bound for every Unicode language. Use provider
+counts to record `actual / estimated` by language and request kind. Before a verified tokenizer is
+available, apply a safety multiplier learned from the smoke-test fixtures and fall back to serialized
+UTF-8 byte length plus overhead as the conservative bound for unfamiliar scripts. Hard byte caps,
+per-engine context caps and single-question overflow rejection still apply. The same estimator and
+safety policy are used by packing in spec 05 §5.2.
+
+LLM admission also reserves its enforced output-token maximum (including thinking tokens when billed).
+Configure/verify the provider output-limit option and include the schema/system prompt in input
+estimates. If the provider cannot enforce a bounded output, leave that fallback disabled until an
+explicit cost policy is recorded. Clipped/truncated output is an invalid answer, never partial success.
 
 ---
 
@@ -274,10 +363,9 @@ Exact per-question costs are not stored. The admin usage page (spec 08 §9) show
 {
   "model": "glm-5.3-flash",
   "stream": false,
-  "format": <JSON schema, below>,
   "options": { "temperature": 0 },
   "messages": [
-    { "role": "system", "content": "<SYSTEM_PROMPT>" },
+    { "role": "system", "content": "<SYSTEM_PROMPT plus JSON schema>" },
     { "role": "user", "content": "<JSON.stringify({ state, questions })>" }
   ]
 }
@@ -292,20 +380,33 @@ Exact per-question costs are not stored. The admin usage page (spec 08 §9) show
 > last; they must sum to 1. Be calibrated: use values near 0.5 when unsure. Output only JSON matching
 > the schema.
 
-**Schema generation:** an object with one required property per question key.
+**Cloud capability:** Ollama's [structured-output documentation](https://docs.ollama.com/capabilities/structured-outputs)
+states that Cloud does not currently support constrained structured outputs (checked 2026-09-25).
+Do **not** send `format: <schema>` by default. Put the schema in the trusted system prompt and strictly
+validate unconstrained JSON; malformed responses consume the bounded retry allowance. Only enable
+a `format` capability flag after a successful, recorded probe against the selected endpoint/model.
+The [Cloud docs](https://docs.ollama.com/cloud) require actual API model ids from `/api/tags`.
+
+**Schema generation:** a closed object (`additionalProperties: false` at every level) with one required
+property per question key. Every probability has `minimum: 0, maximum: 1`.
 - `noul` → `{type:'object', properties:{p:{type:'number', minimum:0, maximum:1}}, required:['p']}`
 - `choice` → `{type:'object', properties:{probabilities:{type:'object', properties:{<opt>:{type:'number'}…}, required:[…all options]}}, required:['probabilities']}`
 - `score` → the same shape with keys `"0"…"n-1"`.
 
 **Post-processing:**
 - Parse `message.content` as JSON.
-- Clamp values to [0, 1] and normalize; if the sum is 0, use a uniform distribution.
-- Then run the §2 normalization.
+- Reject non-finite/out-of-range values, missing/extra keys, zero-sum distributions and truncated
+  responses. Do not clamp invalid values or invent uniform answers; use §2's small sum tolerance.
+- Then run §2 normalization. Article/card/example strings are untrusted data: the system prompt
+  explicitly forbids following instructions embedded in them. No tool execution or generated text
+  is exposed to users. Prompt injection robustness is evaluated, not assumed.
 
 **Usage and cost:**
 - `prompt_eval_count` and `eval_count` from the response give the token counts.
 - Cost comes from the model price table in config: `glm-5.3-flash` $0.15 in / $0.50 out per MTok,
-  `glm-5.3` $1.40 / $4.40. Peak prices are used as the upper bound.
+  `glm-5.3` $1.40 / $4.40. These rates are confirmed by the [Ollama pricing page](https://ollama.com/pricing)
+  on 2026-09-25; pin the price-table version and recheck before G1. Use peak uncached rates for
+  admission, account for billed thinking, and obey the subscribed account's concurrency limit.
 
 **Limits:**
 - Timeout 60 s, 2 attempts.
@@ -317,6 +418,9 @@ Exact per-question costs are not stored. The admin usage page (spec 08 §9) show
 
 ## 9. LayaEngine (M9, optional)
 
+- Before M9, verify checkpoint license, Node port version, supported question types, tensor shapes,
+  tokenizer limits and RAM against the actual artifact; pin checksums. The following is a prototype
+  integration target, not evidence that an untested checkpoint is deployable.
 - Loads a fine-tuned **Laya-multilingual** ONNX checkpoint through the Jev-compatible Node port
   `receptron/laya` (`Laya.load({subfolder})` → `laya.systemOne(state, questions)`).
 - Runs in-process in a dedicated worker (`WORKER_QUEUES=article.enrich.laya`), because it needs
@@ -325,7 +429,7 @@ Exact per-question costs are not stored. The admin usage page (spec 08 §9) show
   `{"enrich": ["sk","cs"]}`.
 - Limits: ≤ 20 options per Choice. Topic questions must use the two-level walk (spec 05 §3.2).
 - Per-question-type temperature calibration (fitted in the fine-tuning notebook) is applied in
-  `normalize()`.
+  `normalize()`. Calibration version and checkpoint hash are part of the answer provenance.
 - Background and the go/no-go criteria: [`../laya-multilingual.md`](../laya-multilingual.md).
 
 ---
@@ -350,6 +454,11 @@ Exact per-question costs are not stored. The admin usage page (spec 08 §9) show
 - rate limiter
 - LLM schema generation
 - attribution
+- two routers reserving the last budget simultaneously; retries/fallback/translation charge their own
+  attempts; failed settlement replay is idempotent; uncertain usage and UTC rollover
+- Retry-After HTTP dates, delays longer than job deadline, cancellation while waiting, no nested retries
+- malformed finite/range/key data, mismatched model pins, prompt injection fixtures and output truncation
+- shared breaker lost-update, probe lease expiry and reset across process instances
 
 **Deterministic fake TypeSafe server** (`packages/testing/src/fake-typesafe.ts`, built in M2-T2): an
 HTTP server implementing `POST /v1/systemone` with the documented response shape, so any question set
@@ -376,3 +485,19 @@ gets a plausible, repeatable answer.
 - After `failRate` is set to 0 and the open duration elapses, the half-open probe succeeds and the
   breaker closes.
 - A reset request (`resetRequested`) closes an auth-mode breaker within one polling interval.
+
+
+### 10.1 Provider contract gate (M3b, before quality evaluation)
+
+Record a sanitized smoke-test report for the configured endpoints, credentials, pinned models, all
+three question types, error shape, usage counters, input limits, output limits and the Cloud JSON
+capability. Keep offline fixtures as contract examples; fake-server success alone does not establish
+provider compatibility. Paid probes count against `--max-usd`. If a required feature is unavailable,
+stop that integration and report the smallest concrete decision to the owner. Do not silently switch
+provider, use an alias or expand the cost limit.
+
+Reference contracts checked 2026-09-25: [TypeSafe API](https://docs.typesafe.ai/api),
+[models and limits](https://docs.typesafe.ai/models),
+[confidence semantics](https://docs.typesafe.ai/confidence),
+and the Ollama links in §8. No source documents guarantee that a general classifier is immune to
+adversarial feed text; add those cases to the golden evaluation.

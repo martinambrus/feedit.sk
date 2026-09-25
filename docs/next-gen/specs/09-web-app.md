@@ -14,22 +14,67 @@ mobile-first, installable, works in English and Slovak, and never makes the read
   `sk.json`, plus `src/i18n/common.{en,sk}.json`. Parallel work on different features never edits the
   same file. A test asserts key parity between `en` and `sk` for every namespace.
 - The API client is generated from the zod DTOs in `packages/shared` (a thin typed `fetch` wrapper).
-  It always sends `X-FeedIt-Client: web`.
+  It sends same-origin credentials and `X-FeedIt-Client: web`; authenticated mutations carry the
+  durable `Idempotency-Key` and reader `stateVersion` required by spec 08. Validate response DTOs
+  at the boundary. All query keys include the account id and normalized reader filters.
 - Optimistic updates for every reader action (read, rate, bookmark, label), rolled back on error with
   a toast ("Couldn't save — retry"). This is FeedIt's "undo on failure" todo.
 - **PWA (vite-plugin-pwa):**
   - manifest (name "FeedIt", theme colour, icons)
-  - service worker precaches the app shell
-  - runtime cache (network-first, 24 h) for `GET /articles*`, holding the last 200 list items for
-    offline reading
-  - mutations made while offline are queued (Background Sync) and replayed
+  - service worker precaches versioned, public app-shell assets only
+  - explicitly persist an allowlisted projection of the last 200 list items and already opened
+    sanitized detail texts in IndexedDB, keyed by account id, with 24-hour expiry and a 10 MiB cap;
+    list summaries alone cannot provide full offline reading. An uncached detail says "Connect to
+    load this article". Do not wildcard-cache `/articles*`: counts, calibration, explanations,
+    exports, auth, admin responses and session data are excluded
+  - reader mutations made offline are queued in the same account-scoped store with original
+    mutation id, expected state version, creation time and optimistic before-state. Only read/unread,
+    rating, bookmark and existing-label actions can queue offline; bulk operations, edits to
+    interests/feeds/settings, login and account deletion require a connection
+  - replay runs on startup, `online` and foreground return; Background Sync is optional acceleration,
+    not a dependency. Replay at most 24 hours after creation, in order per article, with one elected
+    tab/service-worker dispatcher. Serialize dependent versions after acknowledged local actions;
+    stop on a cross-device stale version and offer refresh/review. Retry network/5xx/429 with bounded
+    backoff and Retry-After, never blindly retry 400/403/404/409. Freeze on 401 pending reauthentication
+  - reconnect verifies `/me` before replay; work queued for A is never submitted under B. Logout,
+    account deletion or account switch immediately clears in-memory queries, private IndexedDB,
+    pending mutations and any legacy private caches and broadcasts the reset to all tabs. Explicit
+    logout while offline clears local data immediately and completes server revocation when online;
+    a local signed-out marker blocks automatic `/me` sign-in and queue replay until that pending
+    logout completes. Process it before any new login, so it cannot revoke a later account's session.
+    Never imply the server session was already revoked
+  - offline cached content is available only for the last locally selected account within its cache
+    lifetime; explain this local-device persistence in settings (privacy defaults: PLAN §17).
+    Session tokens never enter IndexedDB/localStorage. A service-worker update preserves queued
+    records via versioned migrations; prompt before reloading an actively used reader
 - **Accessibility:**
   - every swipe action also has a button
   - keyboard navigation throughout
   - focus rings, `aria-live` for toasts
   - colour contrast AA
   - honours `prefers-reduced-motion`
+  - labelled controls, ≥44px touch targets, semantic list landmarks, sensible tab order and focus
+    restoration/trapping for dialogs and sheets; do not convey lane/rating status by colour alone
+  - the disappearing row transfers focus to a predictable adjacent item; undo restores focus.
+    Drag reordering and swipes have keyboard/button alternatives. Timed feedback remains available
+    through the action menu after the toast disappears, and visible timers pause while focused
 - **Theme:** light and dark, following the system, with a manual override in Settings.
+
+**Untrusted content:** render ordinary strings via React escaping; only the server-sanitized fragment
+may enter the HTML sink. No scripts, inline handlers, forms, iframes or active URL schemes from feeds.
+External links use `rel="noopener noreferrer"`; opening a non-null source URL is a direct user gesture so
+popup blockers do not reject it while an `/open` request is awaiting a response. Remote thumbnails
+and favicons are network requests to publishers: `loadRemoteImages=false` by default, omit image
+`src` entirely until the user opts in (a placeholder alone must not still trigger a request).
+When enabled use `referrerPolicy="no-referrer"` and lazy loading; never fetch active SVG/HTML as
+embedded documents. Sanitized excerpt HTML contains no automatically loaded remote images.
+
+**Refresh and errors:** poll list/counts every 5 seconds only while a visible page has
+`rankingPending`/New items, back off to 30 seconds when idle, and pause offline/background polling.
+Cancel obsolete queries on route changes. No SSE infrastructure is required for the first version.
+Refresh from page one on `STALE_CURSOR`; de-duplicate ids and preserve selection/scroll by id.
+Every screen has loading, empty, offline, recoverable error and quota-limit states; 401 navigates to
+login without leaking the previous account's UI. Slow classification leaves articles readable in New.
 
 ---
 
@@ -42,7 +87,7 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 | `/waitlist` | public waitlist form |
 | `/onboarding` | the first-run wizard (§4); shown while `preferences.onboardingCompletedAt` is null. Finishing or skipping sets it |
 | `/` → `/read/for_you` | the reader (§3) |
-| `/read/:lane` | lanes: `for_you`, `maybe`, `everything`, `new`, `bookmarks` |
+| `/read/:lane` | lanes: `for_you`, `maybe`, `everything`, `new`, `bookmarks`, and the explicit recovery view `hidden` |
 | `/read/feed/:feedId`, `/read/folder/:name`, `/read/label/:labelId` | filtered reader |
 | `/interests` | interest cards: mine, library browser, suggestions (§6) |
 | `/labels` | labels manager |
@@ -64,6 +109,10 @@ mobile-first, installable, works in English and Slovak, and never makes the read
   - Feeds with `status = quarantined` show a warning dot; `dead` feeds show a red banner in the feed view.
   - Sidebar lanes: **For you**, **Maybe** (badge: "help me learn"), **Everything else** (collapsible,
     hidden when `prefs.hideEverything`), **New** (not scored yet), **Bookmarks**.
+  - A visible "Show hidden" entry in the reader's More menu opens `/read/hidden`. It shows Why this?
+    and distinguishes "Hidden by you" (`archivedAt`) from Never/block/mute/demotion rules. "Unhide"
+    clears only the explicit archive via `/unhide`; rule-driven exclusions link to the responsible
+    rule/card/preference for an intentional edit. Hidden recovery never changes normal lane defaults.
 - **List header:**
   - the tier slider (1–5, FeedIt's) filtering `for_you`/`maybe` by minimum tier; its value is saved to
     `prefs.defaultTier`
@@ -82,6 +131,8 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 - **Expanding** an item shows the sanitized `excerptHtml` or `bodyLead`, a "Read original" button (opens
   the URL in a new tab and calls `/open`), and the action bar: 👍 👎 🔖 label, Why this?, Mute story,
   more (block feed/domain/author, boost feed).
+- **Linkless items:** remain readable/rateable/bookmarkable; omit "Read original" and domain-based
+  actions when no usable URL exists. Show missing-image/author/date fallbacks without broken controls.
 - **Translated items:** a subtle "translated" marker. A toggle shows the English translation of the
   title and excerpt when available.
 
@@ -93,14 +144,22 @@ mobile-first, installable, works in English and Slovak, and never makes the read
     an icon) past 15 %.
   - Release below the threshold → snap back.
 - **Dislike opens a reason bar** for 5 s: `Off-topic · Clickbait · Seen it · Too shallow · Promo ·
-  Other`. Tapping one sends the reason. Ignoring it keeps the rating without a reason.
+  Other`. Keep one optimistic pending action until a reason is selected or the timer expires, then
+  submit it once with its finalized body/idempotency key. Ignoring it saves the rating without a
+  reason. Undo before submission cancels the pending action; after submission it uses the receipt.
+  A later reason edit is a new mutation, never a changed body replayed under an old key.
 - **Rating** marks read (if `markReadOnRate`) and moves the item out of unread lists after a 400 ms
   animation. **SHIFT + rate** or a long-press + rate also hides the item (`hide: true`).
 - **Rating an already-rated item** in the same direction un-rates it (FeedIt behaviour).
 - **"Train the whole feed"** (feed view menu): like or dislike all visible unread items, with
-  confirmation. Uses `POST /articles/rate-bulk`.
-- **Undo toast** after every rating or bulk action (5 s). Undo re-sends the previous state:
-  `rating: null` (single or bulk) or `/unread`.
+  confirmation showing exact count; freeze up to 200 loaded visible ids/versions at confirmation.
+  Label it "Rate these N visible articles" so it never implies unloaded feed history will be rated.
+  Uses `POST /articles/rate-bulk`.
+- **Undo toast** after every rating or bulk action (5 s), also available in the recent-action menu
+  for the API's 10-minute undo window. Call `POST /articles/undo {mutationId}`; never approximate a
+  previous rating/read/archive state with `rating:null`. If a newer device action prevents undo,
+  refresh and show that conflict. A failed optimistic update restores only that action's changes,
+  not an old whole-query snapshot that could overwrite subsequent successful actions.
 
 ### 3.4 Keyboard shortcuts (desktop; `?` shows the overlay)
 
@@ -108,8 +167,8 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 |---|---|
 | `j` / `k` | next / previous item (auto-expands if `markReadOnExpand`) |
 | `o` or `Enter` | open the original (new tab) |
-| `+` / `=` / `Ctrl+Plus` | like (FeedIt: CTRL+PLUS) |
-| `-` / `Ctrl+Minus` | dislike, then `1`–`6` picks a reason |
+| `+` / `=` | like |
+| `-` | dislike, then `1`–`6` picks a reason |
 | `Shift` + like/dislike | rate and hide |
 | `b` | bookmark |
 | `l` | label picker |
@@ -120,6 +179,10 @@ mobile-first, installable, works in English and Slovak, and never makes the read
 | `g` then `f`/`m`/`e`/`n`/`b` | go to For you / Maybe / Everything / New / Bookmarks |
 | `s` | toggle Simple mode (FeedIt: CTRL+M also works) |
 | `/` | focus the feed filter |
+
+Disable reader shortcuts inside inputs, textareas, contenteditable regions, open modal controls and
+during IME composition. Never intercept browser zoom (`Ctrl/Cmd` + `+`/`-`), navigation or assistive
+technology shortcuts. Shortcut sequences expire after one second and announce pending mode.
 
 ### 3.5 "Why this?" drawer (successor of FeedIt's detailed-training modal)
 
@@ -145,7 +208,10 @@ Rendered from `explain` (spec 06 §6.2):
 ### 3.6 "Did you like it?" prompt
 
 When the page becomes visible again after `/open`:
-- the client measures dwell time and posts `/dwell`
+- record only the away interval correlated with that article's explicit open, once, with a maximum
+  of 30 minutes; post `/dwell` on the next foreground return. Do not accumulate general background
+  tab time or claim this proves reading. If several sources were opened without a clear correlation,
+  omit dwell rather than attach it to an arbitrary item
 - if the response says `prompt: true`, show a bottom sheet "Did you like *<title>*?" with 👍 / 👎 /
   "Ask less often" (sets `feedbackPrompt` one step lower)
 
@@ -167,9 +233,12 @@ When the page becomes visible again after `/open`:
    - at least 1 interest is recommended; a skip is allowed with a warning
 4. **Calibration round:**
    - "Rate 10 articles so FeedIt gets you faster" (spec 06 §10)
-   - if the items aren't ranked yet (backfill running), show a progress indicator ("Reading your
-     feeds… 38/120") by polling `/articles/counts`, and continue when ≥ 10 `maybe`/`for_you` items exist
-     or after 60 s
+   - if backfill is running, show "38 scored of 120 available" from `/articles/counts` without
+     presenting it as pipeline-job completion. Poll `/articles/calibration` and begin with up to
+     10 returned items (Maybe, then Everything per spec 06); For you count is not the readiness test
+   - after 60 s, or with no usable feed items, allow continue/skip with the available sample, including
+     zero. Do not trap the user waiting for ten items or a dead feed. Persist completed onboarding
+     once and allow calibration later from the reader
 5. **Done** → For you.
 
 ---
@@ -182,7 +251,8 @@ When the page becomes visible again after `/open`:
 - **Add feed:** URL input with discovery (candidate chooser).
 - **OPML:** import (with the result report) and export.
 - A **dead** feed shows "This feed stopped working on <date>: <reason>" with **Unsubscribe** or
-  **Dismiss**. Dismiss only hides the banner, client-side in `localStorage`. Admins can reset the feed.
+  **Dismiss**. Dismiss only hides the banner, client-side in account-scoped `localStorage`; a new
+  failure timestamp restores the banner. Clear this state on logout. Admins can reset the feed.
 
 ---
 
@@ -209,6 +279,10 @@ When the page becomes visible again after `/open`:
 Profile (name, language, timezone, theme → `preferences.theme`) · Reading preferences (all fields of spec 08 §3.1 with
 explanations) · Sessions (devices, revoke) · Invites (left, create, list, copy link) · Export data ·
 Delete account (typed confirmation).
+Explain the 7-day restore window before deletion, show queued-unsynced action count, and require an
+online successful response before saying deletion completed. Export has a progress/cancel/error
+state. Offline storage has a "Clear downloaded articles" control and displays its 24-hour limit;
+clearing downloads does not silently discard unsent reader actions without confirmation.
 
 ---
 
@@ -262,4 +336,20 @@ shell and incognito contexts report `in-incognito` installability errors:
 - `navigator.serviceWorker.ready` resolves
 - the manifest link is present and valid
 - the Chrome DevTools Protocol call `Page.getInstallabilityErrors` returns `[]`
-- offline: after one online visit, `context.setOffline(true)` and a reload still render the cached list
+- offline: after one online visit, `context.setOffline(true)` and a reload still render the cached
+  list and a previously opened detail; uncached detail is clearly unavailable
+- queue a rating offline, reconnect and replay twice: exactly one feedback event and the correct
+  state remain. Test replay without Background Sync (including Firefox), a 401 pause, expired queue
+  entries, and a second device's conflicting edit
+- logout/login as another fixture account in the same browser and confirm no prior list, detail,
+  explanation, pending mutation or toast survives; account deletion clears every local private store
+- exact undo restores an earlier opposite rating, reason, read status and SHIFT-hide; bulk undo
+  refuses an intervening edit atomically
+- an excluded article is recoverable via Show hidden with its explanation; unhide clears only a
+  manual archive and does not remove a Never card or rule behind the user's back
+- keyboard/screen-reader focus across row removal, reason bar, sheet, toast and undo; reduced-motion
+  mode, browser zoom shortcuts and input/IME typing are unaffected
+
+Browser capability reference (checked 2026-09-25):
+[MDN Background Synchronization API](https://developer.mozilla.org/en-US/docs/Web/API/Background_Synchronization_API)
+documents limited browser support; foreground replay is therefore part of the acceptance gate.

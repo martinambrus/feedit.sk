@@ -4,6 +4,10 @@
 > prototypes, what the Jev demos and docs taught us, and the risks. It is reference material. The
 > executable plan is [`PLAN.md`](./PLAN.md), and the detailed specs are in [`specs/`](./specs/).
 > Nothing here overrides a spec. If they disagree, the spec wins.
+>
+> **Review note (2026-09-25):** provider benchmarks, prices, limits and community-model claims below
+> are dated research inputs, not measured FeedIt results. The specs require capability preflight,
+> workload-based cost measurement and held-out evaluation. Owner decisions are tracked in PLAN §17.
 
 ## 1. The idea in one page
 
@@ -261,14 +265,19 @@ Article text can argue for its own classification. The mitigations:
 ### 3.4 Cost at scale
 
 Cost scales with articles × distinct cards per feed, not with users. [`specs/05-classification.md`](./specs/05-classification.md) §9 has the
-numbers, which are cents to single dollars per day for thousands of users. Personal example forks are the
-one place where cost grows with each user, so cap them.
+illustrative estimates, not a capacity or budget guarantee for thousands of users. Distinct card
+texts, private-owner batches, revisions, retries, clustering and translation all increase work.
+Measure the actual beta workload at G1 and bound it with the shared spend guard and quotas.
 
 ### 3.5 Privacy
 
-Card texts and ratings are personal data. The article content sent to Jev is public. Only card text and
-example titles leave our system. Vercel AI Gateway supports zero data retention, and TypeSafe offers ZDR on
-enterprise plans.
+Card texts, examples and reading behavior can be personal data. The supported ingestion scope is
+public feeds; private/authenticated feeds need a different isolation design (PLAN §17). Article text,
+card criteria and example titles may reach the configured decision/translation providers. Verify
+the actual account's retention and processing terms before launch and describe those data flows
+accurately. Another gateway's policy or an enterprise-only promise does not establish the policy
+of FeedIt's configured direct API accounts. No production feedback is reused for cross-user model
+training or the golden set without the explicit opt-in specified in spec 10.
 
 ---
 

@@ -26,6 +26,10 @@
 >
 > Specs are **binding** and are the source of truth for behaviour. This file is the source of truth for
 > *order* and *done-ness*.
+>
+> **Review status (2026-09-25):** this is an implementation specification, not a claim that the app
+> or its integrations have passed tests. Open owner decisions are tracked in §17. Their gates apply
+> only to the affected work; proceed with independent fixture-based implementation.
 
 ---
 
@@ -43,6 +47,12 @@ run commands or open files. Every milestone below therefore has a ready-made **g
 - defines "done" as **evidence printed in the transcript**: a milestone report with every task ticked
   and its commit hash, plus the verbatim tail of the verification commands and their exit code
 - bounds the run with "or stop after N turns"
+
+This is a convenient execution wrapper, not a dependency of the application. If the installed agent
+does not support `/goal` or `TaskCreate`, use the same milestone text as an ordinary task and maintain
+the same task/evidence ledger. Follow the tool's actual permission configuration. See the
+[official `/goal` documentation](https://code.claude.com/docs/en/goal); never treat reaching a turn
+limit, a blocked prerequisite or a clean Git status as proof of feature completion.
 
 ### 0.2 Procedure for each milestone
 
@@ -75,6 +85,8 @@ run commands or open files. Every milestone below therefore has a ready-made **g
   - M3a-T2/T9 fetch the real golden feeds
   - M3b calls Jev, Ollama and LibreTranslate
   - M8-T7 fetches the starter-bundle feeds
+- This restriction concerns product data collection and paid inference, not dependency installation,
+  container pulls, documentation reads or security-advisory checks needed by the stated tasks.
 - **Scope:** do not implement other milestones' tasks. Stubs and interfaces that later milestones
   fill in are fine when a task says so.
 - **Parallel work inside a milestone:**
@@ -115,6 +127,27 @@ D-3 (M1-T6): … / none
 ### Notes for the next milestone
 …
 ```
+
+### 0.5 Cross-cutting completion contract
+
+- **Durable work:** every state mutation needing async work writes its outbox intent atomically
+  (specs 02–03). Verify rollback, crash after commit, relay crash after enqueue, duplicate delivery
+  and lease expiry. Queue singleton keys are an optimization, not an exactly-once guarantee.
+- **Freshness:** derived text, answers and scores are valid only for their recorded input revision,
+  question/state fingerprints and ranking context. Delayed results cannot overwrite newer edits or
+  recreate a deleted user's data. Missing/prefiltered answers are unknown, never negative evidence.
+- **Isolation:** fixtures contain at least two users sharing feeds, with private cards/examples and
+  different state. Test direct database grants/RLS and every object-ID API boundary, including
+  offline replay after logout and account switching.
+- **Negative paths:** each stage has bounded retries, a recoverable terminal reason and a reader-visible
+  fallback. No-op stubs are registered for development discovery only: dispatch to an unimplemented
+  stage stops with `stage_unavailable`, preserving its durable pending intent. It must not complete
+  and discard real work. Production startup refuses any unimplemented required handler.
+- **Honest evidence:** `passed`, `failed`, `blocked`, `not run` and `not applicable` are distinct.
+  Report the exact commit, config/fixture versions and commands. A blocked task may end an agent
+  session but does not complete its milestone or satisfy a downstream dependency.
+- **Scope:** implementation is in the new repository described by spec 01. This documentation review
+  does not authorize deploying over the existing PHP/MongoDB app or migrating its data.
 
 ---
 
@@ -184,16 +217,27 @@ Background and rationale: [`background.md`](./background.md).
 
 ## 4. Milestone map
 
-```
-M0 Foundations
- ├─► M1 Ingestion ─────────┬─► M3a Eval tooling ─► [humans rate ~1–2 weeks] ─► M3b G1 gate ─┐
- └─► M2 Classification ────┤                                                                │
-                           ├─► M4 API (needs M1+M2) ──┐                                     │
-                           └─► M5 Ranking (M1+M2) ────┴─► M6 Web app ─► M7 Learning ◄───────┤ (M7-T7 needs M3b)
-                                                                          │                 │
-                                                                          └─► M8 Ops & launch ◄┘ (G1 settings applied)
-                                                                                    └─► 🚀 invite-only beta
-M9 Optional extensions (Laya, image proxy, …): after launch
+```mermaid
+flowchart TD
+  M0["M0 Foundations"] --> M1["M1 Ingestion"]
+  M0 --> M2["M2 Classification"]
+  M1 --> M3a["M3a Evaluation tooling"]
+  M2 --> M3a
+  M1 --> M4["M4 API"]
+  M2 --> M4
+  M1 --> M5["M5 Ranking"]
+  M2 --> M5
+  M3a --> H["Human ratings and frozen dataset"]
+  H --> M3b["M3b G1"]
+  M4 --> M6["M6 PWA"]
+  M5 --> M6
+  M6 --> M7["M7 Learning"]
+  M3b -->|"PASS for T7"| M7
+  M6 --> M8["M8 Operations"]
+  M7 -->|"all tasks for launch"| L["Invite-only beta"]
+  M8 -->|"all launch gates"| L
+  M3b -->|"PASS applied"| L
+  L --> M9["M9 Optional extensions"]
 ```
 
 | Milestone | Depends on (merged to `main`) | Can run in parallel with | Autonomous? | Size |
@@ -207,7 +251,7 @@ M9 Optional extensions (Laya, image proxy, …): after launch
 | **M5** Ranking & lanes | M1, M2 | M3a, M4 | yes | M |
 | **M6** Web app (PWA) | M4, M5 | M3b | yes | L |
 | **M7** Personal learning & suggestions | M4, M5, M6 (its goal runs E2E), and **M3b for T7** (run T7 last, after M3b is merged) | M8 | yes | M |
-| **M8** Operations & launch readiness | M4, M5, M6, and M3b applied | M7 | mostly (one-time host setup is manual) | M |
+| **M8** Operations & launch readiness | M4, M5, M6, and M3b applied; final launch gate also requires all M7 | M7 implementation only | mostly (one-time host setup is manual) | M |
 | **M9** Optional extensions | launch | — | per item | — |
 
 **Shared registration points:**
@@ -217,6 +261,11 @@ M9 Optional extensions (Laya, image proxy, …): after launch
 - Later milestones replace the stubs: M1 fetch/extract, M2 translate/enrich/match/cluster/backfill,
   M5 rank, M7 learn/suggest, M8 house jobs.
 - Merge conflicts are limited to one-line map entries.
+
+M6 and M7 work done before G1 passes is speculative implementation. A G1 FAIL or INCONCLUSIVE
+result freezes further dependent work and launch until the owner resolves it; previously completed
+fixture tests do not override this gate. M8 can prepare operations in parallel with M7, but cannot
+declare launch ready while any M7 task or owner launch gate is outstanding.
 
 ---
 
@@ -247,8 +296,8 @@ Complete milestone M0 "Foundations" exactly as specified in docs/PLAN.md §5, fo
 | M0-T4 | `packages/testing` (part 1): per-worktree test databases from a template, fixture HTTP server | T1, T3 | B | 01 §6; 02 §1.1 |
 | M0-T5 | `packages/db`: schema, grants, RLS, SQL functions, pg-boss schema and queues in the migrate job, `withTenant`, factories (testing part 2), schema parity and RLS tests | T2, T3, T4 | A | 02 all; 03 §2 |
 | M0-T6 | Seed runner (`apps/worker/src/seed.ts`) and settings defaults | T5 | A | 02 §2; 05 §2 (mechanism only) |
-| M0-T7 | App skeletons (api, worker, web, eval), handler map, `pipeline.ts` stubs | T2, T5 | C | 01 §2, §4; 03 §1–2; 08 §10 |
-| M0-T8 | CI workflow and `CLAUDE.md` | T1 | C | 01 §6–7, §10 |
+| M0-T7 | App skeletons (api, worker, web, eval), durable outbox relay, handler map, `pipeline.ts` stubs | T2, T5 | C | 01 §2, §4; 03 §1–2; 08 §10 |
+| M0-T8 | CI workflow and `CLAUDE.md` | T1; verification after T5–T7 | C | 01 §6–7, §10 |
 
 **Done when** (per task):
 
@@ -266,7 +315,8 @@ Complete milestone M0 "Foundations" exactly as specified in docs/PLAN.md §5, fo
   - `loadConfig({process})` covers **every** variable in spec 01 §3, with defaults and zod validation.
     Tests: `DATABASE_URL_WORKER` missing for worker fails and passes for api;
     `FETCH_ALLOW_PRIVATE=true` or `RATE_LIMITS_ENABLED=false` with `NODE_ENV=production` fails.
-  - `settings.ts` has a zod schema and a default for every key in spec 02 §2.
+  - `settings.ts` has a zod schema and a default for every key in spec 02 §2, including the canonical
+    `RankerConfig` schema/defaults in `shared` (ranker consumes or re-exports them).
   - `jobs.ts` has every queue of spec 03 §2 with its payload schema, options and enqueue helpers over a
     `JobSender` interface.
   - Also: `plans.ts`, the `UserPreferences` schema with defaults, `dto/explain.ts`, `ports.ts`
@@ -287,7 +337,8 @@ Complete milestone M0 "Foundations" exactly as specified in docs/PLAN.md §5, fo
   - `docker compose -f infra/compose.test.yml up -d --no-recreate` works. A `psql` check lists the
     database `feedit` owned by `feedit_owner`, the three roles (the owner and the worker with
     BYPASSRLS), and the extensions.
-  - Every doc and script uses `--no-recreate` for the shared containers.
+  - Dev/test docs and scripts use `--no-recreate` for shared containers. Production deploys follow
+    spec 11 and must actually replace changed application images.
 - **T4:**
   - The test-DB helper implements spec 02 §1.1:
     - templates `feedit_template_<journal-hash>`, created under an advisory lock with the extensions
@@ -301,8 +352,8 @@ Complete milestone M0 "Foundations" exactly as specified in docs/PLAN.md §5, fo
   - The fixture HTTP server serves files and scripted redirects and statuses on a random port.
 - **T5:**
   - Drizzle schema plus SQL migrations implement spec 02 §1.2–§7 (not the `eval` schema, which is M3a),
-    including default privileges, the explicit grant table, RLS, and the four SECURITY DEFINER
-    functions with their EXECUTE grants.
+    including explicit grants, RLS, all specified SECURITY DEFINER functions with their EXECUTE
+    grants, and the durable outbox/revision/lease contracts.
   - The migrate job also creates the pg-boss schema and every queue from `jobs.ts`.
   - Factories: user, feed, article, card, subscription.
   - `schema-parity.int.test.ts` passes against the hand-written `expected-schema.json`.
@@ -310,7 +361,9 @@ Complete milestone M0 "Foundations" exactly as specified in docs/PLAN.md §5, fo
     cannot select, insert, update or delete B's rows.
   - The refresh functions are correct in both calling contexts of spec 02 §6 (as app inside
     `withTenant(A)` with A and B subscribed, and as worker), and never drop B's rows.
-  - An API-role connection can `send()` a pg-boss job.
+  - The API role can persist only authorized outbox intents; the relay can deliver them to pg-boss.
+    A committed intent survives a process restart; rollback removes it. End-to-end relay crash
+    verification completes in T7 after the worker exists.
 - **T6:** `pnpm db:seed` runs idempotently. It inserts only `card_text_mode` and
   `question_sets.active = {}` (spec 02 §2), and provides the hooks M2 fills (topics, question sets,
   library). Running it twice changes nothing (a test).
@@ -318,8 +371,9 @@ Complete milestone M0 "Foundations" exactly as specified in docs/PLAN.md §5, fo
   - `apps/api` `buildServer()` with `/api/v1/healthz` and `/readyz` (readyz compares the newest applied
     migration with the bundled journal), tested with inject.
   - `apps/worker` boots pg-boss (`migrate: false`) and registers handlers from the map, with a **stub
-    for every queue** in spec 03 §2 (each stub logs and completes). `pipeline.ts` has
-    `after(stage, …)` with the stage order of spec 03 §1.
+    for every queue** in spec 03 §2 (unimplemented stages preserve pending work per §0.5). `pipeline.ts` has
+    `after(stage, …)` with the stage order of spec 03 §1. The worker runs the outbox relay and
+    tests prove crash-after-send replay, guarded lease completion and unavailable-stage retention.
   - `apps/web`: a Vite + React + TanStack Router + Tailwind + i18next shell rendering a localized
     "FeedIt" page, with the per-feature i18n layout.
   - `apps/eval`: a commander CLI with `--help`.
@@ -395,8 +449,9 @@ Complete milestone M1 "Ingestion core" exactly as specified in docs/PLAN.md §6,
   - OPML import covers nested folders, duplicates and invalid entries (reported as
     `{index, url, reason}`); the export round-trips.
 - **T7:**
-  - Handlers implement spec 03 §7: exact, guid and near-duplicate matching; stale marking; a title
-    change calls `resetArticleAnswers`.
+  - Handlers implement spec 03 §7: exact URL and feed-scoped GUID identity; fuzzy candidates are
+    clustering hints, not destructive merges; stale marking; a title/excerpt/source
+    change increments the input revision and calls `resetArticleAnswers`.
   - They implement the §9 feed updates, including the permanent-redirect merge (subscriptions,
     `feed_items`, scopes and rule values moved; a full rank enqueued).
   - `article.extract` performs the redirect and `rel=canonical` alias/merge, then calls
@@ -414,6 +469,8 @@ Complete milestone M1 "Ingestion core" exactly as specified in docs/PLAN.md §6,
   - stale items are not extracted
   - a second feed newly carrying an already-matched article gets that feed's cards queued in
     `match_queue`
+  - merging preserves ratings/bookmarks/labels/read state for both users; old jobs resolve survivor
+    aliases; out-of-order fetch/extraction results cannot overwrite a newer revision
 - **T9:** the CLI commands work against the dev DB. The output is shown for a fixture feed, including
   auto-creating the dev user.
 
@@ -453,8 +510,8 @@ Complete milestone M2 "Decision engine and classification" exactly as specified 
 | M2-T7 | `packages/translate`: LibreTranslate and Ollama translators, `assessTranslation`, best-row selection | — | B | 07 |
 | M2-T8 | Card and label lifecycle repository (immutability, forks, title overrides, labels with `array_replace`, effects) | — | C | 05 §5.1, §5.3 |
 | M2-T9 | Worker handlers: `article.translate`, `article.enrich`, `article.match`, `card.backfill`, `article.cluster`, `house.rescore-degraded` | T3, T5, T7, T8 | D | 05 §3–6; 07 §3; 04 §5; 03 §1 |
-| M2-T10 | Ranker bootstrap: `cardScore`, BM25 (window corpus), `RANKER_VERSION` and `scoreVersion()` in `packages/ranker` | T5 | E | 06 §4.1, §7, §9 |
-| M2-T11 | Integration tests: classification end-to-end, breaker, budget, degraded path, backfill | T9 | D | 04 §10; 05 §11 |
+| M2-T10 | Ranker bootstrap: `cardScore`, BM25 (window corpus), lane/tier boundary helpers, `RANKER_VERSION` and composite `scoreVersion()` in `packages/ranker`; consume shared `RankerConfig` | T5 | E | 06 §4.1, §7, §9 |
+| M2-T11 | Integration tests: classification end-to-end, breaker, budget, degraded path, backfill | T4, T6, T9, T10 | D | 04 §10; 05 §11 |
 
 **Done when:**
 
@@ -463,7 +520,7 @@ Complete milestone M2 "Decision engine and classification" exactly as specified 
 - **T2:**
   - Fixture tests for 200 (all three answer types), 401, 422 and 429 (with `Retry-After`).
   - The request body matches spec 04 §3 exactly (snapshot).
-  - Cost = input tokens × price.
+  - Cost = input tokens × price per million ÷ 1,000,000; retries/fallback attempts are included.
   - The fake server implements the spec 04 §10 answer rules, `failRate` (deterministic per logical
     request) and `latencyMs`. Unit tests cover each rule.
 - **T3:**
@@ -471,10 +528,12 @@ Complete milestone M2 "Decision engine and classification" exactly as specified 
     mode; the mirror written to `settings`; reset by `resetRequested` within one poll; the spend guard
     (UTC day, `kind='eval'` excluded, the 10 % interactive allowance, `budgetOverrideUsd`); rate-limiter
     waits.
-  - One `engine_calls` row per logical call.
+  - One `engine_calls` row per wire attempt, linked by logical request ID; atomic reservations
+    prevent concurrent calls from exceeding the budget. Crash/timeout uncertainty remains charged
+    conservatively until reconciled (spec 04).
   - `usage_daily` upserts (integration).
   - Crossings recorded in `engine.budget_alerts` without sending email.
-- **T4:** schema generation tests for noul/choice/score; post-processing normalizes; a malformed-JSON
+- **T4:** bounded JSON prompt/validation tests for noul/choice/score; post-processing normalizes; a malformed-JSON
   fixture → `error`; router tests prove it is used only when enabled, interactive, under the daily cap
   and with its own breaker closed.
 - **T5:**
@@ -489,7 +548,8 @@ Complete milestone M2 "Decision engine and classification" exactly as specified 
 - **T6:**
   - ≥ 150 library cards, ≥ 5 per L1 (except `other`), ≥ 15 SK/CZ-specific, including the 10 examples
     of spec 05 §8.
-  - A validation test enforces the authoring rules (length, no "not" in `interest`, topic ids exist).
+  - A validation test enforces length, structure and valid topic IDs; positive wording is guidance,
+    not a substring ban that rejects words containing “not” or legitimate interests (spec 05).
   - The seed is idempotent.
   - A changed library text follows the slug rules (new card, slug moved, holders re-pointed; tested).
   - `question_sets.active` is filled only for absent kinds.
@@ -504,19 +564,22 @@ Complete milestone M2 "Decision engine and classification" exactly as specified 
   - `refresh_feed_cards` in the same transaction
   - the returned effects
 - **T9:**
-  - Handlers implement spec 05 §5.5 exactly: `SKIP LOCKED` claim; skip only `typesafe`/`laya` answers;
-    prefilter; L2 questions; packing; `answered_at`; attempts, and `degraded` after dropped rows;
-    re-enqueue when rows remain.
+  - Handlers implement spec 05 §5.5: short leased `SKIP LOCKED` claims, current revision/fingerprint
+    checks, separate private-owner batches, provisional prefilter semantics, L2-only work, packing
+    and guarded completion. Exhausted rows remain recoverable; incomplete coverage is per reader.
   - Enrich outcomes: engine unavailable → `degraded` plus rank enqueued for all subscribers;
     `invalid_request` → `failed`.
   - The cluster candidate SQL of spec 05 §6, with the per-feed rule in code.
-  - The backfill inserts queue rows with priorities 2/6 and a cap of 500, skipping answered pairs.
+  - Backfill inserts queue rows with priorities 2/6 in pages of 500, skipping only current answered
+    pairs and persisting continuation until the complete eligible window is covered.
   - `pipeline.after` runs extract → (translate) → enrich → cluster + match.
   - `house.rescore-degraded` re-enqueues degraded and `llm`-answered articles, reading the breaker
     **mirror**.
 - **T10:** unit tests for the strength weights, scope and missing answers; BM25 ordering on a
   hand-made corpus with window-level document frequencies; `P = 1 − exp(−s/3)`;
-  `scoreVersion(v) = RANKER_VERSION*10000 + v` exported for the API and the rank handler.
+  the composite `scoreVersion()` key of spec 06 §7 is exported for the API/rank handler;
+  global version changes are collision-free and per-user/context changes invalidate rank revisions.
+  Pure lane/tier helpers support evaluation before M5 implements the full production ranker.
 - **T11:**
   - `classification.e2e.test.ts`: a seeded article, 3 cards and 1 label, against the fake TypeSafe
     server → `article_facets`, `card_answers`, `article_topics_l2`, and `pipeline_state='matched'`.
@@ -553,11 +616,11 @@ Complete milestone M3a "Evaluation tooling and golden-set collection" exactly as
 |---|---|---|---|---|
 | M3a-T1 | `eval` schema migration (incl. `eval.sample`, grants) and the eval system user | — | A | 02 §7 |
 | M3a-T2 | CLI skeleton; `feeds-golden.txt` (18–22 feeds per language); `ingest-sample` (worker heartbeat check, drain wait, `--watch`); `sample`; `status` | T1 | A | 10 §2.1 |
-| M3a-T3 | Rating server: rater add/token (`EVAL_PUBLIC_URL`), card-writing step, feed picking, assignment algorithm, blind rating UI | T1 | B | 10 §2.2, §2.4 |
+| M3a-T3 | Rating server: rater add/token (`EVAL_PUBLIC_URL`), card-writing step, feed picking, assignment algorithm, blind rating UI | T1, T2 | B | 10 §2.2, §2.4 |
 | M3a-T4 | Facet labelling page | T3 | B | 10 §2.3 |
 | M3a-T5 | Metrics library | — | C | 10 §4 |
-| M3a-T6 | Experiment runner (eval router with `budgetOverrideUsd`, `ignoreDailyCaps`, `kind:'eval'`, `EVAL_CACHE_DIR` cache, estimate, `--yes`/`--max-usd`); experiments B0, B1, B1-T, E1, E2, E3, E3b, E4 (E5 stub); `eval replay` | T1 | D | 10 §3, §6 |
-| M3a-T7 | Report generator, decision rules, `apps/eval/config/g1.json` schema, `apply-g1` with the field → settings mapping | T5, T6 | C | 10 §1, §5 |
+| M3a-T6 | Experiment runner (eval router with `budgetOverrideUsd`, `ignoreDailyCaps`, `kind:'eval'`, `EVAL_CACHE_DIR` cache, estimate, `--yes`/`--max-usd`); experiments B0, B1, B1-T, E1, E2, E3, E3b, E4 (E5 stub); `eval replay` | T1, T2 | D | 10 §3, §6 |
+| M3a-T7 | Report generator, decision rules, `apps/eval/config/g1.json` schema, `apply-g1` with the field → settings mapping | T2, T5, T6 | C | 10 §1, §5 |
 | M3a-T8 | `eval dry-run` in the separate `feedit_eval_dryrun` database: simulated raters and the fake engine → full report | T3–T7 | D | 10 all |
 | M3a-T9 | Real sample ingested and the rater onboarding kit | T2, T3 | A | 10 §2 |
 
@@ -569,7 +632,10 @@ Complete milestone M3a "Evaluation tooling and golden-set collection" exactly as
   - `feeds-golden.txt` has 18–22 feeds per language and the category mix of spec 10 §2.1.
   - `ingest-sample --dry-run` lists the feeds and their reachability.
   - `ingest-sample` exits with instructions if no worker heartbeat is found.
-  - `sample` stores up to 500/500/500 in `eval.sample` (an integration test on fixture data).
+  - `sample` stores up to 500/500/500 in `eval.sample` with frozen input snapshots, story-grouped
+    development/test splits and reproducible hashes (integration tests on fixture data).
+  - Ordinary workers cannot consume the isolated golden database's queues; a heartbeat alone is
+    not sufficient isolation.
   - `status` prints per-language and per-rater counts.
 - **T3:**
   - Integration tests cover:
@@ -578,7 +644,7 @@ Complete milestone M3a "Evaluation tooling and golden-set collection" exactly as
     - the assignment algorithm (equal language split, top-up, deterministic shuffle)
     - the blind page (no model fields in the HTML)
     - keyboard handlers, and rating persistence and change
-  - Token-cookie auth.
+  - Token-cookie auth, one-time URL exchange/redaction, rater-scoped access and revocation.
   - Pages work at a 375 px width (a DOM test).
 - **T4:** the labelling page stores all six fields; the second labeller's overlap subset is chosen
   deterministically.
@@ -594,7 +660,8 @@ Complete milestone M3a "Evaluation tooling and golden-set collection" exactly as
 - **T7:**
   - The report renders every table of spec 10 §4 and one reliability SVG per language.
   - The decision rules of spec 10 §5 are pure functions with a unit test for every branch: E*
-    eligibility, the tier-2 cap field, per-language pooling, and the isotonic fallback.
+    eligibility, split isolation, actual composed production configuration, insufficient-coverage
+    INCONCLUSIVE state, tier-2 cap, per-language pooling and the isotonic fallback.
   - `apps/eval/config/g1.json` validates against a zod schema.
   - `apply-g1` writes exactly the settings in the spec 10 §1 mapping table.
 - **T8:**
@@ -611,20 +678,21 @@ Complete milestone M3a "Evaluation tooling and golden-set collection" exactly as
   - `eval rater add` printed a working URL for the owner.
 
 **Milestone done when:** all tasks are done, the full check passes, the dry-run report exists, and the
-real sample has ≥ 300 articles per language (or the report explains a shortfall and `--watch` is
-running).
+real sample has ≥ 300 articles per language. A shortfall is reported as collection pending with
+a monitoring command; a background `--watch` process is not completion evidence.
 
 ### 8.1 Human step (between M3a and M3b, about 1–2 weeks, in parallel with M4–M6)
 
-1. Keep a worker running with `EVAL_INGEST_ONLY=true` (or `ingest-sample --watch`) so the sample keeps
-   growing.
+1. Keep the dedicated evaluation worker/database running with `EVAL_INGEST_ONLY=true` so candidate
+   articles keep growing; do not mutate frozen rated samples. `ingest-sample --watch` monitors it.
 2. Start the rating server on the dev box (`pnpm evaluate serve-rating`) and expose
-   it through a tunnel (`docs/eval/TUNNEL.md`). `golden-v1` lives in the dev database.
+   it through a tunnel (`docs/eval/TUNNEL.md`). `golden-v1` lives in a dedicated evaluation database on the dev host.
 3. Add 3–5 raters (`eval rater add --name … --langs …`) and send them their URLs and `RATERS.md`.
 4. Each rater writes 5–10 interests, picks ≥ 10 feeds, and rates ≥ 250 articles.
 5. The owner labels facets for 100 articles per language (a second person labels 50 if possible).
-6. Check progress with `eval status`, and back up the golden set (`pg_dump -n eval`). Continue with
-   M3b once every rater has ≥ 250 ratings.
+6. Check progress with `eval status` and back up the self-contained golden snapshot plus referenced
+   content/cards/feeds (spec 10). An eval-schema-only dump cannot restore its public-table foreign
+   keys. Continue to M3b only when the coverage/split preflight in spec 10 passes.
 
 ---
 
@@ -635,25 +703,26 @@ G1 report and `apps/eval/config/g1.json` are committed. Either the core bet pass
 (dev), or the build stops with a clear report for the owner.
 
 **Needs:** `TYPESAFE_API_KEY`, `OLLAMA_API_KEY`, LibreTranslate running (`--profile translate`),
-network access, and the dev database holding `golden-v1`.
+network access, and the isolated golden database holding `golden-v1`. Preflight verifies the installed MT language
+paths and both providers' actual model/response capabilities; unsupported experiment variants are
+reported as blocked, never replaced by mislabeled native/fallback output.
 
 **Goal text:**
 
 ```
-Complete milestone M3b "Run gate G1" as specified in docs/PLAN.md §9 and docs/specs/10-evaluation.md §3–§5. Read those sections first and create one task per row of the M3b task table. Live calls to TypeSafe Jev, Ollama Cloud and the local LibreTranslate are allowed in this milestone; run every experiment with `--yes --max-usd <10 minus the actual spend so far>`, print the estimate before each experiment and the actual cost after, and keep the total under $10. Constraints: do not change the decision rules or thresholds of spec 10 §5 to get a different outcome; do not change locked decisions; commit the report and config as "M3b-T<n>: <summary>". The goal is met only when the transcript shows (1) a final "M3b report" in the format of PLAN.md §0.4 (the Verification section may show only `pnpm typecheck` because no code changes) listing M3b-T1…M3b-T4, (2) the printed G1 decision table from the committed report apps/eval/reports/G1-<date>.md with every rule's inputs and result, (3) either "CORE BET: PASS" with apps/eval/config/g1.json committed and the `eval apply-g1` output listing the settings written, or "CORE BET: FAIL" with the failure summary of spec 10 §5 rule 1 printed for the owner, (4) the total actual spend printed, and (5) `git status --short` printing nothing. Or stop after 80 turns and print what is missing.
+Complete milestone M3b "Run gate G1" as specified in docs/PLAN.md §9 and docs/specs/10-evaluation.md §3–§5. Read those sections first and create one task per row of the M3b task table. Live calls to TypeSafe Jev, Ollama Cloud and the local LibreTranslate are allowed in this milestone; run every experiment with `--yes --max-usd <10 minus the actual spend so far>`, print the estimate before each experiment and the actual cost after, and keep the total under $10. Constraints: do not change the decision rules or thresholds of spec 10 §5 to get a different outcome; do not change locked decisions; commit the report and config as "M3b-T<n>: <summary>". The goal is met only when the transcript shows (1) a final "M3b report" in the format of PLAN.md §0.4 (the Verification section may show only `pnpm typecheck` because no code changes) listing M3b-T1…M3b-T4, (2) the printed G1 decision table from the committed report apps/eval/reports/G1-<date>.md with every rule's inputs and result, (3) either "CORE BET: PASS" with apps/eval/config/g1.json committed and the `eval apply-g1` output listing the settings written, or "CORE BET: FAIL/INCONCLUSIVE" with the failure/coverage summary of spec 10 §5 printed for the owner, (4) the total actual spend printed, and (5) `git status --short` printing nothing. Or stop after 80 turns and print what is missing.
 ```
 
 **Tasks**
 
 | ID | Task | Needs | Specs |
 |---|---|---|---|
-| M3b-T1 | Preflight: `eval status` shows ≥ 250 ratings for every rater and the facet labels present; keys valid (one tiny call each); LibreTranslate healthy; total estimate printed | ratings | 10 §2–3 |
+| M3b-T1 | Preflight: coverage/classes/facets and frozen split pass spec 10 readiness; actual model/MT capabilities verified; keys valid with budgeted tiny calls; total estimate printed | ratings | 10 §2–3 |
 | M3b-T2 | Run B0, B1, B1-T, E1, E2, E3, E3b, E4 (E5 only if Laya is installed), each with `--yes --max-usd <10 − spent so far>` | T1 | 10 §3 |
-| M3b-T3 | Generate the report, apply the decision rules, write `apps/eval/config/g1.json` (including `runs`), commit | T2 | 10 §1, §4–5 |
-| M3b-T4 | On PASS: `apply-g1` to the dev settings, and record the production values to apply in `docs/DECISIONS.md` (daily budget, language modes, card text mode, thresholds, tier-2 cap). On FAIL: write `docs/G1-FAIL.md` with the rule 1 details and the 20 worst-ranked liked articles | T3 | 10 §1, §5 |
+| M3b-T3 | Select/tune only on development groups; lock config and evaluate held-out production policy; report PASS/FAIL/INCONCLUSIVE; write `apps/eval/config/g1.json` (runs/snapshot/split hashes), commit | T2 | 10 §1, §4–5 |
+| M3b-T4 | On PASS: `apply-g1` to the dev settings, and record the production values to apply in `docs/DECISIONS.md` (daily budget recommendation, language modes, card text mode, thresholds, tier-2 cap; Q1 governs production cap increases). On FAIL/INCONCLUSIVE: write `docs/G1-FAIL.md` with the rule 1 details and the 20 worst-ranked liked articles | T3 | 10 §1, §5 |
 
-**Milestone done when:** the report is committed and the goal evidence is printed. **If G1 fails, do
-not proceed to M6–M8 until the owner decides.**
+**Milestone done when:** the report is committed and the goal evidence is printed. **If G1 fails or is inconclusive, freeze dependent work and launch until the owner decides (§4).**
 
 ---
 
@@ -675,7 +744,7 @@ and the learn trigger), spec 03 §10–11, spec 07 §5 (card text translation).
 **Goal text:**
 
 ```
-Complete milestone M4 "HTTP API" exactly as specified in docs/PLAN.md §10 and docs/specs/08-api.md, using the existing packages (shared, db, questions, feeds, translate, ranker types) and the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §10 and the referenced specs first, create one task per row of the M4 task table, and implement them in dependency order, using subagents for independent lanes under the parallel-work rules of PLAN.md §0.3. Commit each task as "<task-id>: <summary>". Constraints: every per-user query runs through req.withTx/TenantTx under RLS as feedit_app; jobs are enqueued only through packages/shared/src/jobs.ts after commit; no live third-party calls in tests (emails use MAIL_TRANSPORT=log); locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M4 report" in the format of PLAN.md §0.4 listing M4-T1…M4-T11 each with ✓, commit hash and evidence, and every M4 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, plus the result lines of the named tests api-rls-isolation.int.test.ts and api-operations.test.ts, and (3) `git status --short` printing nothing. Or stop after 220 turns and print the report with the unfinished items.
+Complete milestone M4 "HTTP API" exactly as specified in docs/PLAN.md §10 and docs/specs/08-api.md, using the existing packages (shared, db, questions, feeds, translate, ranker types) and the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §10 and the referenced specs first, create one task per row of the M4 task table, and implement them in dependency order, using subagents for independent lanes under the parallel-work rules of PLAN.md §0.3. Commit each task as "<task-id>: <summary>". Constraints: every tenant-owned query runs through req.withTx/TenantTx under RLS as feedit_app; auth/control-plane repositories follow spec 02 explicit exceptions; state and async intents commit atomically through the outbox; its relay enqueues via packages/shared/src/jobs.ts; no live third-party calls in tests (emails use MAIL_TRANSPORT=log); locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M4 report" in the format of PLAN.md §0.4 listing M4-T1…M4-T11 each with ✓, commit hash and evidence, and every M4 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int` run after the last commit, ending with exit code 0, plus the result lines of the named tests api-rls-isolation.int.test.ts and api-operations.test.ts, and (3) `git status --short` printing nothing. Or stop after 220 turns and print the report with the unfinished items.
 ```
 
 **Tasks**
@@ -706,7 +775,8 @@ Complete milestone M4 "HTTP API" exactly as specified in docs/PLAN.md §10 and d
 - **T2:**
   - Every row of the `request-code` decision table is tested, including the admin bootstrap with an
     empty `invites` table and a soft-deleted user.
-  - Code TTL and the attempt limit; the locale stored on the code row.
+  - Code TTL/attempt limits, simultaneous verification/resend, invite-consumption and quota races;
+    the locale stored on the code row.
   - Signup consumes the invite; the admin role is re-applied on every verify.
   - Restore on verify refreshes the feeds and ranks.
   - Cookie attributes, session sliding and revocation.
@@ -731,14 +801,18 @@ Complete milestone M4 "HTTP API" exactly as specified in docs/PLAN.md §10 and d
   - Lanes and statuses filter correctly, with folding applied before filtering (the mixed
     `allow_duplicates` case is tested).
   - Bookmarks default to `status=all` and ignore the window.
-  - Each sort order is stable under cursor pagination (a property test over 200 seeded items).
+  - Each sort order follows the declared cursor/snapshot contract under reranking, new arrivals,
+    expired cursors, account/filter mismatch and equal sort keys (property/integration tests).
   - The counts agree with the list totals and include `scored` and `total`.
   - An outdated `score_version` enqueues a full rank.
-  - The 404 rule.
+  - The 404 rule. `lane=hidden` supports explicit review/recovery without appearing in normal
+    lanes; explicit hide undo/unhide works and model/rule hiding links to the relevant control.
 - **T7:**
   - Every action is tested, including un-rate, hide, bulk rate with `null` (undo), a prompt answer
     stored as a rating, `unread` recorded, and mute-story creating a cluster when missing.
-  - `/dwell` sets `feedback_prompted_at` when it answers `prompt:true`.
+  - `/dwell` validates bounded durations and sets `feedback_prompted_at` when it answers `prompt:true`.
+  - Mutations retry with the same idempotency key; conditional undo restores prior values and
+    rejects conflicting later edits. Mixed valid/foreign bulk IDs cannot partly mutate another user.
   - The learn trigger fires at the 10th, 20th … explicit label since the last training.
 - **T8:** value validation per kind; creating or deleting a rule enqueues `user.rank {full:true}`.
 - **T9:**
@@ -756,7 +830,7 @@ Complete milestone M4 "HTTP API" exactly as specified in docs/PLAN.md §10 and d
   - `api-rls-isolation.int.test.ts` calls **every** GET endpoint as user A with B's data seeded (shared
     cards with B's private fork, B's labels, rules, bookmarks) and asserts no leakage.
   - Every mutation endpoint passes as `feedit_app` (grants).
-  - `send()` works as the API role.
+  - Transactional outbox rollback/restart and relay duplicate-delivery tests pass.
   - The OpenAPI snapshot is committed.
   - `api-operations.test.ts` asserts that the OpenAPI operations equal
     `apps/api/test/expected-operations.txt`, which is hand-written from spec 08.
@@ -783,7 +857,7 @@ Complete milestone M5 "Ranking and lanes" exactly as specified in docs/PLAN.md �
 
 | ID | Task | Needs | Lane | Specs |
 |---|---|---|---|---|
-| M5-T1 | `RankerConfig` and the settings override loader (using `RANKER_VERSION`/`scoreVersion` from M2-T10) | — | A | 06 §7, §11 |
+| M5-T1 | Shared `RankerConfig` consumer and the settings override loader (using `RANKER_VERSION`/`scoreVersion` from M2-T10) | — | A | 06 §7, §11 |
 | M5-T2 | `rankArticle` with the normative precedence: rules, never, card score, demotions, BM25 path, floors and caps, story rule, label suggestions, `Explain` | T1 | A | 06 §1–6, §9 |
 | M5-T3 | Property tests and truth tables | T2 | B | 06 §12 |
 | M5-T4 | `user.rank` handler: context loading (window BM25 corpus, read clusters), the dirty set, batch loads, upserts; wired to the `jobs.ts` rank helpers (incremental vs full) | T2 | C | 06 §7; 03 §2 |
@@ -792,8 +866,9 @@ Complete milestone M5 "Ranking and lanes" exactly as specified in docs/PLAN.md �
 
 **Done when:**
 
-- **T1:** defaults exactly as spec 06 §11; settings overrides validated (invalid JSON → defaults plus a
-  warning); the handler computes `score_version` with `scoreVersion(settings_version)`.
+- **T1:** defaults exactly as spec 06 §11; settings overrides validated, malformed persisted settings
+  fail visibly rather than silently changing ranking; the handler computes the composite version
+  and per-user rank revision specified in spec 06 §7.
 - **T2:**
   - Every step of the spec 06 §2 algorithm has a test.
   - Every rule code in spec 06 §3.2 is produced by at least one test.
@@ -808,11 +883,13 @@ Complete milestone M5 "Ranking and lanes" exactly as specified in docs/PLAN.md �
 - **T3:** fast-check monotonicity; lane and tier boundary tables; demotion activation tri-state,
   including `staleDislikes90d`.
 - **T4:**
-  - The dirty-set SQL covers all five conditions (a test each).
+  - The dirty-set SQL covers every freshness trigger in spec 06 §7, including time, undo, model,
+    translated card text and subscription changes (a test each).
   - `full` re-ranks the window, and is never swallowed by a pending incremental job (tested through
     `jobs.ts`).
   - Reader-state columns are never modified (asserted).
-  - A second run with nothing dirty writes 0 rows.
+  - A second run with nothing dirty writes 0 rows; >5,000 eligible items drain in bounded batches,
+    clock-only invalidations run, and stale rank jobs fail their revision guard.
   - The BM25 document frequencies come from the whole window.
 - **T5:** a `maybe` item whose best translation is tier-1 `weak` and has no `ollama` row enqueues
   `article.translate {forceTier2:true}` once; expired rules are removed hourly and trigger a full rank.
@@ -849,15 +926,15 @@ Complete milestone M6 "Web app" exactly as specified in docs/PLAN.md §12 and do
 | M6-T5 | Onboarding wizard (feeds, bundles, interests, calibration round, `onboardingCompletedAt`) | T2 | C | 09 §4 |
 | M6-T6 | Feeds manager (folders), Interests (cards, library, suggestions, editor), Labels, Rules, Settings | T1 | C | 09 §5–7 |
 | M6-T7 | Admin UI | T1 | D | 09 §8 |
-| M6-T8 | PWA: manifest, service worker, offline list cache, background sync; accessibility pass | T2, T9 | D | 09 §1, §9 (PWA check) |
-| M6-T9 | Playwright environment (`webServer`) and smoke suite, added to CI | T2–T6 | E | 09 §9; 01 §7 |
+| M6-T8 | PWA: manifest, service worker, account-scoped offline store, foreground replay plus optional Background Sync; accessibility pass | T2, T9 | D | 09 §1, §9 (PWA check) |
+| M6-T9 | Playwright environment (`webServer`) and six smoke scenarios (PWA test belongs to T8), added to CI | T2–T6 | E | 09 §9; 01 §7 |
 
 **Done when:**
 
 - **T1:** login with a code works against the dev API; `/join?code=` flows to signup; a key-parity test
   covers every i18n namespace (en = sk).
 - **T2:** component tests for the list item (all states, every `TopReason` kind); an optimistic rating
-  with a simulated server error rolls back and shows the toast; undo sends `rating: null`; the tier
+  with a simulated server error rolls back and shows the toast; undo sends the server mutation receipt and restores prior state conditionally; the tier
   slider persists to preferences.
 - **T3:** swipe thresholds (15 % feedback, 35 % commit) are tested with synthetic pointer events; every
   shortcut in the spec 09 §3.4 table has a test.
@@ -872,7 +949,7 @@ Complete milestone M6 "Web app" exactly as specified in docs/PLAN.md §12 and do
 - **T8:** `pwa.pw.ts` passes (service worker ready, `getInstallabilityErrors` returns `[]`, offline
   reload shows cached items); axe-core finds no serious or critical violations on the reader, the
   Why-this drawer and onboarding.
-- **T9:** the six scenarios of spec 09 §9 and the PWA check pass **locally** (output shown), and the
+- **T9:** the six smoke scenarios of spec 09 §9 pass **locally** (output shown), and the
   E2E job is present in `ci.yml`.
 
 **Milestone done when:** all tasks are done and the full check, including E2E, passes.
@@ -889,13 +966,13 @@ from unexplained likes. Learning curves are verified on the golden set.
 
 **Scheduling:** T1–T6 can start once M4, M5 and M6 are merged. M6 is needed because the M7 goal
 runs the E2E suite. **T7 needs M3b merged** (it reads
-`apps/eval/config/g1.json` `runs` and the dev database's `golden-v1`). If M3b is not merged yet, finish T1–T6
+`apps/eval/config/g1.json` `runs` and the dedicated evaluation database's `golden-v1`). If M3b is not merged yet, finish T1–T6
 and stop with the report marking T7 "blocked on M3b". Run the goal again afterwards.
 
 **Goal text:**
 
 ```
-Complete milestone M7 "Personal learning and suggestions" exactly as specified in docs/PLAN.md §13, docs/specs/06-ranking-learning.md §8 and §10, and docs/specs/05-classification.md §7, with the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §13 and the referenced specs first, create one task per row of the M7 task table, and implement them in dependency order, using subagents for independent lanes under the parallel-work rules of PLAN.md §0.3. Commit each task as "<task-id>: <summary>". Constraints: training code in packages/ranker stays pure; no live third-party calls in tests; the learning-curve check uses only stored eval.run_answers of the runs listed in apps/eval/config/g1.json (no new API spend); if apps/eval/config/g1.json is absent, mark M7-T7 "blocked on M3b" in the report instead of doing it; locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M7 report" in the format of PLAN.md §0.4 listing M7-T1…M7-T7 each with ✓ (or T7 "blocked on M3b"), commit hash and evidence, and every M7 "Done when" item checked with evidence, (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int && pnpm e2e` run after the last commit, ending with exit code 0, (3) the learning-curve table from M7-T7 printed unless blocked, and (4) `git status --short` printing nothing. Or stop after 150 turns and print the report with the unfinished items.
+Complete milestone M7 "Personal learning and suggestions" exactly as specified in docs/PLAN.md §13, docs/specs/06-ranking-learning.md §8 and §10, and docs/specs/05-classification.md §7, with the conventions of docs/specs/01-architecture.md. Read PLAN.md §0, §2, §13 and the referenced specs first, create one task per row of the M7 task table, and implement them in dependency order, using subagents for independent lanes under the parallel-work rules of PLAN.md §0.3. Commit each task as "<task-id>: <summary>". Constraints: training code in packages/ranker stays pure; no live third-party calls in tests; the learning-curve check uses only stored eval.run_answers of the runs listed in apps/eval/config/g1.json (no new API spend); if apps/eval/config/g1.json is absent, mark M7-T7 "blocked on M3b" in the report instead of doing it; locked decisions unchanged; deviations logged in docs/DECISIONS.md with the spec updated. The goal is met only when the transcript shows (1) a final "M7 report" in the format of PLAN.md §0.4 listing M7-T1…M7-T7 with status, commit hash and evidence, and every applicable M7 "Done when" item checked with evidence (T7 may be reported blocked, but the milestone stays incomplete), (2) the output of `pnpm typecheck && pnpm lint && pnpm test && pnpm test:int && pnpm e2e` run after the last commit, ending with exit code 0, (3) the learning-curve table from M7-T7 printed unless blocked, and (4) `git status --short` printing nothing. Or stop after 150 turns and print the report with the unfinished items.
 ```
 
 **Tasks**
@@ -918,8 +995,10 @@ Complete milestone M7 "Personal learning and suggestions" exactly as specified i
   tested.
 - **T3:**
   - On synthetic data the model recovers the weight signs and reaches AUC ≥ 0.9.
-  - Platt scaling lowers ECE on over-confident scores.
-  - The activation rule is tested on each branch.
+  - Platt scaling lowers ECE on synthetic over-confident scores; preprocessing/calibration use
+    training folds only, story groups never cross folds, one-class/singular/small data fails safely.
+  - The activation rule is tested on each branch, including incompatible feature/card/model inputs
+    and missing event-time snapshots (excluded rather than reconstructed from post-feedback state).
   - Contributions pick the top 3 by |value|.
 - **T4:** training the 10th label enqueues learn (through the M4 trigger); activation enqueues
   `user.rank {full}` and `user.suggest`; retention never deletes the active version; the nightly job
@@ -932,15 +1011,16 @@ Complete milestone M7 "Personal learning and suggestions" exactly as specified i
   excluded for 90 days; at most one run per user per day (throttled).
 - **T7:**
   - `eval learning-curve` simulates each rater's ratings arriving in order: it trains on the first n
-    (n = 10, 20, 30, 50, 100) and evaluates on the rest, printing per-rater AUC of the model vs
-    cards-only.
+    (n = 10, 20, 30, 50, 100) development examples and evaluates every size on the same untouched
+    test groups, printing support and per-rater AUC of the model vs cards-only (spec 10).
   - The table is printed and saved to `apps/eval/reports/`.
   - If the model does not beat cards-only at n = 50 for **more than half** of the raters,
     `docs/DECISIONS.md` gets an entry proposing a threshold change. Thresholds are not changed
     silently.
 
-**Milestone done when:** all tasks are done (or T7 is blocked on M3b, as above), the full check
-passes, and the learning-curve table is printed when T7 ran.
+**Milestone done when:** all tasks, including T7, are done, the full check passes, and the real
+learning-curve table is printed. T1–T6 may be reported implementation-complete while T7 is blocked;
+this does not complete M7 for the M8 launch gate.
 
 ---
 
@@ -970,7 +1050,7 @@ Complete milestone M8 "Operations and launch readiness" exactly as specified in 
 | M8-T6 | Security checklist verification | T1 | C | 11 §7 |
 | M8-T7 | Privacy page (en/sk), starter bundles verified live, SMTP deliverability notes | — | D | 09 §4; 11 §9 |
 | M8-T8 | Load sanity test: generated feed server, fake TypeSafe server at 300 ms, autocannon readers | T1–T4 | D | 11 §9 |
-| M8-T9 | Launch checklist run and `docs/RUNBOOK.md` (deploy, rollback, restore, breaker reset, budget raise, invite batch, model upgrade, applying the G1 settings) | all | A | 11 §3, §8–9 |
+| M8-T9 | Launch checklist run and `docs/RUNBOOK.md` (deploy, rollback, restore, breaker reset, budget raise, invite batch, model upgrade, applying the G1 settings) | T1–T8; all M7 merged for launch | A | 11 §3, §8–9 |
 
 **Done when:**
 
@@ -995,8 +1075,10 @@ Complete milestone M8 "Operations and launch readiness" exactly as specified in 
   items needing the owner (DNS, SMTP provider, sending invites, applying the G1 production settings)
   are marked "owner".
 
-**Milestone done when:** all tasks are done, the full check passes, and the launch checklist has no
-unchecked items except those marked "owner".
+**Implementation done when:** all tasks are done, the full check passes, and every launch item has
+evidence or is explicitly marked blocked/owner. **Launch ready** requires all M7 tasks merged, G1
+PASS applied and every launch item (including owner items and §17 launch gates) resolved. A local
+production-like rehearsal does not prove DNS, mail delivery, host capacity or production recovery.
 
 ---
 
@@ -1018,3 +1100,33 @@ unchecked items except those marked "owner".
 |---|---|
 | 2026-09-24 | Plan restructured into goal-ready milestones and binding specs; decisions 1–8 locked |
 | 2026-09-24 | Review pass: DB bootstrap, grants and definer functions; SSRF hardening; pg-boss semantics; immutable cards and labels; E2E and fake engine; eval budget isolation; dependency and ordering fixes |
+| 2026-09-25 | Cross-spec review: transactional outbox and leases, content/answer/rank freshness, private-card isolation, lossless identity merges, atomic spend reservations, auth/offline mutation safety, held-out evaluation, recovery and launch gates; task dependencies and owner decisions made explicit |
+
+## 17. Owner decisions and implementation gates
+
+`INCONCLUSIVE` in milestone reports maps to `status: needs_more_data` in the G1 artifact; only
+`status: pass` permits applying G1 as launch approval.
+
+These are **open questions**, not new locked decisions. Existing locked decisions in §2 remain in
+force. The recommendations below make the outstanding choices reviewable. An implementing LLM may
+build the documented interfaces and safe fixture paths now; it must not claim an unanswered launch
+gate is approved. Record an answer here (date, chosen option and affected specs), then update those
+specs and acceptance criteria in the same commit.
+
+| ID | Decision needed from the owner | Recommendation / current implementation assumption | Affected work and gate |
+|---|---|---|---|
+| Q1 | How many beta readers, subscriptions and distinct interests should the first box support, and what is the hard daily/monthly inference budget? | Measure an initial 20-reader workload; keep the existing $2/day default and $10 total G1 cap. A measured budget recommendation is not authorization to raise a hard cap. Include private-card batches, retries and translation in estimates. | M3b budget report, quotas and M8 capacity; confirm production limits before invites. |
+| Q2 | May text-only interests be shared internally across readers, and may an administrator publish a popular user-written card to the library without its author's explicit consent? | Preserve internal sharing/dedup of identical text-only cards as designed, keep private examples owner-only, and do not publicly promote user cards until the publication policy is approved. Recommend explicit author consent for public promotion. | Specs 02/05/08/09/11; library publication policy is a launch decision, not permission inferred from three holders. |
+| Q3 | Is launch limited to public feeds, or must it support authenticated/private/tokenized feeds? | Public feeds only. Reject credentials in URLs and do not advertise private-feed support. A secret subscription URL is not made safe merely by removing URL userinfo; warn at add/import and document the public-corpus boundary. Private feeds require tenant-scoped storage, cache, logging and provider policies before implementation. | Specs 03/08/11; private feeds are blocked pending a separate design if requested. |
+| Q4 | Which host/domain, mail provider and off-site backup destination will be used, and what data-loss/recovery window is acceptable? | Keep the single-box design. Nightly backups imply up to roughly 24 hours of data loss; a 4-hour recovery target is provisional and must pass a drill. Confirm both targets and a backup-key custodian before launch. | M8 deployment, mail delivery, backup and disaster recovery; real-host evidence is required before launch. |
+| Q5 | Should bookmarks preserve complete article text indefinitely, or only the retained title/excerpt/link and reader state? | Keep the current 30-day full-body retention and long-lived saved metadata/state, with honest UI wording. Full-text archival changes storage, export, retention and content-handling policy. | Specs 03/08/09/11; confirm retention wording before launch, without silently turning bookmarks into a full-text archive. |
+| Q6 | What privacy defaults do you want for remote images, persistent offline data and implicit dwell/read learning? | Recommend remote images blocked until enabled, an explicit offline-storage choice on shared devices, and a visible switch for implicit feedback. Offline queues must always be account-scoped and cleared on logout; these safety requirements do not depend on the preference choice. | Specs 08/09/11; confirm UI defaults and privacy text before launch. |
+| Q7 | Can 3–5 raters supply at least 250 ratings each with sufficient EN/SK/CZ coverage, plus the facet labels? | Recruit the proposed group before M3b. If only the owner is available, run a clearly labelled pilot and leave G1 inconclusive; do not quietly weaken the multi-reader gate or reuse test data for tuning. | M3a human step and M3b; insufficient coverage blocks a PASS, not tooling development. |
+| Q8 | Are the actual Jev and Ollama account terms/processing locations acceptable for interest text and example titles, and who supplies the API accounts? | Keep the selected providers. Verify capabilities, account limits and data handling at preflight; disclose actual payloads. If unacceptable, the owner chooses whether to revise the locked provider decision. | Specs 04/07/11; do not use real testers' private examples with a provider until this is resolved. |
+| Q9 | When a library card's meaning changes, should current subscribers automatically receive the new definition, or choose whether to upgrade? | Recommend opt-in for semantic changes. Preserve the specified migration mechanism for tests, but do not run semantic holder migrations in production until the policy is approved; spelling/localization-only metadata fixes need no new interest definition. | Spec 05 library lifecycle, API/UI notices and M8 seed/update runbook. |
+| Q10 | Does assigning any label mean “I like this,” or are labels neutral organization (for example “avoid” or “check later”)? | Recommend neutral labels unless the user explicitly marks a label as positive. The existing weighted-label learning rule can be tested, but must not be activated in production before this choice is resolved. Explicit thumbs-up/down remain authoritative. | Spec 06 learning signals, spec 08 label actions and M7 activation; update the signal table/tests after the answer. |
+
+**Technical preflight, not a product vote:** the implementer checks the pinned model IDs, actual API
+response/usage fields, installed MT language paths, package compatibility and target-host performance.
+A failed check produces evidence and the smallest proposed deviation; it does not authorize inventing
+an endpoint, changing a provider, spending above the cap or marking an experiment as successful.
